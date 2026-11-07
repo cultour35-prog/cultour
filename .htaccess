@@ -1,0 +1,50 @@
+Options -Indexes
+
+# Server-side code, config, database dumps and the mobile app source are never served over the web.
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteRule ^(config|includes|database|storage|tools|mobile_app|cultour\ mobile|cultour\ web|\.git|\.cursor|\.vscode)(/|$) - [F,L]
+</IfModule>
+
+<FilesMatch "\.(sql|md|log|env|bak|ini|lock|dart|yaml)$">
+  Require all denied
+</FilesMatch>
+<FilesMatch "^\.git">
+  Require all denied
+</FilesMatch>
+
+# Setup scripts reset the database / passwords: CLI only, or from this PC for the installer.
+<Files "setup_cli.php">
+  Require all denied
+</Files>
+<FilesMatch "^(install|seed_ormoc|security-demo)\.php$">
+  Require local
+</FilesMatch>
+
+<IfModule mod_headers.c>
+  Header set X-Content-Type-Options "nosniff"
+  Header set X-Frame-Options "SAMEORIGIN"
+  Header set Referrer-Policy "strict-origin-when-cross-origin"
+  Header unset X-Powered-By
+
+  # Static files are versioned with ?v=filemtime, so browsers can cache them for a long time.
+  <FilesMatch "\.(css|js|woff2?|ttf|svg|png|jpe?g|gif|webp|ico)$">
+    Header set Cache-Control "public, max-age=2592000"
+  </FilesMatch>
+  <Files "sw.js">
+    Header set Cache-Control "no-cache"
+  </Files>
+</IfModule>
+
+<IfModule mod_deflate.c>
+  AddOutputFilterByType DEFLATE text/html text/css text/plain application/javascript application/json image/svg+xml
+</IfModule>
+
+<IfModule mod_expires.c>
+  ExpiresActive On
+  ExpiresByType text/css "access plus 30 days"
+  ExpiresByType application/javascript "access plus 30 days"
+  ExpiresByType image/webp "access plus 30 days"
+  ExpiresByType image/png "access plus 30 days"
+  ExpiresByType image/jpeg "access plus 30 days"
+</IfModule>

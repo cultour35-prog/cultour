@@ -1,0 +1,11 @@
+# Prevent PHP execution in uploads
+<FilesMatch "\.(php|phtml|php3|php4|php5|phar)$">
+    Require all denied
+</FilesMatch>
+Options -Indexes
+
+# Flutter (especially web/CanvasKit) loads photos from another origin/port.
+<IfModule mod_headers.c>
+  Header set Access-Control-Allow-Origin "*"
+  Header set Cross-Origin-Resource-Policy "cross-origin"
+</IfModule>

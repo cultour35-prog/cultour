@@ -1,0 +1,35 @@
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+/config/secrets.php
+
+# Private storage
+/storage/sessions/
+/storage/backups/
+
+# Logs
+*.log
+error_log
+
+# Dependencies
+/vendor/
+/node_modules/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+
+# IDE settings (optional)
+.vscode/
+
+# Local database files and dumps
+*.sql
+*.sql.gz
+*.sqlite
+*.db
