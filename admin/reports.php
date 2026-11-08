@@ -40,7 +40,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
         fputcsv($out, [$r['guide_name'], $r['total_bookings'], $r['completed'], $r['approved'], $r['pending'], $r['avg_rating']]);
     }
     fputcsv($out, []);
-    fputcsv($out, ['Destination', 'Stops']);
+    fputcsv($out, ['Government site', 'Stops']);
     foreach ($popular as $r) {
         fputcsv($out, [$r['name'], $r['stops']]);
     }

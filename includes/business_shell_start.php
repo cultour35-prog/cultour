@@ -27,12 +27,14 @@ require_once __DIR__ . '/live.php';
 $tbNotifLive = live_header_notif_payload((int) $user['id'], $returnUrl);
 
 $catalogCopy = business_catalog_copy('');
+$businessTypeName = '';
 if (!empty($user['id'])) {
     $typeSt = db()->prepare(
         'SELECT bt.name FROM businesses b JOIN business_types bt ON bt.id = b.business_type_id WHERE b.user_id=? LIMIT 1'
     );
     $typeSt->execute([(int) $user['id']]);
-    $catalogCopy = business_catalog_copy($typeSt->fetchColumn() ?: '');
+    $businessTypeName = (string) ($typeSt->fetchColumn() ?: '');
+    $catalogCopy = business_catalog_copy($businessTypeName);
 }
 $catalogMode = $catalogCopy['mode'];
 $catalogLabel = $catalogCopy['label'];
@@ -43,9 +45,21 @@ $businessNav = [
     ['calendar', 'Calendar', '/business/dashboard.php?view=calendar', 'bi-calendar3'],
     ['report', 'Report', '/business/dashboard.php?view=report', 'bi-file-earmark-bar-graph'],
     ['services', $catalogLabel, '/business/services.php', $catalogIcon],
+];
+if (in_array($catalogMode, ['packages', 'rooms'], true)) {
+    $businessNav[] = ['bookings', 'Bookings', '/business/bookings.php', 'bi-calendar-check'];
+}
+$revenueKind = revenue_bookable_kind($businessTypeName);
+if (revenue_uses_reservation($revenueKind)) {
+    $businessNav[] = ['reservations', 'Reservations', '/business/reservations.php', 'bi-journal-check'];
+}
+if (revenue_uses_reservation($revenueKind) || in_array($revenueKind, ['accommodation', 'transportation', 'package'], true)) {
+    $businessNav[] = ['fees', 'Fees', '/business/fees.php', 'bi-receipt'];
+}
+$businessNav = array_merge($businessNav, [
     ['photos', 'Photos', '/business/photos.php', 'bi-images'],
     ['hours', 'Hours', '/business/hours.php', 'bi-clock'],
-];
+]);
 
 $bodyClass = trim(($bodyClass ?? '') . ' business-app');
 ?>
@@ -144,12 +158,17 @@ $bodyClass = trim(($bodyClass ?? '') . ' business-app');
 
   <main class="tourist-main">
     <?php if (empty($businessHidePagehead) && (!empty($pageHeading) || !empty($pageSub))): ?>
-      <div class="tourist-pagehead">
-        <?php if (!empty($pageHeading)): ?>
-          <h1 class="tourist-pagehead__title"><?= e($pageHeading) ?></h1>
-        <?php endif; ?>
-        <?php if (!empty($pageSub)): ?>
-          <p class="tourist-pagehead__sub"><?= e($pageSub) ?></p>
+      <div class="tourist-pagehead<?= !empty($pageHeadAction) ? ' tourist-pagehead--split' : '' ?>">
+        <div>
+          <?php if (!empty($pageHeading)): ?>
+            <h1 class="tourist-pagehead__title"><?= e($pageHeading) ?></h1>
+          <?php endif; ?>
+          <?php if (!empty($pageSub)): ?>
+            <p class="tourist-pagehead__sub"><?= e($pageSub) ?></p>
+          <?php endif; ?>
+        </div>
+        <?php if (!empty($pageHeadAction)): ?>
+          <div class="tourist-pagehead__action"><?= $pageHeadAction ?></div>
         <?php endif; ?>
       </div>
     <?php endif; ?>

@@ -91,6 +91,9 @@ $rows = [
     ['Party size', ((int) ($b['party_size'] ?? 1)) . ' guest(s)'],
     ['Itinerary', $b['itinerary_title'] ?: '—'],
 ];
+foreach (reservation_itinerary_map((int) ($b['itinerary_id'] ?? 0)) as $ticketReservation) {
+    $rows[] = ['Reservation', implode(' · ', reservation_summary_lines($ticketReservation))];
+}
 if (booking_is_pwd($b)) {
     $pwdLine = 'Accessibility needs';
     if (!empty($b['pwd_notes'])) {

@@ -4,8 +4,8 @@ require_once __DIR__ . '/../includes/map_helpers.php';
 $user = require_login(ROLE_ADMIN);
 ensure_place_schedule_schema();
 ensure_itinerary_items_schema();
-$pageTitle = 'Destinations';
-$pageHeading = 'Manage Destinations';
+$pageTitle = 'Government sites';
+$pageHeading = 'Government sites';
 $pageSub = 'Add places and pin them on the interactive map';
 $activeNav = 'destinations';
 
@@ -17,25 +17,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
     if ($action === 'deactivate' || $action === 'activate') {
         $id = (int) ($_POST['id'] ?? 0);
         if ($id < 1) {
-            flash('error', 'Invalid destination.');
+            flash('error', 'Invalid government site.');
             redirect(APP_URL . '/admin/destinations.php');
         }
         $st = db()->prepare('SELECT id, status FROM destinations WHERE id=?');
         $st->execute([$id]);
         $dest = $st->fetch();
         if (!$dest) {
-            flash('error', 'Destination not found.');
+            flash('error', 'Government site not found.');
             redirect(APP_URL . '/admin/destinations.php');
         }
         if ($action === 'deactivate') {
             db()->prepare("UPDATE destinations SET status='draft' WHERE id=?")->execute([$id]);
-            log_activity((int) $user['id'], 'deactivate_destination', 'destinations', 'Destination #' . $id);
-            flash('success', 'Destination deactivated.');
+            log_activity((int) $user['id'], 'deactivate_destination', 'destinations', 'Government site #' . $id);
+            flash('success', 'Government site deactivated.');
             redirect(APP_URL . '/admin/destinations.php?tab=inactive');
         }
         db()->prepare("UPDATE destinations SET status='published' WHERE id=?")->execute([$id]);
-        log_activity((int) $user['id'], 'activate_destination', 'destinations', 'Destination #' . $id);
-        flash('success', 'Destination activated.');
+        log_activity((int) $user['id'], 'activate_destination', 'destinations', 'Government site #' . $id);
+        flash('success', 'Government site activated.');
         redirect(APP_URL . '/admin/destinations.php');
     }
 
@@ -45,7 +45,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
         $st = db()->prepare('SELECT id FROM destinations WHERE id=?');
         $st->execute([$id]);
         if (!$st->fetch()) {
-            flash('error', 'Destination not found.');
+            flash('error', 'Government site not found.');
             redirect(APP_URL . '/admin/destinations.php');
         }
         if ($action === 'add_service') {
@@ -147,7 +147,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
         if (!empty($_FILES['destination_photos']['name'])) {
             save_destination_gallery_photos($id, $_FILES['destination_photos']);
         }
-        flash('success', 'Destination updated.');
+        flash('success', 'Government site updated.');
         redirect(posted_return_to(APP_URL . '/admin/destinations.php?edit=' . $id));
     } else {
         db()->prepare(
@@ -161,7 +161,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
         if (!empty($_FILES['destination_photos']['name'])) {
             save_destination_gallery_photos($newId, $_FILES['destination_photos']);
         }
-        flash('success', 'Destination created.');
+        flash('success', 'Government site created.');
         redirect(posted_return_to(APP_URL . '/admin/destinations.php?edit=' . $newId));
     }
 }
@@ -179,7 +179,7 @@ if ($viewId) {
     $s->execute([$viewId]);
     $edit = $s->fetch() ?: null;
     if (!$edit) {
-        flash('error', 'Destination not found.');
+        flash('error', 'Government site not found.');
         redirect(APP_URL . '/admin/destinations.php');
     }
 }
@@ -193,9 +193,9 @@ $destPhotos = [];
 $coverUrl = '';
 $dayLabels = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 if ($edit) {
-    $pageTitle = (string) ($edit['name'] ?? 'Destination');
-    $pageHeading = $pageTitle !== '' ? $pageTitle : 'Destination';
-    $pageSub = $isEditing ? 'Edit destination' : 'Destination details';
+    $pageTitle = (string) ($edit['name'] ?? 'Government site');
+    $pageHeading = $pageTitle !== '' ? $pageTitle : 'Government site';
+    $pageSub = $isEditing ? 'Edit government site' : 'Government site details';
     $rawHours = $edit['opening_hours'] ?? null;
     if (is_array($rawHours)) {
         $rawHours = json_encode($rawHours);
@@ -226,21 +226,21 @@ foreach ($rows as $r) {
 $destSections = [
     [
         'id' => 'active',
-        'title' => 'Active destinations',
+        'title' => 'Active government sites',
         'sub' => 'Published places on CulTour',
         'badge' => 'text-bg-success',
-        'btn' => 'Active destinations',
+        'btn' => 'Active government sites',
         'rows' => $activeDestinations,
-        'empty' => 'No active destinations yet. Click Add destination to create one.',
+        'empty' => 'No active government sites yet. Click Add government site to create one.',
     ],
     [
         'id' => 'inactive',
-        'title' => 'Inactive destinations',
+        'title' => 'Inactive government sites',
         'sub' => 'Hidden from the explore map and tourist lists',
         'badge' => 'text-bg-warning',
-        'btn' => 'Inactive destinations',
+        'btn' => 'Inactive government sites',
         'rows' => $inactiveDestinations,
-        'empty' => 'No inactive destinations.',
+        'empty' => 'No inactive government sites.',
     ],
 ];
 $defaultDestTab = 'active';
@@ -263,18 +263,18 @@ map_leaflet_head();
       <div class="glass p-3 mb-4 fade-up">
         <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
           <div>
-            <h3 class="panel-title mb-1">Destinations</h3>
-            <p class="small text-muted mb-0">Choose a list to view active or inactive destinations</p>
+            <h3 class="panel-title mb-1">Government sites</h3>
+            <p class="small text-muted mb-0">Choose a list to view active or inactive government sites</p>
           </div>
           <?php if (!$showAdd): ?>
             <a class="btn btn-ct" href="<?= APP_URL ?>/admin/destinations.php?add=1">
-              <i class="bi bi-plus-lg"></i> Add destination
+              <i class="bi bi-plus-lg"></i> Add government site
             </a>
           <?php else: ?>
             <a class="btn btn-outline-secondary" href="<?= APP_URL ?>/admin/destinations.php">Cancel</a>
           <?php endif; ?>
         </div>
-        <div class="guide-tabs" role="tablist" aria-label="Destination lists">
+        <div class="guide-tabs" role="tablist" aria-label="Government site lists">
           <?php foreach ($destSections as $section): ?>
             <button
               type="button"
@@ -301,7 +301,7 @@ map_leaflet_head();
           $viewInitial = mb_strtoupper(mb_substr((string) ($edit['name'] ?? 'D'), 0, 1));
         ?>
         <div class="mb-3 d-flex flex-wrap gap-2">
-          <a class="btn btn-sm btn-outline-secondary" href="<?= APP_URL ?>/admin/destinations.php">&larr; Back to destinations</a>
+          <a class="btn btn-sm btn-outline-secondary" href="<?= APP_URL ?>/admin/destinations.php">&larr; Back to government sites</a>
           <a class="btn btn-sm btn-ct" href="<?= APP_URL ?>/admin/destinations.php?edit=<?= (int) $edit['id'] ?>">Edit details</a>
         </div>
 
@@ -316,10 +316,10 @@ map_leaflet_head();
             </div>
             <div class="admin-guide-profile__intro">
               <div class="small text-muted mb-1">
-                <?= e($edit['category_name'] ?? 'Destination') ?> · <?= status_badge($isActiveDestView ? 'active' : 'inactive') ?>
+                <?= e($edit['category_name'] ?? 'Government site') ?> · <?= status_badge($isActiveDestView ? 'active' : 'inactive') ?>
                 <?= !empty($edit['is_featured']) ? ' · <span class="badge text-bg-primary">Featured</span>' : '' ?>
               </div>
-              <h2 class="h4 mb-1"><?= e((string) ($edit['name'] ?? 'Destination')) ?></h2>
+              <h2 class="h4 mb-1"><?= e((string) ($edit['name'] ?? 'Government site')) ?></h2>
               <div class="text-muted"><?= $destVal($edit['location'] ?? '') ?></div>
               <div class="admin-guide-profile__rating">
                 <?= rating_stars_html($edit['avg_rating'] ?? 0, (int) ($edit['review_count'] ?? 0), 'lg') ?>
@@ -329,7 +329,7 @@ map_leaflet_head();
         </div>
 
         <div class="glass p-3 p-md-4 mb-3 fade-up">
-          <h3 class="panel-title mb-3">Destination details</h3>
+          <h3 class="panel-title mb-3">Government site details</h3>
           <dl class="admin-guide-profile__dl mb-0">
               <div>
                 <dt>Name</dt>
@@ -395,7 +395,7 @@ map_leaflet_head();
               </div>
             </dl>
           <div class="mt-4">
-            <h3 class="h6 mb-2">Destination photos</h3>
+            <h3 class="h6 mb-2">Government site photos</h3>
             <?php if ($destPhotos): ?>
               <div class="admin-dest-photo-thumbs">
                 <?php foreach ($destPhotos as $ph): ?>
@@ -414,7 +414,7 @@ map_leaflet_head();
           <div class="col-lg-5">
             <div class="glass p-3 p-md-4 h-100 fade-up">
               <h3 class="panel-title mb-1">Pin on map</h3>
-              <p class="small text-muted mb-2">Saved location for this destination.</p>
+              <p class="small text-muted mb-2">Saved location for this government site.</p>
               <div id="destInfoMap" class="ct-map"></div>
             </div>
           </div>
@@ -461,14 +461,14 @@ map_leaflet_head();
       <?php if ($showForm): ?>
         <?php if ($edit): ?>
           <div class="mb-3 d-flex flex-wrap gap-2">
-            <a class="btn btn-sm btn-outline-secondary" href="<?= APP_URL ?>/admin/destinations.php">&larr; Back to destinations</a>
-            <a class="btn btn-sm btn-ct" href="<?= APP_URL ?>/admin/destinations.php?view=<?= (int) $edit['id'] ?>">View destination details</a>
+            <a class="btn btn-sm btn-outline-secondary" href="<?= APP_URL ?>/admin/destinations.php">&larr; Back to government sites</a>
+            <a class="btn btn-sm btn-ct" href="<?= APP_URL ?>/admin/destinations.php?view=<?= (int) $edit['id'] ?>">View government site details</a>
           </div>
         <?php endif; ?>
       <div class="glass p-3 p-md-4 mb-4 fade-up">
         <?php if (!$edit): ?>
           <div class="d-flex justify-content-between align-items-center mb-3">
-            <h3 class="panel-title mb-0">Add destination</h3>
+            <h3 class="panel-title mb-0">Add government site</h3>
             <a class="btn btn-sm btn-outline-secondary" href="<?= APP_URL ?>/admin/destinations.php">Cancel</a>
           </div>
         <?php endif; ?>
@@ -484,7 +484,7 @@ map_leaflet_head();
             <div class="col-12">
               <div class="form-check mb-0">
                 <input class="form-check-input" type="checkbox" name="is_featured" id="feat" <?= !empty($edit['is_featured']) ? 'checked' : '' ?>>
-                <label class="form-check-label" for="feat">Featured destination</label>
+                <label class="form-check-label" for="feat">Featured government site</label>
               </div>
             </div>
             <div class="col-md-6">
@@ -529,7 +529,7 @@ map_leaflet_head();
               <input class="form-control" name="emergency_contacts" value="<?= e($edit['emergency_contacts'] ?? '') ?>">
             </div>
             <div class="col-md-6">
-              <label class="form-label">Destination photos</label>
+              <label class="form-label">Government site photos</label>
               <div class="admin-biz-proof-actions">
                 <div class="admin-biz-proof-actions__file">
                   <input type="file" class="form-control" name="destination_photos[]" accept="image/jpeg,image/png,image/gif,image/webp" multiple>
@@ -602,7 +602,7 @@ map_leaflet_head();
                 </div>
               </form>
             <?php else: ?>
-              <p class="small text-muted mb-3">Save the destination first, then you can add listings.</p>
+              <p class="small text-muted mb-3">Save the government site first, then you can add listings.</p>
             <?php endif; ?>
             <?php if ($destServices): ?>
               <ul class="list-unstyled small mb-0">
@@ -630,14 +630,14 @@ map_leaflet_head();
           </div>
         </div>
         <div class="mt-3">
-          <button type="submit" form="destForm" class="btn btn-ct"><?= $edit ? 'Save changes' : 'Create destination' ?></button>
+          <button type="submit" form="destForm" class="btn btn-ct"><?= $edit ? 'Save changes' : 'Create government site' ?></button>
         </div>
       </div>
       <?php render_unsaved_changes_modal(); ?>
       <div id="destPhotosCard" class="admin-biz-proof-overlay" hidden>
         <div class="admin-biz-proof-card admin-biz-proof-card--photos" role="dialog" aria-labelledby="destPhotosCardTitle" aria-modal="true">
           <div class="admin-biz-proof-card__head">
-            <h2 class="h6 mb-0" id="destPhotosCardTitle">Destination photos</h2>
+            <h2 class="h6 mb-0" id="destPhotosCardTitle">Government site photos</h2>
             <button type="button" class="admin-biz-proof-card__close" data-close-dest-photos-card aria-label="Close">&times;</button>
           </div>
           <div class="admin-biz-proof-card__body">
@@ -657,7 +657,7 @@ map_leaflet_head();
                   <?php endif; ?>
                   <div class="admin-biz-photo-stage__track">
                     <div class="admin-biz-proof-card__pic admin-biz-photo-stage__main">
-                      <img src="<?= e($firstPhotoHref) ?>" alt="Destination photo">
+                      <img src="<?= e($firstPhotoHref) ?>" alt="Government site photo">
                     </div>
                     <?php if ($photoCount > 1): ?>
                       <button type="button" class="admin-biz-photo-stage__preview" data-photo-peek="1" aria-label="Next photo">
@@ -683,7 +683,7 @@ map_leaflet_head();
                 </div>
               </div>
             <?php else: ?>
-              <p class="small text-muted mb-0">No photos are saved for this destination yet. Choose files, then click Save changes.</p>
+              <p class="small text-muted mb-0">No photos are saved for this government site yet. Choose files, then click Save changes.</p>
             <?php endif; ?>
           </div>
         </div>
@@ -710,7 +710,7 @@ map_leaflet_head();
               <table class="table table-ct align-middle mb-0">
                 <thead>
                   <tr>
-                    <th>Destination</th>
+                    <th>Government site</th>
                     <th>Category</th>
                     <th>Coordinates</th>
                     <th>Fee</th>

@@ -93,12 +93,12 @@ map_leaflet_head();
         <div class="dash-section__head">
           <div>
             <h2 class="dash-section__title">City map</h2>
-            <p class="dash-section__sub mb-0">Destinations and businesses pinned across Ormoc</p>
+            <p class="dash-section__sub mb-0">Government sites and businesses pinned across Ormoc</p>
           </div>
           <div id="adminDashMapFilters">
             <div class="d-flex flex-wrap gap-2 align-items-center">
               <button type="button" class="quick-chip is-active fw-semibold" data-map-filter="all">All</button>
-              <button type="button" class="quick-chip" data-map-filter="destinations">Destinations</button>
+              <button type="button" class="quick-chip" data-map-filter="destinations">Government sites</button>
               <button type="button" class="quick-chip" data-map-filter="businesses">Businesses</button>
               <div class="map-search" style="min-width:11rem;max-width:18rem">
                 <label class="visually-hidden" for="adminMapMarkerSearch">Search places</label>

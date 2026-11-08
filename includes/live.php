@@ -1397,7 +1397,7 @@ function live_admin_reports_html(array $d): string
           <section class="glass reports-panel reports-popular">
             <header class="reports-panel__head reports-panel__head--split">
               <div>
-                <h2 class="reports-panel__title">Popular destinations</h2>
+                <h2 class="reports-panel__title">Popular government sites</h2>
                 <p class="reports-panel__sub mb-0">Booked stops in range</p>
               </div>
               <button type="button" class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#popularDestModal">View all</button>
@@ -1406,7 +1406,7 @@ function live_admin_reports_html(array $d): string
               <table class="table table-ct reports-table mb-0 align-middle">
                 <thead>
                   <tr>
-                    <th>Destination</th>
+                    <th>Government site</th>
                     <th class="text-end">Stops</th>
                   </tr>
                 </thead>
@@ -1418,7 +1418,7 @@ function live_admin_reports_html(array $d): string
                     </tr>
                   <?php endforeach; ?>
                   <?php if (!$popular): ?>
-                    <tr><td colspan="2" class="text-muted">No booked destination stops in this range.</td></tr>
+                    <tr><td colspan="2" class="text-muted">No booked government site stops in this range.</td></tr>
                   <?php endif; ?>
                 </tbody>
               </table>
@@ -1466,7 +1466,7 @@ function live_admin_reports_html(array $d): string
           <div class="modal-content">
             <div class="modal-header">
               <div>
-                <h2 class="modal-title fs-5" id="popularDestModalLabel">Popular destinations</h2>
+                <h2 class="modal-title fs-5" id="popularDestModalLabel">Popular government sites</h2>
                 <div class="reports-panel__sub">Booked stops in range</div>
               </div>
               <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
@@ -1475,7 +1475,7 @@ function live_admin_reports_html(array $d): string
               <table class="table table-ct reports-table mb-0 align-middle">
                 <thead>
                   <tr>
-                    <th>Destination</th>
+                    <th>Government site</th>
                     <th class="text-end">Stops</th>
                   </tr>
                 </thead>
@@ -1487,7 +1487,7 @@ function live_admin_reports_html(array $d): string
                     </tr>
                   <?php endforeach; ?>
                   <?php if (!$popular): ?>
-                    <tr><td colspan="2" class="text-muted">No booked destination stops in this range.</td></tr>
+                    <tr><td colspan="2" class="text-muted">No booked government site stops in this range.</td></tr>
                   <?php endif; ?>
                 </tbody>
               </table>

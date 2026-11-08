@@ -2276,6 +2276,7 @@ function ensure_place_schedule_schema(): void
             'extra_guest_fee' => 'DECIMAL(10,2) NULL',
             'extra_guest_limit' => 'INT UNSIGNED NULL',
             'package_days' => 'INT UNSIGNED NULL',
+            'menu_category' => "VARCHAR(40) NULL",
         ];
         foreach ($offerCols as $offerCol => $offerDef) {
             if (!in_array($offerCol, $svcCols, true)) {
@@ -2304,10 +2305,14 @@ function itinerary_items_with_places(int $itineraryId): array
                 COALESCE(d.cover_image, b.cover_image) AS cover_image,
                 CASE WHEN ii.business_id IS NOT NULL THEN 'business' ELSE 'destination' END AS stop_kind,
                 d.name AS destination_name,
-                d.location AS destination_location
+                d.location AS destination_location,
+                bt.name AS business_type_name,
+                b.opening_hours AS business_hours,
+                b.user_id AS business_user_id
          FROM itinerary_items ii
          LEFT JOIN destinations d ON d.id = ii.destination_id
          LEFT JOIN businesses b ON b.id = ii.business_id
+         LEFT JOIN business_types bt ON bt.id = b.business_type_id
          WHERE ii.itinerary_id = ?
          ORDER BY COALESCE(ii.visit_date, '1970-01-01'), ii.sort_order, ii.id"
     );
@@ -6544,6 +6549,46 @@ function package_days_from_post(array $post): array
 }
 
 /**
+ * How many people a tour package is for.
+ *
+ * @return array{ok:bool,message:string,pax:?int}
+ */
+function package_pax_from_post(array $post): array
+{
+    $raw = trim((string) ($post['capacity'] ?? ''));
+    if ($raw === '' || !preg_match('/^\d+$/', $raw)) {
+        return ['ok' => false, 'message' => 'Pax must be a number.', 'pax' => null];
+    }
+    $pax = (int) $raw;
+    if ($pax < 1) {
+        return ['ok' => false, 'message' => 'A package must include at least 1 person.', 'pax' => null];
+    }
+    if ($pax > 99) {
+        return ['ok' => false, 'message' => 'A package can include up to 99 people.', 'pax' => null];
+    }
+    return ['ok' => true, 'message' => '', 'pax' => $pax];
+}
+
+function package_pax_label(int $pax): string
+{
+    if ($pax < 1) {
+        return '';
+    }
+    return $pax === 1 ? '1 pax' : $pax . ' pax';
+}
+
+/** Earliest tour start: two days from today. Today and tomorrow stay closed. */
+function package_earliest_tour_date(): string
+{
+    $dt = DateTime::createFromFormat('!Y-m-d', app_today());
+    if (!$dt) {
+        $dt = new DateTime('today');
+    }
+    $dt->modify('+2 days');
+    return $dt->format('Y-m-d');
+}
+
+/**
  * @return array{ok:bool,message:string,date:?string}
  */
 function package_tour_date_from_post(array $post): array
@@ -6556,8 +6601,8 @@ function package_tour_date_from_post(array $post): array
     if (!$dt || $dt->format('Y-m-d') !== $raw) {
         return ['ok' => false, 'message' => 'Choose a valid tour date.', 'date' => null];
     }
-    if ($raw < app_today()) {
-        return ['ok' => false, 'message' => 'Choose a tour date that is today or later.', 'date' => null];
+    if ($raw < package_earliest_tour_date()) {
+        return ['ok' => false, 'message' => 'This date is closed. A tour cannot start today or tomorrow.', 'date' => null];
     }
     return ['ok' => true, 'message' => '', 'date' => $raw];
 }
@@ -6596,6 +6641,9 @@ function business_catalog_mode(?string $typeName): string
     }
     if (in_array($type, ['tour and travel', 'tours and travel', 'travel and tours', 'travel agency'], true)) {
         return 'packages';
+    }
+    if (str_contains($type, 'food') || str_contains($type, 'beach') || str_contains($type, 'wellness') || str_contains($type, 'recreation')) {
+        return 'menu';
     }
     return 'services';
 }
@@ -6731,7 +6779,7 @@ function business_catalog_copy(?string $typeName): array
             'desc' => 'What this package includes',
             'empty' => 'No packages yet. Add one so tourists can see it when they book a tour.',
             'locked' => 'Packages can be added after the Tourism Office approves your business.',
-            'help' => 'Add a name, price, how many days, and a photo. New packages appear in the list below.',
+            'help' => 'Add a name, price, how many days, how many people, and a photo. New packages appear in the list below.',
         ],
     ];
     $copy = $copies[$mode] ?? [
@@ -6751,6 +6799,46 @@ function business_catalog_copy(?string $typeName): array
         'locked' => 'Listings can be added after the Tourism Office approves your business.',
         'help' => 'Add a name and a photo. New listings appear in the list below.',
     ];
+    if ($mode === 'menu') {
+        $kind = revenue_bookable_kind($typeName);
+        if ($kind === 'beach') {
+            $copy = array_merge($copy, [
+                'label' => 'Beach offerings',
+                'noun' => 'offering',
+                'plural' => 'offerings',
+                'heading' => 'Manage beach offerings',
+                'sub' => 'Rentals, activities, and cottages.',
+                'icon' => 'bi-water',
+                'added' => 'Offering added.',
+                'removed' => 'Offering removed.',
+                'updated' => 'Offering updated.',
+                'nameLabel' => 'Offering',
+                'placeholder' => 'Umbrella set',
+                'desc' => 'What this includes',
+                'empty' => 'Nothing listed yet. Add one so tourists can reserve it.',
+                'locked' => 'Beach offerings can be added after the Tourism Office approves your business.',
+                'help' => 'Add a name and price. New offerings appear in the list below.',
+            ]);
+        } elseif ($kind === 'wellness') {
+            $copy = array_merge($copy, [
+                'label' => 'Services',
+                'noun' => 'service',
+                'plural' => 'services',
+                'heading' => 'Manage services',
+                'sub' => 'Treatments, classes, and facilities.',
+                'icon' => 'bi-heart-pulse',
+                'added' => 'Service added.',
+                'removed' => 'Service removed.',
+                'updated' => 'Service updated.',
+                'nameLabel' => 'Service',
+                'placeholder' => 'Swedish massage',
+                'desc' => 'What this service includes',
+                'empty' => 'No services yet. Add one so tourists can book it.',
+                'locked' => 'Services can be added after the Tourism Office approves your business.',
+                'help' => 'Add a name and price. New services appear in the list below.',
+            ]);
+        }
+    }
     $copy['mode'] = $mode;
     return $copy;
 }
@@ -7124,6 +7212,18 @@ function split_person_name(?string $full): array
     ];
 }
 
+/** Empty is allowed. Any letter or symbol is rejected. */
+function tax_id_digits_error(string $taxId): ?string
+{
+    if ($taxId === '') {
+        return null;
+    }
+    if (!preg_match('/^\d+$/', $taxId)) {
+        return 'Tax identification number must contain numbers only.';
+    }
+    return null;
+}
+
 /**
  * Admin add/edit listing fields (same set as business registration / profile).
  * @param array<string,mixed> $post
@@ -7158,6 +7258,9 @@ function parse_admin_business_listing_post(array $post): array
     $email = strtolower(trim((string) ($post['email'] ?? '')));
     $permit = trim((string) ($post['permit_number'] ?? ''));
     $taxId = trim((string) ($post['tax_id'] ?? ''));
+    if ($taxErr = tax_id_digits_error($taxId)) {
+        return ['ok' => false, 'message' => $taxErr];
+    }
     $description = trim((string) ($post['description'] ?? ''));
     $facebookUrl = trim((string) ($post['facebook_url'] ?? ''));
     $instagramUrl = trim((string) ($post['instagram_url'] ?? ''));
@@ -7524,6 +7627,9 @@ function parse_business_registration_input(array $data, string $firstName, strin
         return ['ok' => false, 'message' => 'Enter a valid business email.'];
     }
     $taxId = trim((string) ($data['tax_id'] ?? ''));
+    if ($taxErr = tax_id_digits_error($taxId)) {
+        return ['ok' => false, 'message' => $taxErr];
+    }
     $description = trim((string) ($data['business_description'] ?? ''));
     return [
         'ok' => true,
@@ -8392,6 +8498,11 @@ function status_badge(string $status): string
         'rejected'  => 'danger',
         'cancelled' => 'secondary',
         'completed' => 'primary',
+        'confirmed' => 'success',
+        'no_show' => 'warning',
+        'unpaid' => 'warning',
+        'paid' => 'success',
+        'overdue' => 'danger',
         'suspended' => 'danger',
         'draft'     => 'secondary',
         'inactive'  => 'warning',
@@ -8403,6 +8514,11 @@ function status_badge(string $status): string
     $label = match (strtolower($status)) {
         'profile not completed' => 'Profile not completed',
         'hidden on map' => 'Hidden on map',
+        'no_show' => 'No-show',
+        'unpaid' => 'Unpaid',
+        'paid' => 'Paid',
+        'overdue' => 'Overdue',
+        'confirmed' => 'Confirmed',
         'reviewed' => 'Review',
         default => ucfirst($status),
     };
@@ -8763,3 +8879,5 @@ function render_business_setup_modal(?array $user): bool
     <?php
     return true;
 }
+
+require_once __DIR__ . '/revenue.php';

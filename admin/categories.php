@@ -4,7 +4,7 @@ require_once __DIR__ . '/../includes/map_helpers.php';
 $user = require_login(ROLE_ADMIN);
 $pageTitle = 'Categories';
 $pageHeading = 'Categories';
-$pageSub = 'Set pin colors for destinations and businesses';
+$pageSub = 'Set pin colors for government sites and businesses';
 $activeNav = 'categories';
 
 ensure_category_pin_colors();
@@ -36,8 +36,8 @@ require __DIR__ . '/../includes/header.php';
         <!-- Destination categories -->
         <section class="glass manage-panel">
           <div class="manage-panel__head">
-            <h3 class="panel-title mb-1">Destination categories</h3>
-            <p class="small text-muted mb-0">Pin colors for destination markers on the map.</p>
+            <h3 class="panel-title mb-1">Government site categories</h3>
+            <p class="small text-muted mb-0">Pin colors for government site markers on the map.</p>
           </div>
           <form id="catForm" class="manage-panel__form">
             <input type="hidden" name="csrf_token" value="<?= e($csrf) ?>">
@@ -279,7 +279,7 @@ require __DIR__ . '/../includes/header.php';
     post(catUrl, { action: 'color', id: input.getAttribute('data-id'), pin_color: input.value })
       .then(function (res) {
         if (!res.ok) { flash(res.message || 'Color update failed', false); return; }
-        flash('Destination pin color saved', true);
+        flash('Government site pin color saved', true);
       });
   });
 

@@ -288,15 +288,18 @@ map_leaflet_head();
                   <li class="py-1 border-bottom">
                     <?php $offerMode = business_catalog_mode($biz['type_name'] ?? ''); ?>
                     <span class="fw-semibold"><?= e($svc['name']) ?></span>
-                    <?php if (in_array($offerMode, ['rooms', 'vehicles', 'packages'], true)): ?>
+                    <?php if (in_array($offerMode, ['rooms', 'vehicles', 'packages', 'menu'], true)): ?>
                       <span class="text-muted"> · <?= e(format_money($svc['price'])) ?></span>
                       <?php if ($offerMode === 'packages' && (int) ($svc['package_days'] ?? 0) > 0): ?>
                         · <?= e(package_days_label((int) $svc['package_days'])) ?>
+                        <?php if ((int) ($svc['capacity'] ?? 0) > 0): ?>
+                          · <?= e(package_pax_label((int) $svc['capacity'])) ?>
+                        <?php endif; ?>
                       <?php elseif (!empty($svc['duration_minutes'])): ?>
                         · <?= (int) $svc['duration_minutes'] ?> min
                       <?php endif; ?>
                     <?php endif; ?>
-                    <?php if (in_array($offerMode, ['rooms', 'vehicles', 'packages'], true) && trim((string) ($svc['description'] ?? '')) !== ''): ?>
+                    <?php if (in_array($offerMode, ['rooms', 'vehicles', 'packages', 'menu'], true) && trim((string) ($svc['description'] ?? '')) !== ''): ?>
                       <div class="text-muted"><?= e($svc['description']) ?></div>
                     <?php endif; ?>
                   </li>

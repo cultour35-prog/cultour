@@ -176,6 +176,19 @@ $qrUrl = ($ticketReady && $b['qr_code_path']) ? (APP_URL . '/uploads/' . $b['qr_
             <?php endif; ?>
           </div>
         </div>
+        <?php $ticketReservations = reservation_itinerary_map((int) ($b['itinerary_id'] ?? 0)); ?>
+        <?php if ($ticketReservations): ?>
+        <div>
+          <div class="label">Reservations</div>
+          <div class="value" style="font-weight:400">
+            <?php foreach ($ticketReservations as $ticketReservation): ?>
+              <?php foreach (reservation_summary_lines($ticketReservation) as $ticketLine): ?>
+                <div><?= e($ticketLine) ?></div>
+              <?php endforeach; ?>
+            <?php endforeach; ?>
+          </div>
+        </div>
+        <?php endif; ?>
         <?php if ($b['notes']): ?>
           <div>
             <div class="label">Notes</div>

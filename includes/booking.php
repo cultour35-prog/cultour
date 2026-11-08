@@ -2799,6 +2799,9 @@ function booking_guide_complete(array $booking, int $guideProfileId, bool $auto 
             : ('Your tour ' . $booking['booking_code'] . ' was marked completed. You can rate your guide.'),
         APP_URL . '/tourist/bookings.php'
     );
+    if (function_exists('revenue_record_booking_commissions')) {
+        revenue_record_booking_commissions($id);
+    }
     return ['ok' => true, 'message' => $auto ? 'Tour auto-completed.' : 'Tour marked completed.'];
 }
 

@@ -46,7 +46,7 @@ require __DIR__ . '/../includes/header.php';
     <div>
       <div class="small text-uppercase opacity-75 mb-2">Ormoc City Tourism Office</div>
       <h1>CulTour</h1>
-      <p class="mb-0 opacity-90" style="max-width:28rem">Tourism office sign-in for managing destinations, businesses, and bookings.</p>
+      <p class="mb-0 opacity-90" style="max-width:28rem">Tourism office sign-in for managing government sites, businesses, and bookings.</p>
     </div>
   </div>
   <div class="auth-panel">

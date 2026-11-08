@@ -104,6 +104,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
         itin_reject_if_booked((int) ($_POST['itinerary_id'] ?? $_POST['id'] ?? 0));
     }
 
+    if (in_array($action, ['reserve_submit', 'reserve_cancel', 'reserve_replace'], true)) {
+        $iid = (int) ($_POST['itinerary_id'] ?? 0);
+        $back = APP_URL . '/tourist/itineraries.php' . ($iid > 0 ? '?id=' . $iid : '');
+        if ($action === 'reserve_submit') {
+            $result = reservation_submit(
+                (int) $user['id'],
+                (int) ($_POST['item_id'] ?? 0),
+                (string) ($_POST['reserve_date'] ?? ''),
+                (string) ($_POST['reserve_time'] ?? ''),
+                (int) ($_POST['guests'] ?? 0),
+                (string) ($_POST['order_mode'] ?? 'table_only'),
+                is_array($_POST['qty'] ?? null) ? $_POST['qty'] : []
+            );
+        } elseif ($action === 'reserve_cancel') {
+            $result = reservation_set_status((int) ($_POST['reservation_id'] ?? 0), 'cancelled', (int) $user['id'], 'tourist');
+        } else {
+            $result = reservation_replace_restaurant((int) $user['id'], (int) ($_POST['item_id'] ?? 0), (int) ($_POST['business_id'] ?? 0));
+        }
+        flash($result['ok'] ? 'success' : 'error', $result['message']);
+        redirect($back);
+    }
+
     if ($action === 'create') {
         $rawMeetup = trim((string) ($_POST['meetup_time'] ?? ''));
         $meetup = $rawMeetup === '' ? null : (normalize_time_input($rawMeetup) ?? null);
@@ -1089,7 +1111,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
             $travelMins,
             $visitMins,
         ]);
-        redirect(APP_URL . '/tourist/itineraries.php?id=' . $iid);
+        $newStopId = (int) db()->lastInsertId();
+        $reserve = '';
+        if (!empty($ref['business_id'])) {
+            $typeSt = db()->prepare(
+                'SELECT bt.name FROM businesses b JOIN business_types bt ON bt.id = b.business_type_id WHERE b.id=? LIMIT 1'
+            );
+            $typeSt->execute([(int) $ref['business_id']]);
+            $addedKind = revenue_bookable_kind((string) $typeSt->fetchColumn());
+            if (revenue_uses_reservation($addedKind)) {
+                $reserve = '&reserve=' . $newStopId;
+            }
+        }
+        redirect(APP_URL . '/tourist/itineraries.php?id=' . $iid . $reserve);
     }
 
     if ($action === 'clear_stops' && itin_owned((int) ($_POST['itinerary_id'] ?? 0), (int) $user['id'])) {
@@ -1472,9 +1506,6 @@ foreach ($destinations as $d) {
         'on_tour' => $onTour,
     ];
 }
-if ($destPicker) {
-    $placePickerGroups[] = ['label' => 'Destinations', 'items' => $destPicker];
-}
 $bizPicker = [];
 foreach ($businesses as $b) {
     if (business_excluded_from_itinerary_stops($b['type_name'] ?? '')) {
@@ -1490,8 +1521,9 @@ foreach ($businesses as $b) {
         'on_tour' => $onTour,
     ];
 }
-if ($bizPicker) {
-    $placePickerGroups[] = ['label' => 'Local businesses', 'items' => $bizPicker];
+$placePicker = array_merge($destPicker, $bizPicker);
+if ($placePicker) {
+    $placePickerGroups[] = ['label' => 'Places', 'items' => $placePicker];
 }
 
 // Empty drafts with a past date → clear so the field stays blank.
@@ -2338,11 +2370,11 @@ require __DIR__ . '/../includes/header.php';
                           <span class="itin-rich-picker__trigger-media" data-itin-rich-trigger-media></span>
                           <span class="itin-rich-picker__trigger-text">
                             <span class="itin-rich-picker__trigger-title" data-itin-rich-trigger-title>Choose a place…</span>
-                            <span class="itin-rich-picker__trigger-sub" data-itin-rich-trigger-sub>Destinations or businesses</span>
+                            <span class="itin-rich-picker__trigger-sub" data-itin-rich-trigger-sub>Places</span>
                           </span>
                         </button>
                       </div>
-                      <div class="form-text" data-itin-travel-hint>Switch Destinations / Businesses, then pick a place with photo and details.</div>
+                      <div class="form-text" data-itin-travel-hint>Pick a place with a photo and details.</div>
                       <div class="alert alert-warning py-2 px-3 small mt-2 mb-0 d-none" data-itin-travel-warn role="alert"></div>
                     </div>
                     <div class="col-12<?= $isMultidayTour ? '' : ' d-none' ?>" data-itin-add-day-wrap>
@@ -2398,10 +2430,6 @@ require __DIR__ . '/../includes/header.php';
                     <button type="button" class="itin-rich-picker__close" data-itin-rich-close aria-label="Close place picker">
                       <i class="bi bi-x-lg" aria-hidden="true"></i>
                     </button>
-                  </div>
-                  <div class="itin-rich-picker__tabs" role="tablist">
-                    <button type="button" class="itin-rich-picker__tab is-active" data-itin-rich-tab="destination" role="tab" aria-selected="true">Destinations</button>
-                    <button type="button" class="itin-rich-picker__tab" data-itin-rich-tab="business" role="tab" aria-selected="false">Businesses</button>
                   </div>
                   <div class="itin-rich-picker__search">
                     <i class="bi bi-search" aria-hidden="true"></i>
@@ -2610,10 +2638,11 @@ require __DIR__ . '/../includes/header.php';
                               <div class="small text-muted">
                                 <?php if ($canEdit): ?><i class="bi bi-grip-vertical itin-item__handle"></i><?php endif; ?>
                                 Stop <span data-itin-stop-num><?= $idx + 1 ?></span>
-                                · <?= $stopKind === 'business' ? 'Business' : 'Destination' ?><span data-itin-travel-wrap><?php if ($travel !== null && $travel > 0): ?> · ~<span data-itin-travel><?= (int) $travel ?></span> min drive<?php endif; ?></span>
+                                · Place<span data-itin-travel-wrap><?php if ($travel !== null && $travel > 0): ?> · ~<span data-itin-travel><?= (int) $travel ?></span> min drive<?php endif; ?></span>
                               </div>
                               <div><?= e($it['stop_name'] ?? $it['destination_name'] ?? 'Unknown place') ?></div>
                               <div class="small text-muted"><?= e($it['location'] ?? '') ?></div>
+                              <?php reservation_render_stop_panel($it, $view, (bool) $canEdit); ?>
                               <div class="small itin-stop-times" data-itin-stop-times>
                                 <span data-itin-arrive-leave<?= ($dayMeetupMins === null) ? ' hidden' : '' ?>>Estimated time of arrival <span data-itin-arrive><?= e($arrive) ?></span> · Leave <span data-itin-leave><?= e($leave) ?></span></span>
                                 <span class="itin-stop-times__stay">Stay <span data-itin-stay><?php
@@ -2764,6 +2793,16 @@ require __DIR__ . '/../includes/header.php';
           <div><dt>Stay</dt><dd data-itin-review="stay">Not chosen</dd></div>
           <div><dt>Ride</dt><dd data-itin-review="ride">Not chosen</dd></div>
           <div><dt>Stops</dt><dd data-itin-review="stops"><?= count($stops) ?> stop<?= count($stops) === 1 ? '' : 's' ?></dd></div>
+          <?php $reviewReservations = reservation_itinerary_map((int) $view['id']); ?>
+          <?php if ($reviewReservations): ?>
+          <div><dt>Reservations</dt><dd>
+            <?php foreach ($reviewReservations as $reviewReservation): ?>
+              <?php foreach (reservation_summary_lines($reviewReservation) as $reviewLine): ?>
+                <div><?= e($reviewLine) ?></div>
+              <?php endforeach; ?>
+            <?php endforeach; ?>
+          </dd></div>
+          <?php endif; ?>
         </dl>
         <div class="guide-book-bill" data-guide-bill data-ride-spans="<?= (int) ($rideDays ?? $dayCountDisplay) ?>">
           <ul class="guide-book-bill__rows">
@@ -3032,14 +3071,21 @@ require __DIR__ . '/../includes/header.php';
             <span>I don’t need accommodation</span>
           </label>
           <?php if ($stayHotels): ?>
+          <label class="pick-search">
+            <i class="bi bi-search" aria-hidden="true"></i>
+            <input type="search" data-pick-search placeholder="Search a place" aria-label="Search a place" autocomplete="off">
+          </label>
           <div class="pick-focus pick-focus--stay" data-pick-focus>
-            <button type="button" class="pick-focus__arrow pick-focus__arrow--prev" aria-label="Previous place"><i class="bi bi-chevron-left"></i></button>
+            <p class="pick-search__empty" data-pick-empty hidden>No places match that search.</p>
             <div class="pick-focus__stage">
-              <div class="pick-focus__slot" data-slot="left"></div>
+              <div class="pick-focus__slot" data-slot="left">
+                <button type="button" class="pick-focus__arrow pick-focus__arrow--prev" aria-label="Previous place"><i class="bi bi-chevron-up"></i></button>
+              </div>
               <div class="pick-focus__slot pick-focus__slot--center" data-slot="center"></div>
-              <div class="pick-focus__slot" data-slot="right"></div>
+              <div class="pick-focus__slot" data-slot="right">
+                <button type="button" class="pick-focus__arrow pick-focus__arrow--next" aria-label="Next place"><i class="bi bi-chevron-down"></i></button>
+              </div>
             </div>
-            <button type="button" class="pick-focus__arrow pick-focus__arrow--next" aria-label="Next place"><i class="bi bi-chevron-right"></i></button>
           </div>
           <?php endif; ?>
           <div class="pick-row pick-row--places" role="listbox" aria-label="Accommodation">
@@ -3264,15 +3310,22 @@ require __DIR__ . '/../includes/header.php';
             <input type="radio" name="stayRideTrn" value="0" data-service-id="" data-review-label="Not needed"<?= $savedTrnDeclined ? ' checked' : '' ?>>
             <span>I don’t need transportation</span>
           </label>
+          <label class="pick-search">
+            <i class="bi bi-search" aria-hidden="true"></i>
+            <input type="search" data-pick-search placeholder="Search a place" aria-label="Search a place" autocomplete="off">
+          </label>
           <?php if ($stayRides): ?>
           <div class="pick-focus pick-focus--stay" data-pick-focus>
-            <button type="button" class="pick-focus__arrow pick-focus__arrow--prev" aria-label="Previous place"><i class="bi bi-chevron-left"></i></button>
+            <p class="pick-search__empty" data-pick-empty hidden>No places match that search.</p>
             <div class="pick-focus__stage">
-              <div class="pick-focus__slot" data-slot="left"></div>
+              <div class="pick-focus__slot" data-slot="left">
+                <button type="button" class="pick-focus__arrow pick-focus__arrow--prev" aria-label="Previous place"><i class="bi bi-chevron-up"></i></button>
+              </div>
               <div class="pick-focus__slot pick-focus__slot--center" data-slot="center"></div>
-              <div class="pick-focus__slot" data-slot="right"></div>
+              <div class="pick-focus__slot" data-slot="right">
+                <button type="button" class="pick-focus__arrow pick-focus__arrow--next" aria-label="Next place"><i class="bi bi-chevron-down"></i></button>
+              </div>
             </div>
-            <button type="button" class="pick-focus__arrow pick-focus__arrow--next" aria-label="Next place"><i class="bi bi-chevron-right"></i></button>
           </div>
           <?php endif; ?>
           <div class="pick-row pick-row--places" role="listbox" aria-label="Transportation">
@@ -3642,9 +3695,8 @@ require __DIR__ . '/../includes/header.php';
     var place = places[key] || null;
     if (titleEl) titleEl.textContent = (place && place.name) || fallbackName || 'Place';
     if (subEl) {
-      var kindLabel = place && place.kind === 'business' ? 'Business' : 'Destination';
-      var sub = place && place.subtitle ? place.subtitle : '';
-      subEl.textContent = sub ? (kindLabel + ' · ' + sub) : kindLabel;
+      var sub = place && place.subtitle ? place.subtitle : 'Place';
+      subEl.textContent = sub;
     }
     if (!bodyEl) return;
     if (!place) {
@@ -6123,7 +6175,7 @@ CulTourMap.bindItineraryStopTiming(document.getElementById('itinAddStopForm'), {
   function filtered() {
     var q = String(query || '').trim().toLowerCase();
     return allPlaces.filter(function (p) {
-      if (!p || p.kind !== kind) return false;
+      if (!p) return false;
       if (meetupPickDay == null && p.stopExcluded) return false;
       if (!q) return true;
       var hay = ((p.name || '') + ' ' + (p.subtitle || '') + ' ' + (p.location || '') + ' ' + (p.description || '')).toLowerCase();
@@ -6156,12 +6208,12 @@ CulTourMap.bindItineraryStopTiming(document.getElementById('itinAddStopForm'), {
     var shownFavHead = false;
     var shownAllHead = false;
     rows.forEach(function (p) {
-      if (kind === 'destination' && p.favorite && !shownFavHead) {
+      if (p.favorite && !shownFavHead) {
         html += '<div class="itin-rich-picker__section">Favorites</div>';
         shownFavHead = true;
       }
-      if (kind === 'destination' && !p.favorite && shownFavHead && !shownAllHead) {
-        html += '<div class="itin-rich-picker__section">All destinations</div>';
+      if (!p.favorite && shownFavHead && !shownAllHead) {
+        html += '<div class="itin-rich-picker__section">All places</div>';
         shownAllHead = true;
       }
       var coverStyle = p.cover
@@ -6213,8 +6265,8 @@ CulTourMap.bindItineraryStopTiming(document.getElementById('itinAddStopForm'), {
     if (titleEl) titleEl.textContent = place ? place.name : 'Choose a place…';
     if (subEl) {
       subEl.textContent = place
-        ? metaBits(place) || (place.kind === 'business' ? 'Business' : 'Destination')
-        : 'Destinations or businesses';
+        ? metaBits(place) || 'Place'
+        : 'Places';
     }
     if (mediaEl) {
       if (place && place.cover) {
@@ -8130,22 +8182,38 @@ window.itinVisitHm = {
       var shelf = board.querySelector('[data-pick-shelf]');
       if (shelf) shelf.hidden = !any;
     }
+    var search = board.querySelector('[data-pick-search]');
+    function cardText(card) {
+      var name = card.querySelector('.pick-spot__name');
+      var place = card.querySelector('.pick-spot__place');
+      return ((name ? name.textContent : '') + ' ' + (place ? place.textContent : '')).toLowerCase();
+    }
+    function visibleCards() {
+      var q = search ? String(search.value || '').trim().toLowerCase() : '';
+      if (!q) return cards.slice();
+      return cards.filter(function (card) { return cardText(card).indexOf(q) !== -1; });
+    }
     function paint() {
       if (!focus || !cards.length) return;
-      var n = cards.length;
+      var loop = visibleCards();
+      var n = loop.length;
+      var pos = loop.indexOf(cards[idx]);
+      if (pos < 0) pos = 0;
       ['left', 'center', 'right'].forEach(function (name) {
         var slot = focus.querySelector('[data-slot="' + name + '"]');
         if (!slot) return;
+        Array.prototype.slice.call(slot.querySelectorAll('.pick-spot')).forEach(function (node) {
+          slot.removeChild(node);
+        });
         var offset = name === 'left' ? -1 : (name === 'right' ? 1 : 0);
-        var source = (n < 2 && offset !== 0) ? null : cards[(idx + offset + n) % n];
-        while (slot.firstChild) slot.removeChild(slot.firstChild);
+        var source = (!n || (n < 2 && offset !== 0)) ? null : loop[(pos + offset + n) % n];
         slot.classList.toggle('is-empty', !source);
         if (!source) return;
         var clone = source.cloneNode(true);
         clone.addEventListener('click', function () {
           var id = String(source.getAttribute('data-pick-card') || '');
-          var pos = cards.indexOf(source);
-          if (pos >= 0) idx = pos;
+          var at = cards.indexOf(source);
+          if (at >= 0) idx = at;
           paint();
           selectPlace(id);
         });
@@ -8156,6 +8224,20 @@ window.itinVisitHm = {
       var next = focus.querySelector('.pick-focus__arrow--next');
       if (prev) prev.hidden = hideArrows;
       if (next) next.hidden = hideArrows;
+      var empty = focus.querySelector('[data-pick-empty]');
+      var stage = focus.querySelector('.pick-focus__stage');
+      if (empty) empty.hidden = n > 0;
+      if (stage) stage.hidden = n === 0;
+    }
+    function step(dir) {
+      var loop = visibleCards();
+      if (loop.length < 2) return;
+      var pos = loop.indexOf(cards[idx]);
+      if (pos < 0) pos = 0;
+      pos = (pos + dir + loop.length) % loop.length;
+      idx = cards.indexOf(loop[pos]);
+      paint();
+      selectPlace(cards[idx].getAttribute('data-pick-card'));
     }
     function selectPlace(id) {
       board.querySelectorAll('input[name="' + group + '"]').forEach(function (input) {
@@ -8186,17 +8268,19 @@ window.itinVisitHm = {
     if (focus) {
       var prevBtn = focus.querySelector('.pick-focus__arrow--prev');
       var nextBtn = focus.querySelector('.pick-focus__arrow--next');
-      if (prevBtn) prevBtn.addEventListener('click', function () {
-        if (cards.length < 2) return;
-        idx = (idx - 1 + cards.length) % cards.length;
+      if (prevBtn) prevBtn.addEventListener('click', function () { step(-1); });
+      if (nextBtn) nextBtn.addEventListener('click', function () { step(1); });
+    }
+    if (search) {
+      search.addEventListener('input', function () {
+        var loop = visibleCards();
+        if (loop.length && loop.indexOf(cards[idx]) < 0) {
+          idx = cards.indexOf(loop[0]);
+          paint();
+          selectPlace(cards[idx].getAttribute('data-pick-card'));
+          return;
+        }
         paint();
-        selectPlace(cards[idx].getAttribute('data-pick-card'));
-      });
-      if (nextBtn) nextBtn.addEventListener('click', function () {
-        if (cards.length < 2) return;
-        idx = (idx + 1) % cards.length;
-        paint();
-        selectPlace(cards[idx].getAttribute('data-pick-card'));
       });
     }
     board.querySelectorAll('input[name="' + group + '"]').forEach(function (input) {

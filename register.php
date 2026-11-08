@@ -578,7 +578,8 @@ $bizPhonePosted = ph_phone_local_digits((string) ($_POST['business_phone_local']
           </div>
           <div class="col-md">
             <label class="form-label">Tax Identification Number</label>
-            <input class="form-control" name="tax_id" placeholder="If applicable" value="<?= e($_POST['tax_id'] ?? '') ?>">
+            <input class="form-control js-tax-digits" name="tax_id" inputmode="numeric" autocomplete="off" pattern="[0-9]*" placeholder="If applicable" value="<?= e($_POST['tax_id'] ?? '') ?>">
+            <div class="form-text text-danger d-none js-tax-digits-warn"></div>
           </div>
           <div class="col-12">
             <label class="form-label">Business Address</label>

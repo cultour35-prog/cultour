@@ -60,7 +60,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $biz && !verify_csrf()) {
             redirect($profileUrl);
         }
         $d = $svc['data'];
-        $keepOfferMeta = in_array(business_catalog_mode($bizTypeName), ['rooms', 'vehicles', 'packages'], true);
+        $keepOfferMeta = in_array(business_catalog_mode($bizTypeName), ['rooms', 'vehicles', 'packages', 'menu'], true);
         db()->prepare(
             'INSERT INTO business_services (business_id, name, description, price, duration_minutes)
              VALUES (?,?,?,?,?)'

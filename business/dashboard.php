@@ -28,9 +28,25 @@ $biz->execute([$user['id']]);
 $biz = $biz->fetch();
 
 $svc = 0; $photos = 0;
+$showEarnings = false;
+$earnRows = [];
+$earnDashTotal = 0.0;
+$earnMode = '';
 if ($biz) {
     $s = db()->prepare('SELECT COUNT(*) FROM business_services WHERE business_id=?'); $s->execute([$biz['id']]); $svc = (int)$s->fetchColumn();
     $s = db()->prepare('SELECT COUNT(*) FROM business_photos WHERE business_id=?'); $s->execute([$biz['id']]); $photos = (int)$s->fetchColumn();
+    $earnMode = business_catalog_mode($biz['type_name'] ?? '');
+    $showEarnings = in_array($earnMode, ['packages', 'rooms', 'vehicles'], true);
+    if ($showEarnings) {
+        require_once __DIR__ . '/../includes/business_earnings.php';
+        $earnRows = business_earnings_rows((int) $biz['id'], $earnMode);
+        $earnMonth = substr(app_today(), 0, 7);
+        foreach ($earnRows as $earnRow) {
+            if (str_starts_with($earnRow['sort_date'], $earnMonth)) {
+                $earnDashTotal += (float) $earnRow['amount'];
+            }
+        }
+    }
 }
 
 ensure_destination_coords();
@@ -98,9 +114,12 @@ require __DIR__ . '/../includes/business_shell_start.php';
         <?php endif; ?>
         <?php if ($bizVisitView === ''): ?>
         <div class="row g-3 mb-4" data-live-stats="business_dashboard">
-          <div class="col-md-4"><div class="glass stat-card"><div class="label"><?= e(business_catalog_copy($biz['type_name'] ?? '')['label']) ?></div><p class="value" data-stat="services"><?= $svc ?></p></div></div>
-          <div class="col-md-4"><div class="glass stat-card"><div class="label">Photos</div><p class="value" data-stat="photos"><?= $photos ?></p></div></div>
-          <div class="col-md-4"><div class="glass stat-card"><div class="label">Listing</div><p class="value" data-stat="listing" style="font-size:1.2rem"><?= e(ucfirst($biz['status'])) ?></p></div></div>
+          <div class="<?= $showEarnings ? 'col-6 col-lg-3' : 'col-md-4' ?>"><div class="glass stat-card"><div class="label"><?= e(business_catalog_copy($biz['type_name'] ?? '')['label']) ?></div><p class="value" data-stat="services"><?= $svc ?></p></div></div>
+          <div class="<?= $showEarnings ? 'col-6 col-lg-3' : 'col-md-4' ?>"><div class="glass stat-card"><div class="label">Photos</div><p class="value" data-stat="photos"><?= $photos ?></p></div></div>
+          <div class="<?= $showEarnings ? 'col-6 col-lg-3' : 'col-md-4' ?>"><div class="glass stat-card"><div class="label">Listing</div><p class="value" data-stat="listing" style="font-size:1.2rem"><?= e(ucfirst($biz['status'])) ?></p></div></div>
+          <?php if ($showEarnings): ?>
+          <div class="col-6 col-lg-3"><a class="glass stat-card" href="?view=report"><div class="label">Earnings</div><p class="value" style="font-size:1.35rem"><?= e(format_money($earnDashTotal)) ?></p></a></div>
+          <?php endif; ?>
         </div>
         <?php endif; ?>
 
@@ -351,6 +370,70 @@ require __DIR__ . '/../includes/business_shell_start.php';
               </div>
             </div>
           </div>
+          <?php if ($showEarnings): ?>
+            <?php
+              $earnMonthRows = array_values(array_filter(
+                  $earnRows,
+                  static fn (array $row): bool => str_starts_with($row['sort_date'], $visitYm)
+              ));
+              $earnMonthTotal = array_sum(array_column($earnMonthRows, 'amount'));
+              $earnItemLabel = match ($earnMode) {
+                  'rooms' => 'Room',
+                  'vehicles' => 'Vehicle',
+                  default => 'Package',
+              };
+              $earnPayLabel = static function (string $status): string {
+                  return match ($status) {
+                      'paid' => 'Paid',
+                      'pay_at_office' => 'Pay at Tourism Office',
+                      'pending_review' => 'Waiting for confirmation',
+                      default => 'Booked',
+                  };
+              };
+            ?>
+            <div class="biz-report__stat mb-3">
+              <div class="label">Earnings</div>
+              <div class="value"><?= e(format_money((float) $earnMonthTotal)) ?></div>
+            </div>
+            <?php if (!$earnMonthRows): ?>
+              <p class="text-muted">No earnings this month.</p>
+            <?php else: ?>
+              <div class="table-responsive mb-4">
+                <table class="table table-sm table-ct align-middle mb-0 biz-report__table">
+                  <thead>
+                    <tr>
+                      <th>Tourist</th>
+                      <th><?= e($earnItemLabel) ?></th>
+                      <th>Date</th>
+                      <th>Amount</th>
+                      <th>Payment</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <?php foreach ($earnMonthRows as $earnRow): ?>
+                      <tr>
+                        <td>
+                          <div class="fw-semibold"><?= e($earnRow['tourist']) ?></div>
+                          <?php if ($earnRow['phone'] !== ''): ?>
+                            <div class="small text-muted"><?= e($earnRow['phone']) ?></div>
+                          <?php endif; ?>
+                        </td>
+                        <td>
+                          <?= e($earnRow['item']) ?>
+                          <?php if ($earnRow['code'] !== ''): ?>
+                            <div class="small text-muted"><?= e($earnRow['code']) ?></div>
+                          <?php endif; ?>
+                        </td>
+                        <td><?= e($earnRow['when']) ?></td>
+                        <td><?= e(format_money((float) $earnRow['amount'])) ?></td>
+                        <td><?= e($earnPayLabel($earnRow['payment'])) ?></td>
+                      </tr>
+                    <?php endforeach; ?>
+                  </tbody>
+                </table>
+              </div>
+            <?php endif; ?>
+          <?php endif; ?>
           <?php if (!$visitsByDate): ?>
             <p class="text-muted mb-0">No visits are booked at your business this month.</p>
           <?php else: ?>

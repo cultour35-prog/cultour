@@ -113,11 +113,11 @@ function content_report_reasons(): array
 function content_report_target_kind(string $targetType): string
 {
     return match ($targetType) {
-        'destination' => 'Destination',
+        'destination' => 'Government site',
         'business' => 'Business',
-        'destination_image' => 'Destination photo',
+        'destination_image' => 'Government site photo',
         'business_photo' => 'Business photo',
-        'review' => 'Destination review',
+        'review' => 'Government site review',
         'business_review' => 'Business review',
         'user' => 'Account',
         default => 'Other',
@@ -257,7 +257,7 @@ function moderate_reported_content(string $targetType, int $targetId): string
                 db()->prepare('UPDATE destinations SET avg_rating=?, review_count=? WHERE id=?')
                     ->execute([round((float) $a, 2), (int) $c, $destId]);
             }
-            return 'Destination review hidden.';
+            return 'Government site review hidden.';
         }
         if ($targetType === 'business_review') {
             require_once __DIR__ . '/business_engagement.php';
@@ -277,7 +277,7 @@ function moderate_reported_content(string $targetType, int $targetId): string
         }
         if ($targetType === 'destination_image') {
             db()->prepare('UPDATE destination_images SET is_hidden=1 WHERE id=?')->execute([$targetId]);
-            return 'Destination photo hidden.';
+            return 'Government site photo hidden.';
         }
         if ($targetType === 'business') {
             db()->prepare("UPDATE businesses SET status='inactive' WHERE id=?")->execute([$targetId]);
@@ -285,7 +285,7 @@ function moderate_reported_content(string $targetType, int $targetId): string
         }
         if ($targetType === 'destination') {
             db()->prepare("UPDATE destinations SET status='draft' WHERE id=? AND status='published'")->execute([$targetId]);
-            return 'Destination unpublished (draft).';
+            return 'Government site unpublished (draft).';
         }
     } catch (Throwable $e) {
         return 'Could not apply takedown.';

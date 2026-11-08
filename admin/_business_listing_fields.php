@@ -180,7 +180,8 @@ $listingSexField = static function (string $name, string $selected): void {
         </div>
         <div>
           <label class="form-label">Tax Identification Number</label>
-          <input class="form-control" name="tax_id" placeholder="If applicable" value="<?= e((string) ($listing['tax_id'] ?? '')) ?>">
+          <input class="form-control js-tax-digits" name="tax_id" inputmode="numeric" autocomplete="off" pattern="[0-9]*" placeholder="If applicable" value="<?= e((string) ($listing['tax_id'] ?? '')) ?>">
+          <div class="form-text text-danger d-none js-tax-digits-warn"></div>
         </div>
       </div>
     </div>
@@ -300,7 +301,8 @@ $listingSexField = static function (string $name, string $selected): void {
 </div>
 <div class="col-md-6">
   <label class="form-label">Tax Identification Number</label>
-  <input class="form-control" name="tax_id" placeholder="If applicable" value="<?= e((string) ($listing['tax_id'] ?? '')) ?>">
+  <input class="form-control js-tax-digits" name="tax_id" inputmode="numeric" autocomplete="off" pattern="[0-9]*" placeholder="If applicable" value="<?= e((string) ($listing['tax_id'] ?? '')) ?>">
+  <div class="form-text text-danger d-none js-tax-digits-warn"></div>
 </div>
 <div class="col-12">
   <label class="form-label">Business Description</label>

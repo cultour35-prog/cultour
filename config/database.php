@@ -2,13 +2,85 @@
 /**
  * CulTour Database Configuration
  * Ormoc City Tourism Office
+ *
+ * Local (localhost / 127.0.0.1): XAMPP cultour_db as root.
+ * Any other host: InfinityFree credentials from CULTOUR_DB_* (config/secrets.php).
+ * Production never falls back to the local database.
  */
 
-define('DB_HOST', '127.0.0.1');
-define('DB_NAME', 'cultour_db');
-define('DB_USER', 'root');
-define('DB_PASS', '');
+if (!defined('ROOT_PATH')) {
+    define('ROOT_PATH', dirname(__DIR__));
+}
+
+$cultourSecretsFile = ROOT_PATH . '/config/secrets.php';
+if (is_file($cultourSecretsFile)) {
+    require_once $cultourSecretsFile;
+}
+
+function cultour_db_env(string $key): string
+{
+    if (function_exists('cultour_env')) {
+        return cultour_env($key, '');
+    }
+    $v = getenv($key);
+    if (is_string($v) && trim($v) !== '') {
+        return trim($v);
+    }
+    if (isset($_ENV[$key]) && trim((string) $_ENV[$key]) !== '') {
+        return trim((string) $_ENV[$key]);
+    }
+    return '';
+}
+
+function cultour_is_local_request(): bool
+{
+    $host = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'localhost';
+    $host = strtolower(trim((string) $host));
+    $host = preg_replace('/:\d+$/', '', $host) ?? $host;
+    return in_array($host, ['localhost', '127.0.0.1', '::1'], true);
+}
+
+/**
+ * @return array{host:string,name:string,user:string,pass:string,local:bool}
+ */
+function cultour_db_config(): array
+{
+    if (cultour_is_local_request()) {
+        return [
+            'host' => '127.0.0.1',
+            'name' => 'cultour_db',
+            'user' => 'root',
+            'pass' => '',
+            'local' => true,
+        ];
+    }
+
+    return [
+        'host' => cultour_db_env('CULTOUR_DB_HOST'),
+        'name' => cultour_db_env('CULTOUR_DB_NAME'),
+        'user' => cultour_db_env('CULTOUR_DB_USER'),
+        'pass' => cultour_db_env('CULTOUR_DB_PASS'),
+        'local' => false,
+    ];
+}
+
+$cultourDb = cultour_db_config();
+
+define('DB_HOST', $cultourDb['host']);
+define('DB_NAME', $cultourDb['name']);
+define('DB_USER', $cultourDb['user']);
+define('DB_PASS', $cultourDb['pass']);
 define('DB_CHARSET', 'utf8mb4');
+define('DB_IS_LOCAL', $cultourDb['local']);
+
+function cultour_db_fail(string $logMessage): void
+{
+    error_log('CulTour DB: ' . $logMessage);
+    if (!headers_sent()) {
+        http_response_code(503);
+    }
+    die('Database connection failed. Please try again later.');
+}
 
 /**
  * Get PDO database connection (singleton).
@@ -18,54 +90,44 @@ function db(): PDO
     static $pdo = null;
 
     if ($pdo === null) {
+        if (!DB_IS_LOCAL && (DB_HOST === '' || DB_NAME === '' || DB_USER === '' || DB_PASS === '')) {
+            cultour_db_fail('Production database credentials are missing. Set CULTOUR_DB_HOST, CULTOUR_DB_NAME, CULTOUR_DB_USER, and CULTOUR_DB_PASS in config/secrets.php on the server.');
+        }
+
+        $usePipe = DB_IS_LOCAL && PHP_OS_FAMILY === 'Windows';
         $options = [
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             PDO::ATTR_EMULATE_PREPARES   => false,
-            PDO::ATTR_PERSISTENT         => true,
+            // Each Windows click was opening a new TCP connection and leaving it
+            // in TIME_WAIT until the port list filled up. Reuse one pipe connection
+            // per Apache thread. Production stays non-persistent.
+            PDO::ATTR_PERSISTENT         => $usePipe,
         ];
-        $dsns = [
-            'mysql:host=localhost;dbname=' . DB_NAME . ';charset=' . DB_CHARSET,
-            'mysql:host=' . DB_HOST . ';port=3306;dbname=' . DB_NAME . ';charset=' . DB_CHARSET,
-        ];
+        $dsn = $usePipe
+            ? 'mysql:unix_socket=\\\\.\\pipe\\MySQL;dbname=' . DB_NAME . ';charset=' . DB_CHARSET
+            : 'mysql:host=' . DB_HOST . ';port=3306;dbname=' . DB_NAME . ';charset=' . DB_CHARSET;
+
         $lastError = null;
-        foreach ($dsns as $index => $dsn) {
-            $tries = $index === 0 ? 2 : 8;
-            for ($attempt = 0; $attempt < $tries; $attempt++) {
-                try {
-                    $pdo = new PDO($dsn, DB_USER, DB_PASS, $options);
-                    break 2;
-                } catch (PDOException $e) {
-                    $lastError = $e;
-                    $portBusy = str_contains($e->getMessage(), 'Only one usage of each socket address');
-                    if (!$portBusy || $attempt === $tries - 1) {
-                        break;
-                    }
-                    usleep(20000);
-                }
-            }
-        }
-        if ($pdo instanceof PDO) {
+        $tries = $usePipe ? 3 : 1;
+        for ($attempt = 0; $attempt < $tries; $attempt++) {
             try {
+                $pdo = new PDO($dsn, DB_USER, DB_PASS, $options);
                 $pdo->query('SELECT 1');
+                break;
             } catch (Throwable $e) {
                 $lastError = $e;
                 $pdo = null;
-                try {
-                    $options[PDO::ATTR_PERSISTENT] = false;
-                    $pdo = new PDO($dsns[0], DB_USER, DB_PASS, $options);
-                } catch (Throwable $again) {
-                    $lastError = $again;
-                    $pdo = null;
+                if ($attempt < $tries - 1) {
+                    usleep(40000);
                 }
             }
         }
+
         if (!$pdo instanceof PDO) {
-            if ($lastError instanceof Throwable) {
-                error_log('CulTour DB: ' . $lastError->getMessage());
-            }
-            http_response_code(503);
-            die('Database connection failed. Refresh the page. MySQL is still running, so do not import the SQL file again.');
+            $where = DB_IS_LOCAL ? 'local' : 'production';
+            $detail = $lastError instanceof Throwable ? $lastError->getMessage() : 'unknown error';
+            cultour_db_fail($where . ' connection failed: ' . $detail);
         }
     }
 

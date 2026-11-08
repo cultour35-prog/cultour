@@ -9,7 +9,7 @@ $stmt->execute([$id]);
 $d = $stmt->fetch();
 if (!$d) {
     flash('error', 'Destination not found.');
-    redirect(APP_URL . '/tourist/destinations.php');
+    redirect(APP_URL . '/tourist/places.php');
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
@@ -106,10 +106,10 @@ if (!empty($d['latitude']) && !empty($d['longitude'])) {
 
 $pageTitle = $d['name'];
 $pageHeading = '';
-$pageHeadBackHref = APP_URL . '/tourist/destinations.php';
-$pageHeadBackLabel = 'Back to destinations';
+$pageHeadBackHref = APP_URL . '/tourist/places.php';
+$pageHeadBackLabel = 'Back to places';
 $pageSub = '';
-$activeNav = 'destinations';
+$activeNav = 'places';
 $bodyClass = trim(($bodyClass ?? '') . ' tourist-app');
 require __DIR__ . '/../includes/header.php';
 map_leaflet_head();

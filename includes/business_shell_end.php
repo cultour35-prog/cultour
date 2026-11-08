@@ -5,7 +5,7 @@
  */
 $activeNav = $activeNav ?? '';
 $tbLinkedAccounts = $tbLinkedAccounts ?? (isset($user) ? switchable_linked_accounts($user) : []);
-$moreActive = in_array($activeNav, ['profile', 'inquiries', 'chat'], true);
+$moreActive = in_array($activeNav, ['profile', 'inquiries', 'chat', 'bookings', 'reservations', 'fees'], true);
 ?>
     </div>
   </main>
@@ -28,6 +28,15 @@ $moreActive = in_array($activeNav, ['profile', 'inquiries', 'chat'], true);
         <i class="bi bi-grid"></i><span>More</span>
       </button>
       <ul class="dropdown-menu dropdown-menu-end">
+        <?php if (in_array(($catalogMode ?? ''), ['packages', 'rooms'], true)): ?>
+        <li><a class="dropdown-item <?= $activeNav === 'bookings' ? 'active' : '' ?>" href="<?= APP_URL ?>/business/bookings.php"><i class="bi bi-calendar-check me-2"></i>Bookings</a></li>
+        <?php endif; ?>
+        <?php if (revenue_uses_reservation((string) ($revenueKind ?? ''))): ?>
+        <li><a class="dropdown-item <?= $activeNav === 'reservations' ? 'active' : '' ?>" href="<?= APP_URL ?>/business/reservations.php"><i class="bi bi-journal-check me-2"></i>Reservations</a></li>
+        <?php endif; ?>
+        <?php if (revenue_uses_reservation((string) ($revenueKind ?? '')) || in_array(($revenueKind ?? ''), ['accommodation', 'transportation', 'package'], true)): ?>
+        <li><a class="dropdown-item <?= $activeNav === 'fees' ? 'active' : '' ?>" href="<?= APP_URL ?>/business/fees.php"><i class="bi bi-receipt me-2"></i>Fees</a></li>
+        <?php endif; ?>
         <li><a class="dropdown-item <?= $activeNav === 'inquiries' ? 'active' : '' ?>" href="<?= APP_URL ?>/business/inquiries.php"><i class="bi bi-inbox me-2"></i>Inquiries</a></li>
         <li><a class="dropdown-item <?= $activeNav === 'chat' ? 'active' : '' ?>" href="<?= APP_URL ?>/business/chat.php"><i class="bi bi-chat-dots me-2"></i>Messages</a></li>
         <li><hr class="dropdown-divider"></li>

@@ -4,7 +4,7 @@
  * Expects: $activeNav, $user
  */
 $activeNav = $activeNav ?? '';
-$moreActive = in_array($activeNav, ['businesses', 'profile', 'destinations', 'chat', 'favorites', 'notifications'], true);
+$moreActive = in_array($activeNav, ['places', 'profile', 'chat', 'favorites', 'notifications'], true);
 $tbLinkedAccounts = $tbLinkedAccounts ?? (isset($user) ? switchable_linked_accounts($user) : []);
 ?>
     </div>
@@ -27,12 +27,11 @@ $tbLinkedAccounts = $tbLinkedAccounts ?? (isset($user) ? switchable_linked_accou
       <i class="bi bi-calendar-check"></i><span>Bookings</span>
     </a>
     <div class="dropup tourist-bottomnav__more">
-      <button class="tourist-bottomnav__item <?= $moreActive ? 'is-active' : '' ?>" type="button" data-bs-toggle="dropdown" data-app-tour-fallback="destinations businesses" aria-expanded="false">
+      <button class="tourist-bottomnav__item <?= $moreActive ? 'is-active' : '' ?>" type="button" data-bs-toggle="dropdown" data-app-tour-fallback="places" aria-expanded="false">
         <i class="bi bi-grid"></i><span>More</span>
       </button>
       <ul class="dropdown-menu dropdown-menu-end">
-        <li><a class="dropdown-item <?= $activeNav === 'destinations' ? 'active' : '' ?>" href="<?= APP_URL ?>/tourist/destinations.php" data-app-tour="destinations"><i class="bi bi-geo-alt me-2"></i>Destinations</a></li>
-        <li><a class="dropdown-item <?= $activeNav === 'businesses' ? 'active' : '' ?>" href="<?= APP_URL ?>/tourist/businesses.php" data-app-tour="businesses"><i class="bi bi-shop me-2"></i>Businesses</a></li>
+        <li><a class="dropdown-item <?= $activeNav === 'places' ? 'active' : '' ?>" href="<?= APP_URL ?>/tourist/places.php" data-app-tour="places"><i class="bi bi-geo-alt me-2"></i>Places</a></li>
         <li><a class="dropdown-item <?= $activeNav === 'favorites' ? 'active' : '' ?>" href="<?= APP_URL ?>/tourist/favorites.php" data-app-tour="favorites"><i class="bi bi-heart me-2"></i>Favorites</a></li>
         <li><a class="dropdown-item <?= $activeNav === 'chat' ? 'active' : '' ?>" href="<?= APP_URL ?>/tourist/chat.php"><i class="bi bi-chat-dots me-2"></i>Messages</a></li>
         <li><a class="dropdown-item <?= $activeNav === 'notifications' ? 'active' : '' ?>" href="<?= APP_URL ?>/notifications.php"><i class="bi bi-bell me-2"></i>Notifications</a></li>

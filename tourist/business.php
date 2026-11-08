@@ -27,12 +27,12 @@ $stmt->execute([$id]);
 $b = $stmt->fetch();
 if (!$b) {
     flash('error', 'Business not found.');
-    redirect(APP_URL . '/tourist/businesses.php');
+    redirect(APP_URL . '/tourist/places.php');
 }
 $listingBlock = business_listing_unavailable_message($b);
 if ($listingBlock !== null) {
     flash('error', $listingBlock);
-    redirect(APP_URL . '/tourist/businesses.php');
+    redirect(APP_URL . '/tourist/places.php');
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
@@ -191,10 +191,10 @@ if ($b['latitude'] !== null && $b['longitude'] !== null) {
 
 $pageTitle = $b['name'];
 $pageHeading = '';
-$pageHeadBackHref = APP_URL . '/tourist/businesses.php';
-$pageHeadBackLabel = 'Back to businesses';
+$pageHeadBackHref = APP_URL . '/tourist/places.php';
+$pageHeadBackLabel = 'Back to places';
 $pageSub = '';
-$activeNav = 'businesses';
+$activeNav = 'places';
 
 $bodyClass = trim(($bodyClass ?? '') . ' tourist-app');
 require __DIR__ . '/../includes/header.php';
@@ -295,17 +295,17 @@ map_leaflet_head();
                     <?php endif; ?>
                     <div>
                       <div class="fw-semibold"><?= e($s['name']) ?></div>
-                      <?php if (in_array($offerMode, ['rooms', 'vehicles', 'packages'], true) && !empty($s['description'])): ?>
+                      <?php if (in_array($offerMode, ['rooms', 'vehicles', 'packages', 'menu'], true) && !empty($s['description'])): ?>
                         <div class="small text-muted"><?= e($s['description']) ?></div>
                       <?php endif; ?>
                       <?php if (!empty($s['amenities']) || !empty($s['capacity'])): ?>
                         <div class="small text-muted">
-                          <?php if (!empty($s['capacity'])): ?><?= (int) $s['capacity'] ?> <?= $offerMode === 'vehicles' ? 'seats' : 'guests' ?><?php endif; ?>
+                          <?php if (!empty($s['capacity'])): ?><?= (int) $s['capacity'] ?> <?= $offerMode === 'vehicles' ? 'seats' : ($offerMode === 'packages' ? 'pax' : 'guests') ?><?php endif; ?>
                           <?php if (!empty($s['amenities'])): ?><?= !empty($s['capacity']) ? ' · ' : '' ?><?= e($s['amenities']) ?><?php endif; ?>
                         </div>
                       <?php endif; ?>
                     </div>
-                    <?php if (in_array($offerMode, ['rooms', 'vehicles', 'packages'], true)): ?>
+                    <?php if (in_array($offerMode, ['rooms', 'vehicles', 'packages', 'menu'], true)): ?>
                     <div class="place-detail-svc__meta">
                       <span><?= $s['price'] !== null ? e(format_money((float) $s['price'])) : '—' ?></span>
                       <?php if ($offerMode === 'packages' && (int) ($s['package_days'] ?? 0) > 0): ?>

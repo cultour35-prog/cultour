@@ -29,8 +29,7 @@ $tbNotifLive = live_header_notif_payload((int) $user['id'], $returnUrl);
 $touristNav = [
     ['dashboard', 'Dashboard', '/tourist/dashboard.php', 'bi-house'],
     ['map', 'Map', '/map.php', 'bi-map'],
-    ['destinations', 'Destinations', '/tourist/destinations.php', 'bi-geo-alt'],
-    ['businesses', 'Businesses', '/tourist/businesses.php', 'bi-shop'],
+    ['places', 'Places', '/tourist/places.php', 'bi-geo-alt'],
     ['itineraries', 'Itineraries', '/tourist/itineraries.php', 'bi-signpost-2'],
     ['packages', 'Tour package', '/tourist/packages.php', 'bi-suitcase-lg'],
     ['bookings', 'Bookings', '/tourist/bookings.php', 'bi-calendar-check'],

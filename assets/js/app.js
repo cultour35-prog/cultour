@@ -1845,3 +1845,26 @@
     if (ev.persisted) finishNavProgress();
   });
 })();
+
+(function () {
+  document.querySelectorAll('.js-tax-digits').forEach(function (input) {
+    var warn = input.parentElement && input.parentElement.querySelector('.js-tax-digits-warn');
+    function show(msg) {
+      if (warn) {
+        warn.textContent = msg || '';
+        warn.classList.toggle('d-none', !msg);
+      }
+      input.classList.toggle('is-invalid', !!msg);
+    }
+    input.addEventListener('input', function () {
+      var raw = input.value;
+      var digits = raw.replace(/\D+/g, '');
+      if (raw !== digits) {
+        input.value = digits;
+        show('Tax identification number must contain numbers only.');
+      } else {
+        show('');
+      }
+    });
+  });
+})();

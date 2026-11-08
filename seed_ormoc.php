@@ -157,7 +157,7 @@ $destinations = [
     ],
     [
         'slug' => 'puertobelo-beach',
-        'category' => 'beach',
+        'category' => 'park',
         'name' => 'Puertobelo Beach Area',
         'location' => 'Coastal Ormoc / nearby beach strip, Leyte',
         'lat' => 10.9800, 'lng' => 124.5900,
@@ -205,7 +205,7 @@ $destinations = [
     ],
     [
         'slug' => 'sabin-resort-area',
-        'category' => 'beach',
+        'category' => 'park',
         'name' => 'Sabin Resort Beachfront Area',
         'location' => 'Brgy. Combado / coastal Ormoc area',
         'lat' => 11.0205, 'lng' => 124.5750,

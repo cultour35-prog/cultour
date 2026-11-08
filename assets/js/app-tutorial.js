@@ -8,9 +8,8 @@
     tourist: [
       { title: 'Welcome', body: 'This is your CulTour home. Find places, plan a tour, and book a guide.', target: null },
       { title: 'Dashboard', body: 'Your home. Places of interest and your trip summary start here.', target: '[data-app-tour="dashboard"]' },
-      { title: 'Map', body: 'See destinations and businesses on the map.', target: '[data-app-tour="map"]' },
-      { title: 'Destinations', body: 'Browse places of interest in Ormoc.', target: '[data-app-tour="destinations"]', fallback: '[data-app-tour-fallback~="destinations"]' },
-      { title: 'Businesses', body: 'See shops, food, and other local businesses.', target: '[data-app-tour="businesses"]', fallback: '[data-app-tour-fallback~="businesses"]' },
+      { title: 'Map', body: 'See places on the map.', target: '[data-app-tour="map"]' },
+      { title: 'Places', body: 'Browse destinations and local businesses in Ormoc.', target: '[data-app-tour="places"]', fallback: '[data-app-tour-fallback~="places"]' },
       { title: 'Itineraries', body: 'Build a tour, pick a guide, and pay.', target: '[data-app-tour="itineraries"]' },
       { title: 'Tour package', body: 'Browse packages uploaded by tour and travel businesses.', target: '[data-app-tour="packages"]' },
       { title: 'Bookings', body: 'After you pay, the guide still accepts the tour. Your ticket is here once they do.', target: '[data-app-tour="bookings"]' },

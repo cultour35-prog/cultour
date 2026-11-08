@@ -49,18 +49,18 @@ if ($useTouristShell) {
       <div class="mb-3" id="exploreMapFilters">
         <div class="d-flex flex-wrap gap-2 align-items-center">
           <button type="button" class="quick-chip is-active fw-semibold" data-map-filter="all">All</button>
-          <button type="button" class="quick-chip" data-map-filter="destinations">Destinations</button>
+          <button type="button" class="quick-chip" data-map-filter="destinations"><?= (int) $user['role_id'] === ROLE_ADMIN ? 'Government sites' : 'Destinations' ?></button>
           <button type="button" class="quick-chip" data-map-filter="businesses">Businesses</button>
           <div class="map-search flex-grow-1" style="min-width:12rem;max-width:20rem">
             <label class="visually-hidden" for="mapMarkerSearch">Search places</label>
             <div class="input-group input-group-sm">
               <span class="input-group-text"><i class="bi bi-search"></i></span>
               <input type="search" class="form-control" id="mapMarkerSearch" data-map-search
-                     placeholder="Search destinations or businesses…" autocomplete="off">
+                     placeholder="<?= (int) $user['role_id'] === ROLE_ADMIN ? 'Search government sites or businesses…' : 'Search destinations or businesses…' ?>" autocomplete="off">
             </div>
           </div>
           <?php if ((int) $user['role_id'] === ROLE_ADMIN): ?>
-            <a class="quick-chip" href="<?= APP_URL ?>/admin/destinations.php"><i class="bi bi-geo-fill"></i> Pin destinations</a>
+            <a class="quick-chip" href="<?= APP_URL ?>/admin/destinations.php"><i class="bi bi-geo-fill"></i> Pin government sites</a>
           <?php elseif ((int) $user['role_id'] === ROLE_BUSINESS): ?>
             <a class="quick-chip" href="<?= APP_URL ?>/business/profile.php"><i class="bi bi-geo-fill"></i> Pin your business</a>
           <?php endif; ?>
@@ -72,7 +72,7 @@ if ($useTouristShell) {
           <div class="alert alert-warning mb-3 mb-md-0">
             No mapped places yet.
             <?php if ((int) $user['role_id'] === ROLE_ADMIN): ?>
-              Open Destinations and click the map to drop a pin.
+              Open Government sites and click the map to drop a pin.
             <?php elseif ((int) $user['role_id'] === ROLE_BUSINESS): ?>
               Open your business profile and pin your location on the map.
             <?php else: ?>

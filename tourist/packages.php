@@ -22,7 +22,7 @@ ensure_business_favorites_schema();
 ensure_place_schedule_schema();
 
 $q = trim((string) ($_GET['q'] ?? ''));
-$sql = "SELECT s.id, s.name AS package_name, s.description AS package_description, s.price, s.package_days, s.image_path,
+$sql = "SELECT s.id, s.name AS package_name, s.description AS package_description, s.price, s.package_days, s.capacity, s.image_path,
                b.id AS business_id, b.name AS business_name, b.address, b.phone, b.email,
                b.avg_rating, b.review_count,
                bt.name AS type_name, " . business_itinerary_ready_columns() . "
@@ -82,6 +82,7 @@ function tourist_package_card(array $row, bool $active = false): void
     $packageDesc = trim((string) ($row['package_description'] ?? ''));
     $serviceId = (int) ($row['id'] ?? 0);
     $packageDays = (int) ($row['package_days'] ?? 0);
+    $packagePax = (int) ($row['capacity'] ?? 0);
     $coverUrl = tourist_package_cover($row);
     $cover = $coverUrl !== '' ? 'background-image:url(' . e($coverUrl) . ')' : '';
     $isFav = isset($favBizIds[$bizId]);
@@ -98,6 +99,7 @@ function tourist_package_card(array $row, bool $active = false): void
              data-package-photo="<?= e($coverUrl) ?>"
              data-package-price="<?= e(format_money($row['price'] ?? 0)) ?>"
              data-package-days="<?= $packageDays ?>"
+             data-package-pax="<?= $packagePax ?>"
              tabindex="0"
              role="button"
              aria-label="<?= e($aria) ?>">
@@ -117,6 +119,7 @@ function tourist_package_card(array $row, bool $active = false): void
           <div class="ct-rail__title"><?= e($packageName !== '' ? $packageName : 'Package') ?></div>
           <div class="ct-rail__stats">
             <span><?= e(format_money($row['price'] ?? 0)) ?></span>
+            <?php if ($packagePax > 0): ?><span><?= e(package_pax_label($packagePax)) ?></span><?php endif; ?>
           </div>
           <span class="ct-rail__cta">View details <i class="bi bi-arrow-right"></i></span>
         </div>
@@ -184,7 +187,8 @@ function tourist_package_card(array $row, bool $active = false): void
                 <input type="hidden" name="action" value="book_package">
                 <input type="hidden" name="service_id" id="packageBookService" value="">
                 <label class="form-label" for="packageTourDate">Tour date</label>
-                <input type="date" class="form-control" name="tour_date" id="packageTourDate" required min="<?= e(app_today()) ?>">
+                <input type="date" class="form-control" name="tour_date" id="packageTourDate" required min="<?= e(package_earliest_tour_date()) ?>">
+                <p class="small text-muted mb-2">Today and tomorrow are closed. The earliest start is <?= e(format_date(package_earliest_tour_date())) ?>.</p>
                 <p class="package-view-card__span" id="packageTourSpan"></p>
                 <button class="btn btn-ct w-100" type="submit" id="packageBookBtn">Book</button>
               </form>
@@ -212,6 +216,8 @@ $extraScripts = '<script src="' . APP_URL . '/assets/js/focus-rail.js?v='
         var serviceId = card.getAttribute("data-package-id") || "";
         var days = parseInt(card.getAttribute("data-package-days") || "0", 10);
         if (!days || days < 1) days = 0;
+        var pax = parseInt(card.getAttribute("data-package-pax") || "0", 10);
+        if (!pax || pax < 1) pax = 0;
         var title = document.getElementById("packageViewLabel");
         var body = document.getElementById("packageViewDesc");
         var media = document.getElementById("packageViewMedia");
@@ -224,7 +230,11 @@ $extraScripts = '<script src="' . APP_URL . '/assets/js/focus-rail.js?v='
         if (title) title.textContent = name;
         if (body) body.textContent = desc !== "" ? desc : "No description for this package yet.";
         if (priceEl) priceEl.textContent = price;
-        if (daysEl) daysEl.textContent = days > 0 ? (days === 1 ? "1 day" : days + " days") : "This package does not have a length yet.";
+        if (daysEl) {
+          var lengthText = days > 0 ? (days === 1 ? "1 day" : days + " days") : "This package does not have a length yet.";
+          if (pax > 0) lengthText += " · " + (pax === 1 ? "1 pax" : pax + " pax");
+          daysEl.textContent = lengthText;
+        }
         if (serviceInput) serviceInput.value = serviceId;
         if (dateInput) {
           dateInput.value = "";

@@ -44,6 +44,7 @@ if (!$allowed) {
 }
 
 $stops = itinerary_items_with_places($id);
+$reservationMap = reservation_itinerary_map($id);
 $meetup = format_time_12h((string) ($itin['meetup_time'] ?? '08:00:00'));
 $shareUrl = APP_URL . '/itinerary-share.php?id=' . $id;
 $dayCount = itinerary_logical_day_count($itin);
@@ -125,6 +126,12 @@ $stopsByDay = itinerary_group_stops_by_day($stops, $itin['start_date'] ?? null, 
             · Leave <?= e(format_time_12h(isset($it['end_time']) ? (string)$it['end_time'] : null)) ?>
             · Stay <?= (int)($it['visit_minutes'] ?? 60) ?> min
           </div>
+          <?php $stopReservation = $reservationMap[(int) ($it['id'] ?? 0)] ?? null; ?>
+          <?php if ($stopReservation): ?>
+            <?php foreach (reservation_summary_lines($stopReservation) as $reservationLine): ?>
+              <div class="small" style="color:#0e8a7a"><?= e($reservationLine) ?></div>
+            <?php endforeach; ?>
+          <?php endif; ?>
         </div>
       <?php endforeach; ?>
       <?php if (!$g['stops']): ?>

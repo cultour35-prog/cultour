@@ -498,6 +498,9 @@ function ensure_package_order_schema(): void
     if (!in_array('package_days', $cols, true)) {
         db()->exec('ALTER TABLE package_orders ADD COLUMN package_days INT UNSIGNED NULL AFTER tour_date');
     }
+    if (!in_array('package_pax', $cols, true)) {
+        db()->exec('ALTER TABLE package_orders ADD COLUMN package_pax INT UNSIGNED NULL AFTER package_days');
+    }
 }
 
 /**
@@ -518,7 +521,7 @@ function package_order_create(int $touristId, int $serviceId, string $tourDate):
     }
     $tourDate = $dateParsed['date'];
     $st = db()->prepare(
-        'SELECT s.id, s.name AS package_name, s.price, s.package_days, s.is_active,
+        'SELECT s.id, s.name AS package_name, s.price, s.package_days, s.capacity, s.is_active,
                 b.id AS business_id, b.user_id AS business_user_id, b.name AS business_name,
                 bt.name AS type_name, ' . business_itinerary_ready_columns() . '
          FROM business_services s
@@ -540,6 +543,8 @@ function package_order_create(int $touristId, int $serviceId, string $tourDate):
     if ($packageDays < 1) {
         return ['ok' => false, 'message' => 'This package does not have a length yet.', 'checkout_url' => null];
     }
+    $packagePax = (int) ($row['capacity'] ?? 0);
+    $packagePax = $packagePax > 0 ? $packagePax : null;
     $packageName = trim((string) ($row['package_name'] ?? ''));
     if ($packageName === '') {
         $packageName = 'Package';
@@ -555,7 +560,7 @@ function package_order_create(int $touristId, int $serviceId, string $tourDate):
     if ($order) {
         db()->prepare(
             'UPDATE package_orders
-             SET package_name=?, business_name=?, business_id=?, business_user_id=?, amount=?, tour_date=?, package_days=?
+             SET package_name=?, business_name=?, business_id=?, business_user_id=?, amount=?, tour_date=?, package_days=?, package_pax=?
              WHERE id=? AND payment_status=\'unpaid\''
         )->execute([
             $packageName,
@@ -565,6 +570,7 @@ function package_order_create(int $touristId, int $serviceId, string $tourDate):
             $amount,
             $tourDate,
             $packageDays,
+            $packagePax,
             (int) $order['id'],
         ]);
         $order['package_name'] = $packageName;
@@ -574,8 +580,8 @@ function package_order_create(int $touristId, int $serviceId, string $tourDate):
         $code = 'PK' . strtoupper(bin2hex(random_bytes(4)));
         db()->prepare(
             'INSERT INTO package_orders
-                (order_code, tourist_id, business_id, business_user_id, service_id, package_name, business_name, amount, tour_date, package_days)
-             VALUES (?,?,?,?,?,?,?,?,?,?)'
+                (order_code, tourist_id, business_id, business_user_id, service_id, package_name, business_name, amount, tour_date, package_days, package_pax)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?)'
         )->execute([
             $code,
             $touristId,
@@ -587,6 +593,7 @@ function package_order_create(int $touristId, int $serviceId, string $tourDate):
             $amount,
             $tourDate,
             $packageDays,
+            $packagePax,
         ]);
         $load = db()->prepare('SELECT * FROM package_orders WHERE id=? LIMIT 1');
         $load->execute([(int) db()->lastInsertId()]);
@@ -641,6 +648,9 @@ function package_order_complete_scan(array $order): array
         "UPDATE package_orders SET payment_status='paid', payment_reference=? WHERE id=? AND payment_status<>'paid'"
     )->execute([$ref, (int) $order['id']]);
     package_order_notify_paid($order, $ref);
+    if (function_exists('revenue_record_package_order')) {
+        revenue_record_package_order((int) ($order['id'] ?? 0));
+    }
     return ['ok' => true, 'message' => 'Payment received.', 'reference' => $ref];
 }
 

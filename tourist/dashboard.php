@@ -53,7 +53,7 @@ require __DIR__ . '/../includes/tourist_shell_start.php';
           <div>
             <h2 class="dash-section__title mb-0">Places of interest</h2>
           </div>
-          <a class="quick-chip" href="<?= APP_URL ?>/tourist/destinations.php">View all</a>
+          <a class="quick-chip" href="<?= APP_URL ?>/tourist/places.php">View all</a>
         </div>
         <div class="tourist-dest-grid">
           <?php foreach ($featured as $i => $d):
@@ -72,7 +72,7 @@ require __DIR__ . '/../includes/tourist_shell_start.php';
             </a>
           <?php endforeach; ?>
           <?php if (!$featured): ?>
-            <p class="text-muted mb-0">No destinations published yet.</p>
+            <p class="text-muted mb-0">No places published yet.</p>
           <?php endif; ?>
         </div>
       </section>
