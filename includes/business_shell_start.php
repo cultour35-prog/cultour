@@ -44,22 +44,42 @@ $businessNav = [
     ['dashboard', 'Dashboard', '/business/dashboard.php', 'bi-speedometer2'],
     ['calendar', 'Calendar', '/business/dashboard.php?view=calendar', 'bi-calendar3'],
     ['report', 'Report', '/business/dashboard.php?view=report', 'bi-file-earmark-bar-graph'],
-    ['services', $catalogLabel, '/business/services.php', $catalogIcon],
 ];
-if (in_array($catalogMode, ['packages', 'rooms'], true)) {
+if ($catalogMode === 'packages') {
+    $businessNav[] = ['package-maker', 'Package maker', '/business/package.php', 'bi-signpost-split'];
+    $businessNav[] = ['services', 'Packages made', '/business/services.php', $catalogIcon];
+    $businessNav[] = ['inhouse', 'In-house Guides', '/business/guides.php', 'bi-person-badge'];
+} else {
+    $businessNav[] = ['services', $catalogLabel, '/business/services.php', $catalogIcon];
+}
+if (in_array($catalogMode, ['packages', 'rooms', 'vehicles'], true)) {
     $businessNav[] = ['bookings', 'Bookings', '/business/bookings.php', 'bi-calendar-check'];
 }
+$pendingPackageBookings = 0;
+if ($catalogMode === 'packages' && !empty($user['id'])) {
+    require_once __DIR__ . '/payments.php';
+    $bizIdSt = db()->prepare('SELECT id FROM businesses WHERE user_id=? LIMIT 1');
+    $bizIdSt->execute([(int) $user['id']]);
+    $pendingPackageBookings = package_unseen_booking_count((int) $bizIdSt->fetchColumn());
+}
 $revenueKind = revenue_bookable_kind($businessTypeName);
+$pendingReservations = 0;
 if (revenue_uses_reservation($revenueKind)) {
     $businessNav[] = ['reservations', 'Reservations', '/business/reservations.php', 'bi-journal-check'];
-}
-if (revenue_uses_reservation($revenueKind) || in_array($revenueKind, ['accommodation', 'transportation', 'package'], true)) {
-    $businessNav[] = ['fees', 'Fees', '/business/fees.php', 'bi-receipt'];
+    $pendingSt = db()->prepare(
+        "SELECT COUNT(*) FROM restaurant_reservations r
+         JOIN businesses b ON b.id = r.business_id
+         WHERE b.user_id = ? AND r.status = 'pending'"
+    );
+    $pendingSt->execute([(int) $user['id']]);
+    $pendingReservations = (int) $pendingSt->fetchColumn();
 }
 $businessNav = array_merge($businessNav, [
     ['photos', 'Photos', '/business/photos.php', 'bi-images'],
-    ['hours', 'Hours', '/business/hours.php', 'bi-clock'],
 ]);
+if ($catalogMode !== 'packages') {
+    $businessNav[] = ['hours', 'Hours', '/business/hours.php', 'bi-clock'];
+}
 
 $bodyClass = trim(($bodyClass ?? '') . ' business-app');
 ?>
@@ -72,6 +92,12 @@ $bodyClass = trim(($bodyClass ?? '') . ' business-app');
         <a class="tourist-topnav__link <?= $activeNav === $key ? 'is-active' : '' ?>" href="<?= APP_URL . $path ?>" data-app-tour="<?= e($key) ?>">
           <i class="bi <?= e($icon) ?>"></i>
           <span><?= e($label) ?></span>
+          <?php if ($key === 'reservations'): ?>
+            <span class="nav-dot" title="Reservation requests waiting" aria-label="Reservation requests waiting"<?= $pendingReservations > 0 ? '' : ' hidden' ?>></span>
+          <?php endif; ?>
+          <?php if ($key === 'bookings' && $catalogMode === 'packages'): ?>
+            <span class="nav-dot" data-booking-dot id="navBookingsPending" title="Pending package bookings" aria-label="Pending package bookings"<?= $pendingPackageBookings > 0 ? '' : ' hidden' ?>></span>
+          <?php endif; ?>
         </a>
       <?php endforeach; ?>
     </nav>
@@ -158,7 +184,7 @@ $bodyClass = trim(($bodyClass ?? '') . ' business-app');
 
   <main class="tourist-main">
     <?php if (empty($businessHidePagehead) && (!empty($pageHeading) || !empty($pageSub))): ?>
-      <div class="tourist-pagehead<?= !empty($pageHeadAction) ? ' tourist-pagehead--split' : '' ?>">
+      <div class="tourist-pagehead<?= !empty($pageHeadingTools) ? ' tourist-pagehead--tools' : (!empty($pageHeadAction) ? ' tourist-pagehead--split' : '') ?>">
         <div>
           <?php if (!empty($pageHeading)): ?>
             <h1 class="tourist-pagehead__title"><?= e($pageHeading) ?></h1>
@@ -167,7 +193,9 @@ $bodyClass = trim(($bodyClass ?? '') . ' business-app');
             <p class="tourist-pagehead__sub"><?= e($pageSub) ?></p>
           <?php endif; ?>
         </div>
-        <?php if (!empty($pageHeadAction)): ?>
+        <?php if (!empty($pageHeadingTools)): ?>
+          <?= $pageHeadingTools ?>
+        <?php elseif (!empty($pageHeadAction)): ?>
           <div class="tourist-pagehead__action"><?= $pageHeadAction ?></div>
         <?php endif; ?>
       </div>

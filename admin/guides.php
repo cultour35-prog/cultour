@@ -4,6 +4,10 @@ require_once __DIR__ . '/../includes/admin_registrations.php';
 $user = require_login(ROLE_ADMIN);
 ensure_password_schema();
 ensure_guide_documents_schema();
+if (is_file(__DIR__ . '/../includes/inhouse_guides.php')) {
+    require_once __DIR__ . '/../includes/inhouse_guides.php';
+    inhouse_guides_ensure_schema();
+}
 apply_office_daily_rate_to_unset_guides();
 $pageTitle = 'Tour Guides';
 $pageHeading = 'Tour Guides';
@@ -165,6 +169,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
         if ($action === 'update') {
             log_activity((int) $user['id'], 'update_guide', 'guides', 'Guide #' . $gid);
         }
+        if ((string) ($profileRow['guide_type'] ?? '') === 'in_house') {
+            $GLOBALS['inhouseGuideAddressFree'] = true;
+        }
         guide_profile_apply_post(
             $profileUserRow,
             $profileRow,
@@ -232,7 +239,17 @@ if ((string) ($_GET['created'] ?? '') === '1' && !empty($_SESSION['admin_created
 
 $rows = $edit ? [] : admin_guides_fetch_rows();
 $docsByGuide = [];
-$split = $edit ? ['pending' => [], 'registered' => [], 'rejected' => [], 'suspended' => []] : admin_guides_split($rows);
+$systemRows = [];
+$inhouseRows = [];
+foreach ($rows as $guideRow) {
+    if ((string) ($guideRow['guide_type'] ?? 'olga') === 'in_house') {
+        $inhouseRows[] = $guideRow;
+    } else {
+        $systemRows[] = $guideRow;
+    }
+}
+$split = $edit ? ['pending' => [], 'registered' => [], 'rejected' => [], 'suspended' => []] : admin_guides_split($systemRows);
+$inhouseSplit = $edit ? ['pending' => [], 'registered' => [], 'rejected' => [], 'suspended' => []] : admin_guides_split($inhouseRows);
 $pendingGuides = $split['pending'];
 $registeredGuides = $split['registered'];
 $rejectedGuides = $split['rejected'];
@@ -281,9 +298,59 @@ $guideSections = [
         'empty' => 'No rejected applications.',
     ],
 ];
+$inhouseSections = [
+    [
+        'id' => 'ih_registered',
+        'title' => 'Active in-house guides',
+        'sub' => 'Guides employed by a tour and travel business',
+        'badge' => 'text-bg-success',
+        'btn' => 'Active tour guides',
+        'rows' => $inhouseSplit['registered'],
+        'approve' => false,
+        'affiliation' => true,
+        'empty' => 'No active in-house guides.',
+    ],
+    [
+        'id' => 'ih_pending',
+        'title' => 'Pending in-house guides',
+        'sub' => 'Waiting for Tourism Office approval',
+        'badge' => 'text-bg-secondary',
+        'btn' => 'Pending applications',
+        'rows' => $inhouseSplit['pending'],
+        'approve' => true,
+        'affiliation' => true,
+        'empty' => 'No pending in-house guides.',
+    ],
+    [
+        'id' => 'ih_suspended',
+        'title' => 'Suspended',
+        'sub' => 'In-house guides who cannot be assigned until restored',
+        'badge' => 'text-bg-warning',
+        'btn' => 'Suspended',
+        'rows' => $inhouseSplit['suspended'],
+        'approve' => false,
+        'affiliation' => true,
+        'empty' => 'No suspended in-house guides.',
+    ],
+    [
+        'id' => 'ih_rejected',
+        'title' => 'Rejected',
+        'sub' => 'In-house applications that were not approved',
+        'badge' => 'text-bg-danger',
+        'btn' => 'Rejected',
+        'rows' => $inhouseSplit['rejected'],
+        'approve' => false,
+        'affiliation' => true,
+        'empty' => 'No rejected in-house guides.',
+    ],
+];
 $defaultGuideTab = 'registered';
 if (!empty($_GET['tab']) && in_array($_GET['tab'], ['registered', 'pending', 'rejected', 'suspended'], true)) {
     $defaultGuideTab = $_GET['tab'];
+}
+$defaultGuideKind = (string) ($_GET['kind'] ?? '') === 'inhouse' ? 'inhouse' : 'system';
+if ($defaultGuideKind === 'inhouse') {
+    $defaultGuideTab = 'ih_' . $defaultGuideTab;
 }
 
 $loadLangTags = true;
@@ -309,6 +376,9 @@ require __DIR__ . '/../includes/header.php';
           $guideProfileRequirePhoto = false;
           $guideProfileShowBlocks = true;
           $guideProfileAvailNote = 'Same-day bookings close 2 hours before end.';
+          if ((string) ($profile['guide_type'] ?? $edit['guide_type'] ?? '') === 'in_house') {
+              $inhouseGuideAddressFree = true;
+          }
           require __DIR__ . '/../includes/guide_profile_form.php';
         ?>
       <?php elseif ($edit): ?>
@@ -621,11 +691,26 @@ HTML;
           <div>
             <h3 class="panel-title mb-1"><?= $showAdd ? 'Add tour guide' : 'Tour guides' ?></h3>
             <?php if (!$showAdd): ?>
-            <p class="small text-muted mb-0">Choose a list to view active, pending, suspended, or rejected guides</p>
+            <p class="small text-muted mb-0">Switch between system guides and in-house guides</p>
             <?php endif; ?>
           </div>
           <?php if (!$showAdd): ?>
-            <div class="d-flex flex-wrap gap-2">
+            <div class="d-flex flex-wrap align-items-center gap-2">
+              <?php
+                $guideRequestCount = 0;
+                try {
+                    inhouse_guides_ensure_schema();
+                    $guideRequestCount = (int) db()->query(
+                        "SELECT COUNT(*) FROM package_guide_assignments WHERE status IN ('pending_admin','needs_replacement')"
+                    )->fetchColumn();
+                } catch (Throwable $e) {
+                    $guideRequestCount = 0;
+                }
+              ?>
+              <a class="btn btn-outline-secondary d-inline-flex align-items-center justify-content-center gap-2" href="<?= APP_URL ?>/admin/guide-requests.php">
+                Tour guide request
+                <?php if ($guideRequestCount > 0): ?><span class="badge text-bg-danger"><?= $guideRequestCount ?></span><?php endif; ?>
+              </a>
               <button type="button" class="btn btn-outline-secondary" data-bs-toggle="modal" data-bs-target="#editDailyRateModal">Edit daily rate</button>
               <a class="btn btn-ct" href="<?= APP_URL ?>/admin/guides.php?add=1">
                 <i class="bi bi-plus-lg"></i> Add tour guide
@@ -636,8 +721,26 @@ HTML;
           <?php endif; ?>
         </div>
         <?php if (!$showAdd): ?>
-        <div class="guide-tabs" role="tablist" aria-label="Tour guide lists" data-live-regs="guides" data-live-version="<?= e($guidesLiveVersion) ?>">
+        <div class="guide-tabs mb-2" role="tablist" aria-label="Guide type">
+          <button type="button" class="guide-tabs__btn<?= $defaultGuideKind === 'system' ? ' is-active' : '' ?>" data-guide-kind="system">System guides</button>
+          <button type="button" class="guide-tabs__btn<?= $defaultGuideKind === 'inhouse' ? ' is-active' : '' ?>" data-guide-kind="inhouse">In-house tour guides</button>
+        </div>
+        <div class="guide-tabs" role="tablist" aria-label="Tour guide lists" data-live-regs="guides" data-live-version="<?= e($guidesLiveVersion) ?>" data-guide-kind-panel="system"<?= $defaultGuideKind === 'system' ? '' : ' hidden' ?>>
           <?php foreach ($guideSections as $section): ?>
+            <button
+              type="button"
+              class="guide-tabs__btn<?= $defaultGuideTab === $section['id'] ? ' is-active' : '' ?>"
+              data-guide-tab="<?= e($section['id']) ?>"
+              role="tab"
+              aria-selected="<?= $defaultGuideTab === $section['id'] ? 'true' : 'false' ?>"
+            >
+              <span><?= e($section['btn']) ?></span>
+              <span class="badge <?= e($section['badge']) ?>" data-live-count="<?= e($section['id']) ?>"><?= count($section['rows']) ?></span>
+            </button>
+          <?php endforeach; ?>
+        </div>
+        <div class="guide-tabs" role="tablist" aria-label="In-house guide lists" data-guide-kind-panel="inhouse"<?= $defaultGuideKind === 'inhouse' ? '' : ' hidden' ?>>
+          <?php foreach ($inhouseSections as $section): ?>
             <button
               type="button"
               class="guide-tabs__btn<?= $defaultGuideTab === $section['id'] ? ' is-active' : '' ?>"
@@ -673,7 +776,7 @@ HTML;
                     <?php endif; ?>
 
       <?php if (!$edit && !$showAdd): ?>
-      <div class="guide-sections">
+      <div class="guide-sections" data-guide-kind-panel="system"<?= $defaultGuideKind === 'system' ? '' : ' hidden' ?>>
         <?php foreach ($guideSections as $section): ?>
           <div
             class="glass guide-section<?= $defaultGuideTab === $section['id'] ? ' is-active' : '' ?>"
@@ -717,6 +820,44 @@ HTML;
           </div>
         <?php endforeach; ?>
       </div>
+      <div class="guide-sections" data-guide-kind-panel="inhouse"<?= $defaultGuideKind === 'inhouse' ? '' : ' hidden' ?>>
+        <?php foreach ($inhouseSections as $section): ?>
+          <div
+            class="glass guide-section<?= $defaultGuideTab === $section['id'] ? ' is-active' : '' ?>"
+            data-guide-panel="<?= e($section['id']) ?>"
+            role="tabpanel"
+            <?= $defaultGuideTab === $section['id'] ? '' : 'hidden' ?>
+          >
+            <div class="guide-section__head">
+              <div class="guide-section__titles">
+                <h3 class="panel-title mb-0"><?= e($section['title']) ?></h3>
+                <p class="small text-muted mb-0"><?= e($section['sub']) ?></p>
+              </div>
+              <span class="badge <?= e($section['badge']) ?> guide-section__count" data-live-panel-count="<?= e($section['id']) ?>"><?= count($section['rows']) ?></span>
+            </div>
+            <div class="guide-section__list table-responsive">
+              <table class="table table-ct align-middle mb-0 guide-table">
+                <thead>
+                  <tr>
+                    <th>Guide</th>
+                    <th>Languages</th>
+                    <th>Affiliation</th>
+                    <th>Status</th>
+                    <th>Joined</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody data-live-tbody="<?= e($section['id']) ?>" data-live-empty="<?= e($section['empty']) ?>" data-live-cols="6">
+                  <?= admin_render_guide_rows($section['rows'], $docsByGuide, $section['approve'], true) ?>
+                  <?php if (!$section['rows']): ?>
+                    <tr class="live-empty-row"><td colspan="6" class="text-muted"><?= e($section['empty']) ?></td></tr>
+                  <?php endif; ?>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        <?php endforeach; ?>
+      </div>
       <?php
 $extraScripts = ($extraScripts ?? '') . <<<'HTML'
 <script>
@@ -724,6 +865,23 @@ document.addEventListener('DOMContentLoaded', function () {
   const buttons = Array.prototype.slice.call(document.querySelectorAll('[data-guide-tab]'));
   const panels = Array.prototype.slice.call(document.querySelectorAll('[data-guide-panel]'));
   if (!buttons.length || !panels.length) return;
+
+  const kindButtons = Array.prototype.slice.call(document.querySelectorAll('[data-guide-kind]'));
+  const kindPanels = Array.prototype.slice.call(document.querySelectorAll('[data-guide-kind-panel]'));
+  function showKind(kind) {
+    kindButtons.forEach(function (btn) {
+      btn.classList.toggle('is-active', btn.getAttribute('data-guide-kind') === kind);
+    });
+    kindPanels.forEach(function (panel) {
+      const on = panel.getAttribute('data-guide-kind-panel') === kind;
+      if (on) panel.removeAttribute('hidden');
+      else panel.setAttribute('hidden', '');
+    });
+    showTab(kind === 'inhouse' ? 'ih_registered' : 'registered');
+  }
+  kindButtons.forEach(function (btn) {
+    btn.addEventListener('click', function () { showKind(btn.getAttribute('data-guide-kind')); });
+  });
 
   function showTab(id) {
     buttons.forEach(function (btn) {

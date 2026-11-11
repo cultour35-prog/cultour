@@ -13,6 +13,15 @@ $annBundle = announcements_for_role(ROLE_TOUR_GUIDE, (int) $user['id']);
 $profile = db()->prepare('SELECT * FROM tour_guide_profiles WHERE user_id=?');
 $profile->execute([$user['id']]);
 $profile = $profile->fetch();
+if (is_file(__DIR__ . '/../includes/inhouse_guides.php')) {
+    require_once __DIR__ . '/../includes/inhouse_guides.php';
+    inhouse_guides_ensure_schema();
+    if (inhouse_guide_is_inhouse($profile ?: null)) {
+        $bizName = db()->prepare('SELECT name FROM businesses WHERE id=?');
+        $bizName->execute([(int) ($profile['affiliated_business_id'] ?? 0)]);
+        $pageSub = 'In-house guide · ' . ((string) ($bizName->fetchColumn() ?: 'Tour and travel'));
+    }
+}
 
 $gid = (int) ($profile['id'] ?? 0);
 $pending = 0;
@@ -61,6 +70,35 @@ if ($gid) {
     }
 }
 
+$packageJobs = [];
+if ($gid && inhouse_guide_is_inhouse($profile ?: null)) {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string) ($_POST['action'] ?? '') === 'package_checkin' && verify_csrf()) {
+        $orderId = (int) ($_POST['order_id'] ?? 0);
+        $own = db()->prepare("SELECT id FROM package_guide_assignments WHERE order_id=? AND guide_id=? AND status='assigned'");
+        $own->execute([$orderId, $gid]);
+        if (!$own->fetchColumn()) {
+            flash('error', 'You can only check in to a package assigned to you.');
+        } else {
+            db()->prepare('INSERT IGNORE INTO package_guide_checkins (order_id, guide_id) VALUES (?,?)')->execute([$orderId, $gid]);
+            flash('success', 'Checked in.');
+        }
+        redirect(APP_URL . '/tourguide/dashboard.php');
+    }
+    $jobs = db()->prepare(
+        "SELECT o.id, o.order_code, o.package_name, o.tour_date, o.business_name,
+                CONCAT(tu.first_name,' ',tu.last_name) AS tourist_name,
+                c.checked_in_at
+         FROM package_guide_assignments a
+         JOIN package_orders o ON o.id = a.order_id
+         JOIN users tu ON tu.id = o.tourist_id
+         LEFT JOIN package_guide_checkins c ON c.order_id = o.id AND c.guide_id = a.guide_id
+         WHERE a.guide_id=? AND a.status='assigned'
+         ORDER BY o.tour_date IS NULL, o.tour_date"
+    );
+    $jobs->execute([$gid]);
+    $packageJobs = $jobs->fetchAll() ?: [];
+}
+
 $bodyClass = trim(($bodyClass ?? '') . ' guide-app');
 require __DIR__ . '/../includes/header.php';
 require __DIR__ . '/../includes/guide_shell_start.php';
@@ -68,6 +106,29 @@ require __DIR__ . '/../includes/guide_shell_start.php';
       <?php if ($m = flash('success')): ?><div class="alert alert-success" data-autohide="1"><?= e($m) ?></div><?php endif; ?>
       <?php if ($m = flash('error')): ?><div class="alert alert-danger"><?= e($m) ?></div><?php endif; ?>
       <?php render_account_status_panel($user); ?>
+      <?php if ($packageJobs): ?>
+        <div class="glass p-3 mb-3">
+          <h2 class="h6">Package assignments</h2>
+          <?php foreach ($packageJobs as $job): ?>
+            <div class="d-flex justify-content-between align-items-center gap-2 py-2 border-bottom">
+              <div>
+                <div class="fw-semibold"><?= e((string) $job['package_name']) ?></div>
+                <div class="small text-muted"><?= e((string) $job['business_name']) ?> · <?= e((string) $job['tourist_name']) ?><?= !empty($job['tour_date']) ? ' · ' . e(format_date((string) $job['tour_date'])) : '' ?></div>
+              </div>
+              <?php if (!empty($job['checked_in_at'])): ?>
+                <span class="badge text-bg-success">Checked in</span>
+              <?php else: ?>
+                <form method="post">
+                  <?= csrf_field() ?>
+                  <input type="hidden" name="action" value="package_checkin">
+                  <input type="hidden" name="order_id" value="<?= (int) $job['id'] ?>">
+                  <button class="btn btn-sm btn-ct" type="submit">Check in</button>
+                </form>
+              <?php endif; ?>
+            </div>
+          <?php endforeach; ?>
+        </div>
+      <?php endif; ?>
       <?php if (user_is_suspended($user)): ?>
 <?php require __DIR__ . '/../includes/guide_shell_end.php'; ?>
 <?php require __DIR__ . '/../includes/footer.php'; return; endif; ?>
@@ -132,7 +193,6 @@ require __DIR__ . '/../includes/guide_shell_start.php';
               <a class="btn btn-outline-secondary" href="checkin.php">Stop check-in</a>
               <a class="btn btn-outline-secondary" href="schedule.php">Open schedule</a>
               <a class="btn btn-outline-secondary" href="availability.php">Set availability</a>
-              <a class="btn btn-outline-secondary" href="itineraries.php">Suggested itineraries</a>
               <a class="btn btn-outline-secondary" href="profile.php">Update profile</a>
             </div>
           </div>

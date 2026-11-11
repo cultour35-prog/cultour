@@ -7,9 +7,50 @@ $user = require_login();
 ensure_itinerary_items_schema();
 
 $id = (int) ($_GET['id'] ?? 0);
+$fromPackage = (string) ($_GET['from'] ?? '') === 'package';
+$orderId = (int) ($_GET['order'] ?? 0);
+$orderRow = null;
+if ($orderId > 0) {
+    require_once __DIR__ . '/includes/payments.php';
+    ensure_package_order_schema();
+    $orderSt = db()->prepare('SELECT snapshot_itinerary_id, tourist_id, business_id, snapshot_inclusions, snapshot_description, amount, package_name FROM package_orders WHERE id=? LIMIT 1');
+    $orderSt->execute([$orderId]);
+    $orderRow = $orderSt->fetch();
+    if ($orderRow && (int) ($orderRow['snapshot_itinerary_id'] ?? 0) > 0) {
+        $id = (int) $orderRow['snapshot_itinerary_id'];
+        $fromPackage = true;
+    }
+}
 $stmt = db()->prepare('SELECT i.*, CONCAT(u.first_name,\' \',u.last_name) AS owner_name FROM itineraries i JOIN users u ON u.id=i.user_id WHERE i.id=?');
 $stmt->execute([$id]);
 $itin = $stmt->fetch();
+$packageFallback = null;
+if (!$itin && $fromPackage && $id > 0) {
+    package_stops_ensure_schema();
+    $pkgStmt = db()->prepare(
+        'SELECT s.*, b.name AS business_name
+         FROM business_services s
+         JOIN businesses b ON b.id = s.business_id
+         WHERE s.package_itinerary_id=? AND s.package_made=1
+         LIMIT 1'
+    );
+    $pkgStmt->execute([$id]);
+    $packageFallback = $pkgStmt->fetch() ?: null;
+    if ($packageFallback) {
+        $itin = [
+            'id' => $id,
+            'title' => (string) ($packageFallback['name'] ?? 'Package'),
+            'description' => (string) ($packageFallback['description'] ?? ''),
+            'start_date' => (string) ($packageFallback['package_fixed_date'] ?? ''),
+            'end_date' => '',
+            'meetup_time' => '08:00:00',
+            'user_id' => 0,
+            'owner_name' => (string) ($packageFallback['business_name'] ?? ''),
+            'is_suggested' => 0,
+            'package_days' => (int) ($packageFallback['package_days'] ?? 1),
+        ];
+    }
+}
 if (!$itin) {
     flash('error', 'Itinerary not found.');
     redirect(role_dashboard((int) $user['role_id']));
@@ -38,18 +79,122 @@ if (!$allowed && $role === ROLE_TOUR_GUIDE) {
     }
 }
 
+if (!$allowed && $orderRow && (int) $orderRow['tourist_id'] === (int) $user['id']) {
+    $allowed = true;
+}
+if (!$allowed && $role === ROLE_BUSINESS) {
+    $ownPkg = db()->prepare(
+        'SELECT s.id
+         FROM business_services s
+         JOIN businesses b ON b.id = s.business_id
+         WHERE s.package_itinerary_id=? AND s.package_made=1 AND b.user_id=?
+         LIMIT 1'
+    );
+    $ownPkg->execute([$id, (int) $user['id']]);
+    $allowed = (bool) $ownPkg->fetchColumn();
+}
+if (!$allowed && !$packageFallback) {
+    $pkgLink = db()->prepare('SELECT id FROM business_services WHERE package_itinerary_id=? AND package_made=1 AND is_active=1 LIMIT 1');
+    $pkgLink->execute([$id]);
+    $allowed = (bool) $pkgLink->fetchColumn();
+}
+if ($packageFallback) {
+    $allowed = true;
+}
+
 if (!$allowed) {
     flash('error', 'Access denied.');
     redirect(role_dashboard($role));
 }
 
-$stops = itinerary_items_with_places($id);
-$reservationMap = reservation_itinerary_map($id);
+$packageBusinessName = '';
+if ($fromPackage) {
+    $bizNameStmt = db()->prepare(
+        'SELECT b.name
+         FROM business_services s
+         JOIN businesses b ON b.id = s.business_id
+         WHERE s.package_itinerary_id=? AND s.package_made=1
+         LIMIT 1'
+    );
+    $bizNameStmt->execute([$id]);
+    $packageBusinessName = trim((string) $bizNameStmt->fetchColumn());
+}
+
+if ($packageFallback) {
+    $stops = [];
+    $meetupMins = itin_time_to_minutes((string) ($itin['meetup_time'] ?? '08:00:00'));
+    if ($meetupMins === null) {
+        $meetupMins = 8 * 60;
+    }
+    $port = ormoc_port_coords();
+    $byDay = [];
+    foreach (package_stops_for_service((int) $packageFallback['id']) as $stop) {
+        $day = max(1, (int) ($stop['day_number'] ?? 1));
+        $byDay[$day][] = $stop;
+    }
+    ksort($byDay);
+    foreach ($byDay as $day => $dayStops) {
+        $prevLat = (float) $port['lat'];
+        $prevLng = (float) $port['lng'];
+        $prevLeave = $meetupMins;
+        foreach ($dayStops as $i => $stop) {
+            $visit = max(15, (int) ($stop['visit_minutes'] ?? 60));
+            $lat = isset($stop['latitude']) && $stop['latitude'] !== null && $stop['latitude'] !== ''
+                ? (float) $stop['latitude'] : null;
+            $lng = isset($stop['longitude']) && $stop['longitude'] !== null && $stop['longitude'] !== ''
+                ? (float) $stop['longitude'] : null;
+            $hasCoords = $lat !== null && $lng !== null && ($lat != 0.0 || $lng != 0.0);
+            if ($i === 0 && $day > 1) {
+                $arrive = $meetupMins;
+            } else {
+                $travel = $hasCoords
+                    ? itin_estimate_travel_minutes($prevLat, $prevLng, $lat, $lng)
+                    : 45;
+                $arrive = itin_suggest_arrival($prevLeave, $travel);
+            }
+            $leave = itin_compute_end($arrive, $visit);
+            $stops[] = [
+                'id' => (int) $stop['id'],
+                'stop_kind' => (int) ($stop['business_id'] ?? 0) > 0 ? 'business' : 'destination',
+                'stop_name' => (string) ($stop['place_name'] ?? 'Place'),
+                'location' => (string) ($stop['location'] ?? ''),
+                'visit_minutes' => $visit,
+                'day_number' => $day,
+                'start_time' => itin_minutes_to_time($arrive),
+                'end_time' => itin_minutes_to_time($leave),
+            ];
+            $prevLeave = $leave;
+            if ($hasCoords) {
+                $prevLat = $lat;
+                $prevLng = $lng;
+            }
+        }
+    }
+    $reservationMap = [];
+} else {
+    $stops = itinerary_items_with_places($id);
+    $reservationMap = reservation_itinerary_map($id);
+}
 $meetup = format_time_12h((string) ($itin['meetup_time'] ?? '08:00:00'));
 $shareUrl = APP_URL . '/itinerary-share.php?id=' . $id;
-$dayCount = itinerary_logical_day_count($itin);
+if ($packageFallback) {
+    $dayCount = max(1, (int) ($itin['package_days'] ?? 1));
+    foreach ($stops as $stop) {
+        $dayCount = max($dayCount, (int) ($stop['day_number'] ?? 1));
+    }
+    $stopsByDay = [];
+    for ($d = 1; $d <= $dayCount; $d++) {
+        $stopsByDay[$d] = ['day' => $d, 'date' => '', 'label' => 'Day ' . $d, 'stops' => []];
+    }
+    foreach ($stops as $stop) {
+        $day = max(1, (int) ($stop['day_number'] ?? 1));
+        $stopsByDay[$day]['stops'][] = $stop;
+    }
+} else {
+    $dayCount = itinerary_logical_day_count($itin);
+    $stopsByDay = itinerary_group_stops_by_day($stops, $itin['start_date'] ?? null, $itin['end_date'] ?? null, $id, $itin);
+}
 $isMultiday = $dayCount > 1;
-$stopsByDay = itinerary_group_stops_by_day($stops, $itin['start_date'] ?? null, $itin['end_date'] ?? null, $id, $itin);
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -69,6 +214,7 @@ $stopsByDay = itinerary_group_stops_by_day($stops, $itin['start_date'] ?? null, 
     .sheet { max-width:720px; margin:0 auto; background:#fff; border-radius:1rem; padding:1.5rem; border:1px solid #d5e0e3; }
     h1 { font-family: Fraunces, Georgia, serif; font-size:1.75rem; margin:0 0 .35rem; }
     .meta { color:#5c6f76; font-size:.9rem; margin-bottom:1.25rem; }
+    .desc { margin:0 0 1.15rem; color:#3d5158; font-size:.95rem; line-height:1.5; overflow-wrap:anywhere; word-break:break-word; }
     .day-head { margin:1.1rem 0 .35rem; padding:.4rem .65rem; background:#eef5f6; border-radius:.5rem; display:flex; justify-content:space-between; gap:.5rem; font-weight:700; }
     .stop { padding:.85rem 0; border-bottom:1px solid #e6ecee; }
     .stop:last-child { border-bottom:0; }
@@ -80,23 +226,40 @@ $stopsByDay = itinerary_group_stops_by_day($stops, $itin['start_date'] ?? null, 
     <button type="button" onclick="window.print()">Print</button>
     <a class="download" href="<?= APP_URL ?>/itinerary-pdf.php?id=<?= (int) $id ?>">Download PDF</a>
     <button class="ghost" type="button" id="itinCopyLink" data-url="<?= e($shareUrl) ?>">Copy link</button>
-    <a class="ghost" href="<?= APP_URL ?>/<?= $role===ROLE_TOURIST?'tourist/itineraries.php?id='.$id:($role===ROLE_TOUR_GUIDE?'tourguide/itineraries.php?id='.$id:'admin/itineraries.php') ?>">Back</a>
+    <?php if (!$fromPackage): ?>
+    <a class="ghost" href="<?= e(APP_URL . '/' . ($role===ROLE_TOURIST?'tourist/itineraries.php?id='.$id:($role===ROLE_TOUR_GUIDE?'tourguide/itineraries.php?id='.$id:'admin/itineraries.php'))) ?>">Back</a>
+    <?php endif; ?>
   </div>
   <article class="sheet">
     <div class="small" style="color:var(--teal);font-weight:700;letter-spacing:.04em;text-transform:uppercase">CulTour itinerary</div>
     <h1><?= e($itin['title']) ?></h1>
     <div class="meta">
-      <?= (int)($itin['is_suggested'] ?? 0) ? 'Suggested tour' : 'Personal plan' ?>
-      · <?= e($itin['owner_name']) ?><br>
-      <?php if ($isMultiday): ?>
-        <?= (int) $dayCount ?> days · starts <?= e(format_date($itin['start_date'] ?? null)) ?>
+      <?php if ($packageBusinessName !== ''): ?>
+        <?= e($packageBusinessName) ?><br>
       <?php else: ?>
-        <?= e(format_date($itin['start_date'] ?? null)) ?>
+        <?= (int)($itin['is_suggested'] ?? 0) ? 'Suggested tour' : 'Personal plan' ?>
+        · <?= e($itin['owner_name']) ?><br>
       <?php endif; ?>
-      · Meetup <?= e($meetup) ?> at Ormoc City Port
+      <?php $shareStart = trim((string) ($itin['start_date'] ?? '')); ?>
+      <?php if ($shareStart !== '' && $isMultiday): ?>
+        <?= (int) $dayCount ?> days · starts <?= e(format_date($shareStart)) ?><br>
+      <?php elseif ($shareStart !== ''): ?>
+        <?= e(format_date($shareStart)) ?><br>
+      <?php endif; ?>
+      Meetup <?= e($meetup) ?> at Ormoc City Port
     </div>
-    <?php if (!empty($itin['description'])): ?>
-      <p><?= nl2br(e($itin['description'])) ?></p>
+    <?php
+      $shareDesc = trim((string) ($orderRow['snapshot_description'] ?? ''));
+      if ($shareDesc === '') {
+          $shareDesc = trim((string) ($itin['description'] ?? ''));
+      }
+      $shareInclusions = trim((string) ($orderRow['snapshot_inclusions'] ?? ''));
+    ?>
+    <?php if ($shareDesc !== ''): ?>
+      <p class="desc"><?= nl2br(e($shareDesc)) ?></p>
+    <?php endif; ?>
+    <?php if ($shareInclusions !== ''): ?>
+      <p class="meta">Inclusions: <?= e($shareInclusions) ?></p>
     <?php endif; ?>
 
     <?php foreach ($stopsByDay as $g): ?>
@@ -122,12 +285,17 @@ $stopsByDay = itinerary_group_stops_by_day($stops, $itin['start_date'] ?? null, 
           <strong><?= e($it['stop_name'] ?? $it['destination_name'] ?? 'Stop') ?></strong>
           <div class="small" style="color:#6a7c83"><?= e($it['location'] ?? '') ?></div>
           <div class="small">
-            Estimated time of arrival <?= e(format_time_12h(isset($it['start_time']) ? (string)$it['start_time'] : null)) ?>
+            ETA <?= e(format_time_12h(isset($it['start_time']) ? (string)$it['start_time'] : null)) ?>
             · Leave <?= e(format_time_12h(isset($it['end_time']) ? (string)$it['end_time'] : null)) ?>
             · Stay <?= (int)($it['visit_minutes'] ?? 60) ?> min
           </div>
           <?php $stopReservation = $reservationMap[(int) ($it['id'] ?? 0)] ?? null; ?>
-          <?php if ($stopReservation): ?>
+          <?php if ($stopReservation && $fromPackage): ?>
+            <?php foreach ($stopReservation['lines'] ?? [] as $foodLine): ?>
+              <?php if (!is_array($foodLine) || trim((string) ($foodLine['item_name'] ?? '')) === '') continue; ?>
+              <div class="small" style="color:#0e8a7a"><?= (int) ($foodLine['qty'] ?? 0) ?> × <?= e((string) $foodLine['item_name']) ?></div>
+            <?php endforeach; ?>
+          <?php elseif ($stopReservation): ?>
             <?php foreach (reservation_summary_lines($stopReservation) as $reservationLine): ?>
               <div class="small" style="color:#0e8a7a"><?= e($reservationLine) ?></div>
             <?php endforeach; ?>

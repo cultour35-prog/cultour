@@ -10,6 +10,7 @@ $pageSub = 'CulTour · Ormoc City';
 $activeNav = 'places';
 
 ensure_destination_coords();
+ensure_business_listing_schema();
 ensure_category_pin_colors();
 ensure_business_type_pin_colors();
 
@@ -19,11 +20,19 @@ $categories = db()->query(
      ORDER BY name"
 )->fetchAll();
 $types = db()->query('SELECT id, name, pin_color FROM business_types ORDER BY name')->fetchAll();
+$types = array_values(array_filter($types, static function (array $t): bool {
+    return !in_array(business_catalog_mode((string) ($t['name'] ?? '')), ['vehicles', 'packages'], true);
+}));
+$placeTypeIds = array_map(static fn (array $t): int => (int) $t['id'], $types);
 
 $q = trim($_GET['q'] ?? '');
 $cat = (int) ($_GET['category'] ?? 0);
 $type = (int) ($_GET['type'] ?? 0);
+$featuredView = (int) ($_GET['featured'] ?? 0) === 1;
 if ($cat && $type) {
+    $type = 0;
+}
+if ($type && !in_array($type, $placeTypeIds, true)) {
     $type = 0;
 }
 
@@ -69,7 +78,10 @@ $bizRows = [];
 if (!$cat) {
     $stmt = db()->prepare($bizSql);
     $stmt->execute($bizParams);
-    $bizRows = array_values(array_filter($stmt->fetchAll() ?: [], 'business_itinerary_ready'));
+    $bizRows = array_values(array_filter($stmt->fetchAll() ?: [], static function (array $row) use ($placeTypeIds): bool {
+        return in_array((int) ($row['business_type_id'] ?? 0), $placeTypeIds, true)
+            && business_itinerary_ready($row);
+    }));
 }
 
 $favStmt = db()->prepare('SELECT destination_id FROM favorites WHERE user_id=?');
@@ -94,6 +106,12 @@ foreach ($destRows as $d) {
     $byCategory[$cid]['items'][] = $d;
     if (!empty($d['is_featured'])) {
         $featured[] = $d;
+    }
+}
+foreach ($bizRows as $b) {
+    if (!empty($b['is_featured'])) {
+        $b['kind'] = 'business';
+        $featured[] = $b;
     }
 }
 $byType = [];
@@ -230,10 +248,13 @@ function tourist_place_rail(string $title, string $railId, array $items, ?string
     <?php
 }
 
-$placesQuery = static function (string $q, int $category = 0, int $type = 0): string {
+$placesQuery = static function (string $q, int $category = 0, int $type = 0, bool $featured = false): string {
     $params = [];
     if ($q !== '') {
         $params['q'] = $q;
+    }
+    if ($featured) {
+        $params['featured'] = 1;
     }
     if ($category) {
         $params['category'] = $category;
@@ -243,55 +264,55 @@ $placesQuery = static function (string $q, int $category = 0, int $type = 0): st
     }
     return $params ? ('?' . http_build_query($params)) : '?';
 };
+$pageHeadingTools = '<form class="booking-list-tools" method="get" id="placesSearchForm">'
+    . '<input type="hidden" name="category" value="' . (int) $cat . '">'
+    . '<input type="hidden" name="type" value="' . (int) $type . '">'
+    . ($featuredView ? '<input type="hidden" name="featured" value="1">' : '')
+    . '<label class="guide-bookings-search">'
+    . '<i class="bi bi-search" aria-hidden="true"></i>'
+    . '<input type="search" name="q" value="' . e($q) . '" placeholder="Search places" aria-label="Search places" autocomplete="off">'
+    . '</label></form>';
 ?>
 <?php require __DIR__ . '/../includes/tourist_shell_start.php'; ?>
     <div class="page-content page-content--rails">
-      <form class="ct-rail-filters glass p-3 mb-4" method="get">
-        <div class="row g-2 align-items-center">
-          <div class="col-md-5">
-            <input class="form-control" name="q" value="<?= e($q) ?>" placeholder="Search places…">
-          </div>
-          <div class="col-md-5">
-            <div class="ct-chip-row" role="list">
-              <a class="ct-chip <?= $cat === 0 && $type === 0 ? 'is-active' : '' ?>" href="<?= e($placesQuery($q)) ?>" role="listitem">All</a>
-              <?php foreach ($categories as $c): ?>
-                <a class="ct-chip <?= $cat === (int) $c['id'] ? 'is-active' : '' ?>"
-                   href="<?= e($placesQuery($q, (int) $c['id'])) ?>"
-                   role="listitem"
-                   style="<?= $cat === (int) $c['id'] ? '--chip-accent:' . e($c['pin_color'] ?: '#0e8a7a') : '' ?>">
-                  <?= e($c['name']) ?>
-                </a>
-              <?php endforeach; ?>
-              <?php foreach ($types as $t): ?>
-                <a class="ct-chip <?= $type === (int) $t['id'] ? 'is-active' : '' ?>"
-                   href="<?= e($placesQuery($q, 0, (int) $t['id'])) ?>"
-                   role="listitem"
-                   style="<?= $type === (int) $t['id'] ? '--chip-accent:' . e($t['pin_color'] ?: '#c4a35a') : '' ?>">
-                  <?= e($t['name']) ?>
-                </a>
-              <?php endforeach; ?>
-            </div>
-            <input type="hidden" name="category" value="<?= (int) $cat ?>">
-            <input type="hidden" name="type" value="<?= (int) $type ?>">
-          </div>
-          <div class="col-md-2">
-            <button class="btn btn-ct w-100" type="submit">Search</button>
-          </div>
-        </div>
-      </form>
+      <div class="pkg-offer-tabs" role="tablist" aria-label="Place categories">
+        <a class="pkg-offer-tabs__btn<?= $cat === 0 && $type === 0 && !$featuredView ? ' is-on' : '' ?>" href="<?= e($placesQuery($q)) ?>">All</a>
+        <a class="pkg-offer-tabs__btn<?= $featuredView ? ' is-on' : '' ?>" href="<?= e($placesQuery($q, 0, 0, true)) ?>">Featured</a>
+        <?php foreach ($categories as $c): ?>
+          <a class="pkg-offer-tabs__btn<?= $cat === (int) $c['id'] ? ' is-on' : '' ?>" href="<?= e($placesQuery($q, (int) $c['id'])) ?>"><?= e($c['name']) ?></a>
+        <?php endforeach; ?>
+        <?php foreach ($types as $t): ?>
+          <a class="pkg-offer-tabs__btn<?= $type === (int) $t['id'] ? ' is-on' : '' ?>" href="<?= e($placesQuery($q, 0, (int) $t['id'])) ?>"><?= e($t['name']) ?></a>
+        <?php endforeach; ?>
+      </div>
+      <script>
+      (function () {
+        var form = document.getElementById('placesSearchForm');
+        var input = form ? form.querySelector('input[name="q"]') : null;
+        if (!form || !input) return;
+        var timer = null;
+        input.addEventListener('input', function () {
+          clearTimeout(timer);
+          timer = setTimeout(function () { form.submit(); }, 350);
+        });
+      })();
+      </script>
 
-      <?php if (!$destRows && !$bizRows): ?>
+      <?php if ($featuredView ? !$featured : (!$destRows && !$bizRows)): ?>
         <div class="glass p-4 text-muted">No places found. Try another search.</div>
       <?php else: ?>
-        <?php if ($featured && $cat === 0 && $type === 0 && $q === ''): ?>
+        <?php if ($featured && $featuredView): ?>
           <?php
             foreach ($featured as &$featuredPlace) {
-                $featuredPlace['kind'] = 'destination';
+                if (($featuredPlace['kind'] ?? '') !== 'business') {
+                    $featuredPlace['kind'] = 'destination';
+                }
             }
             unset($featuredPlace);
             tourist_place_rail('Featured in Ormoc', 'rail-featured', $featured);
           ?>
         <?php endif; ?>
+        <?php if (!$featuredView): ?>
         <?php foreach ($byCategory as $group): ?>
           <?php
             foreach ($group['items'] as &$item) {
@@ -310,6 +331,7 @@ $placesQuery = static function (string $q, int $category = 0, int $type = 0): st
             tourist_place_rail($group['name'], 'rail-biz-' . $group['id'], $group['items'], $group['color']);
           ?>
         <?php endforeach; ?>
+        <?php endif; ?>
       <?php endif; ?>
     </div>
 <?php require __DIR__ . '/../includes/tourist_shell_end.php'; ?>

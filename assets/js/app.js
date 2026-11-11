@@ -58,6 +58,9 @@
     }
     if (data.pending_bookings != null) {
       setDot(document.getElementById('navBookingsPending'), data.pending_bookings);
+      document.querySelectorAll('[data-booking-dot]').forEach(function (el) {
+        setDot(el, data.pending_bookings);
+      });
     }
     if (data.notif_html != null) {
       document.querySelectorAll('[data-live-slot="notif_dropdown"]').forEach(function (el) {
@@ -66,6 +69,76 @@
         if (data.notif_version) el.setAttribute('data-live-version', data.notif_version);
       });
     }
+    if (data.reject_notice) showRejectNotice(data.reject_notice);
+  }
+
+  function showRejectNotice(notice) {
+    if (!notice || !notice.id || !window.bootstrap) return;
+    var shell = document.querySelector('.tourist-shell');
+    var viewing = shell ? Number(shell.getAttribute('data-view-itinerary') || 0) : 0;
+    if (viewing && viewing === Number(notice.itinerary_id)) return;
+    var id = String(notice.id);
+    if (window._rejectNoticeShown === id) return;
+    var existing = document.getElementById('rejectNoticeModal');
+    if (existing && existing.getAttribute('data-reject-id') === id) {
+      window._rejectNoticeShown = id;
+      if (!existing.classList.contains('show')) bootstrap.Modal.getOrCreateInstance(existing).show();
+      return;
+    }
+    if (existing) existing.remove();
+    var root = document.createElement('div');
+    root.className = 'modal fade reject-notice';
+    root.id = 'rejectNoticeModal';
+    root.setAttribute('data-reject-id', id);
+    root.tabIndex = -1;
+    root.setAttribute('aria-hidden', 'true');
+    var dialog = document.createElement('div');
+    dialog.className = 'modal-dialog modal-dialog-centered';
+    var card = document.createElement('div');
+    card.className = 'modal-content reject-notice__card';
+    var close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'btn-close reject-notice__close';
+    close.setAttribute('data-bs-dismiss', 'modal');
+    close.setAttribute('aria-label', 'Close');
+    var mark = document.createElement('div');
+    mark.className = 'reject-notice__mark';
+    mark.setAttribute('aria-hidden', 'true');
+    mark.textContent = '!';
+    var kicker = document.createElement('p');
+    kicker.className = 'reject-notice__kicker';
+    kicker.textContent = 'Reservation declined';
+    var title = document.createElement('h2');
+    title.className = 'reject-notice__title';
+    title.id = 'rejectNoticeTitle';
+    title.textContent = notice.business_name || 'A place';
+    var lead = document.createElement('p');
+    lead.className = 'reject-notice__lead';
+    lead.textContent = 'did not accept this stop.';
+    var reasonWrap = document.createElement('div');
+    reasonWrap.className = 'reject-notice__reason';
+    var reasonLabel = document.createElement('span');
+    reasonLabel.textContent = 'Their reason';
+    var reasonText = document.createElement('p');
+    reasonText.textContent = notice.reason || 'No reason was given.';
+    reasonWrap.appendChild(reasonLabel);
+    reasonWrap.appendChild(reasonText);
+    var go = document.createElement('a');
+    go.className = 'btn btn-ct reject-notice__go';
+    go.href = notice.url || '#';
+    go.textContent = 'Open the tour';
+    card.appendChild(close);
+    card.appendChild(mark);
+    card.appendChild(kicker);
+    card.appendChild(title);
+    card.appendChild(lead);
+    card.appendChild(reasonWrap);
+    card.appendChild(go);
+    dialog.appendChild(card);
+    root.appendChild(dialog);
+    document.body.appendChild(root);
+    window._rejectNoticeShown = id;
+    bootstrap.Modal.getOrCreateInstance(root).show();
   }
 
   window.CulTourUnread = { apply: applyUnread };
@@ -577,7 +650,7 @@
       tabsRoot.setAttribute('data-live-version', version);
 
       const counts = data.counts || {};
-      ['registered', 'pending', 'rejected', 'suspended', 'inactive'].forEach(function (id) {
+      ['registered', 'pending', 'rejected', 'suspended', 'inactive', 'ih_registered', 'ih_pending', 'ih_rejected', 'ih_suspended'].forEach(function (id) {
         if (counts[id] == null) return;
         setCount('[data-live-count="' + id + '"]', counts[id]);
         setCount('[data-live-panel-count="' + id + '"]', counts[id]);
@@ -592,7 +665,7 @@
       }
 
       const panels = data.panels || {};
-      ['registered', 'pending', 'rejected', 'suspended', 'inactive'].forEach(function (id) {
+      ['registered', 'pending', 'rejected', 'suspended', 'inactive', 'ih_registered', 'ih_pending', 'ih_rejected', 'ih_suspended'].forEach(function (id) {
         if (panels[id]) fillTbody(id, panels[id]);
       });
     }
@@ -1270,15 +1343,55 @@
   bindFriendlyValidation();
   bindConfirmCard();
   document.addEventListener('cultour:live-replaced', function (e) {
-    enhanceAccessibility(e.target && e.target.querySelectorAll ? e.target : document);
+    var root = e.target && e.target.querySelectorAll ? e.target : document;
+    enhanceAccessibility(root);
+    bindNationality(root);
   });
+
+  function titleCaseName(value) {
+    return String(value || '').replace(/[A-Za-zÀ-ÖØ-öø-ÿÑñ]+/g, function (word) {
+      return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+    });
+  }
 
   function capNameStart(el) {
     if (!el || el.disabled || el.readOnly) return;
+    if (el.name && /suffix/i.test(el.name)) return;
     var v = el.value || '';
     if (!v) return;
-    var next = v.charAt(0).toUpperCase() + v.slice(1);
-    if (next !== v) el.value = next;
+    var next = titleCaseName(v);
+    if (next === v) return;
+    var start = el.selectionStart;
+    var end = el.selectionEnd;
+    el.value = next;
+    if (typeof start === 'number' && el.setSelectionRange) {
+      try { el.setSelectionRange(start, end); } catch (err) {}
+    }
+  }
+
+  function capNationality(el) {
+    if (!el || el.disabled || el.readOnly) return;
+    var v = el.value || '';
+    if (!v) return;
+    var lower = v.toLocaleLowerCase();
+    var next = lower.charAt(0).toLocaleUpperCase() + lower.slice(1);
+    if (next === v) return;
+    var start = el.selectionStart;
+    var end = el.selectionEnd;
+    el.value = next;
+    if (typeof start === 'number' && el.setSelectionRange) {
+      try { el.setSelectionRange(start, end); } catch (err) {}
+    }
+  }
+
+  function bindNationality(root) {
+    (root || document).querySelectorAll('input[name="nationality"], textarea[name="nationality"]').forEach(function (el) {
+      if (el.getAttribute('data-nat-cap') === '1') return;
+      el.setAttribute('data-nat-cap', '1');
+      capNationality(el);
+      el.addEventListener('input', function () { capNationality(el); });
+      el.addEventListener('blur', function () { capNationality(el); });
+    });
   }
 
   function bindNameCaps(root) {
@@ -1301,15 +1414,14 @@
       if (el.getAttribute('data-name-cap') === '1') return;
       el.setAttribute('data-name-cap', '1');
       capNameStart(el);
-      el.addEventListener('input', function () {
-        if ((el.value || '').length <= 1) capNameStart(el);
-      });
+      el.addEventListener('input', function () { capNameStart(el); });
       el.addEventListener('blur', function () { capNameStart(el); });
     });
   }
 
   document.addEventListener('DOMContentLoaded', function () {
     bindNameCaps(document);
+    bindNationality(document);
     const sidebarToggle = document.getElementById('sidebarToggle');
     const sidebar = document.getElementById('appSidebar');
     if (sidebarToggle && sidebar) {
@@ -1694,7 +1806,8 @@
     var clock = root.querySelector('[data-visit-duration-clock]');
     var noLimit = root.querySelector('[data-visit-no-limit]');
     var warn = root.querySelector('[data-visit-duration-warn]');
-    if (!clock || !noLimit) return;
+    var isMin = root.hasAttribute('data-min-visit');
+    if (!clock || (!noLimit && !isMin)) return;
     var wrap = clock.closest('.itin-visit-clock-wrap');
     var unit = wrap ? wrap.querySelector('[data-itin-visit-unit]') : null;
     var lastValue = clock.value || '01:00';
@@ -1716,6 +1829,10 @@
       clock.classList.toggle('is-invalid', !!msg);
     }
     function syncNoLimit() {
+      if (!noLimit) {
+        paintUnit();
+        return;
+      }
       var off = !!noLimit.checked;
       if (off) {
         if (clock.value) lastValue = clock.value;
@@ -1739,19 +1856,19 @@
       if (String(clock.value || '').trim()) clock.value = visitClockPad(clock.value);
       paintUnit();
     });
-    noLimit.addEventListener('change', syncNoLimit);
+    if (noLimit) noLimit.addEventListener('change', syncNoLimit);
     syncNoLimit();
 
     var form = clock.form || root.closest('form');
     if (form) {
       form.addEventListener('submit', function (e) {
-        if (noLimit.checked) return;
+        if (noLimit && noLimit.checked) return;
         if (String(clock.value || '').trim()) clock.value = visitClockPad(clock.value);
         var mins = visitClockMinutes(clock.value);
         var msg = '';
-        if (!Number.isFinite(mins)) msg = 'Enter a visit duration (HH:MM) or check No limit.';
-        else if (mins < 15) msg = 'Visit duration must be at least 15 minutes.';
-        else if (mins > VISIT_MAX_HOURS * 60) msg = 'Visit duration can be up to ' + VISIT_MAX_HOURS + ' hours.';
+        if (!Number.isFinite(mins)) msg = isMin ? 'Enter a minimum visit time, like 01:00, or check No minimum visit time.' : 'Enter a visit duration (HH:MM) or check No limit.';
+        else if (mins < 15) msg = isMin ? 'Minimum visit must be at least 15 minutes.' : 'Visit duration must be at least 15 minutes.';
+        else if (mins > VISIT_MAX_HOURS * 60) msg = (isMin ? 'Minimum visit' : 'Visit duration') + ' can be up to ' + VISIT_MAX_HOURS + ' hours.';
         if (msg) {
           e.preventDefault();
           e.stopImmediatePropagation();
@@ -1762,17 +1879,43 @@
     }
   }
 
+  function formatPhLocal(raw) {
+    var digits = String(raw || '').replace(/\D/g, '');
+    if (digits.indexOf('63') === 0 && digits.length > 10) digits = digits.slice(2);
+    digits = digits.replace(/^0+/, '').slice(0, 10);
+    var out = digits.slice(0, 3);
+    if (digits.length > 3) out += ' ' + digits.slice(3, 6);
+    if (digits.length > 6) out += ' ' + digits.slice(6, 10);
+    return out;
+  }
+  window.formatPhLocal = formatPhLocal;
+  function paintPhones(root) {
+    (root || document).querySelectorAll('.phone-input input').forEach(function (el) {
+      el.maxLength = 12;
+      if (!el.getAttribute('placeholder') || el.getAttribute('placeholder') === '9XXXXXXXXX') {
+        el.setAttribute('placeholder', '9XX XXX XXXX');
+      }
+      var formatted = formatPhLocal(el.value);
+      if (el.value !== formatted) el.value = formatted;
+    });
+  }
+  paintPhones(document);
   document.addEventListener('input', function (e) {
     var el = e.target;
     if (el && el.classList && el.classList.contains('is-incomplete') && String(el.value || '').trim() !== '') {
       el.classList.remove('is-incomplete');
     }
     if (!el || !el.closest || !el.closest('.phone-input')) return;
-    var digits = String(el.value || '').replace(/\D/g, '');
-    if (digits.indexOf('63') === 0 && digits.length > 10) digits = digits.slice(2);
-    digits = digits.replace(/^0+/, '').slice(0, 10);
-    if (el.value !== digits) el.value = digits;
+    var formatted = formatPhLocal(el.value);
+    if (el.value !== formatted) el.value = formatted;
   });
+  document.addEventListener('submit', function (e) {
+    var form = e.target;
+    if (!form || !form.querySelectorAll) return;
+    form.querySelectorAll('.phone-input input').forEach(function (el) {
+      el.value = String(el.value || '').replace(/\D/g, '').slice(0, 10);
+    });
+  }, true);
 
   document.addEventListener('change', function (e) {
     var input = e.target;
@@ -1866,5 +2009,46 @@
         show('');
       }
     });
+  });
+})();
+
+(function () {
+  var ROOTS = '#registerForm, .guide-profile-layout form, #editBizListingForm, #addBizListingForm, #adminAddGuideForm, #adminAddTouristForm';
+  function labelFor(el) {
+    if (el.id) {
+      var byFor = document.querySelector('label[for="' + el.id.replace(/"/g, '\\"') + '"]');
+      if (byFor) return byFor;
+    }
+    var holder = el.closest('.phone-input, .select-chevron, .password-field, .avatar-preview');
+    var parent = holder ? holder.parentElement : el.parentElement;
+    return parent ? parent.querySelector(':scope > label.form-label') : null;
+  }
+  function paint(root) {
+    if (!root) return;
+    root.querySelectorAll('.ct-req-star').forEach(function (star) { star.remove(); });
+    root.querySelectorAll('input, select, textarea').forEach(function (el) {
+      if (!el.required || el.type === 'hidden') return;
+      if (el.closest('.d-none, [hidden]')) return;
+      var lab = labelFor(el);
+      if (!lab || lab.querySelector('.ct-req-star') || /\*/.test(lab.textContent)) return;
+      var star = document.createElement('span');
+      star.className = 'text-danger ct-req-star';
+      star.setAttribute('aria-hidden', 'true');
+      star.textContent = '*';
+      lab.appendChild(document.createTextNode(' '));
+      lab.appendChild(star);
+    });
+  }
+  function paintAll() {
+    document.querySelectorAll(ROOTS).forEach(paint);
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', paintAll);
+  } else {
+    paintAll();
+  }
+  document.addEventListener('change', function (e) {
+    var form = e.target && e.target.closest && e.target.closest(ROOTS);
+    if (form) paint(form);
   });
 })();

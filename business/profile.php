@@ -157,7 +157,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $biz && !verify_csrf()) {
         }
         $visitLimit = $visitParsed['limit'];
         $visit = $visitLimit ?? 60;
+        $featuredFlag = isset($_POST['is_featured']) ? 1 : 0;
     } else {
+        $featuredFlag = !empty($biz['is_featured']) ? 1 : 0;
         $d['description'] = $biz['description'] ?? null;
         $d['facebook_url'] = $biz['facebook_url'] ?? null;
         $d['instagram_url'] = $biz['instagram_url'] ?? null;
@@ -179,7 +181,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $biz && !verify_csrf()) {
         'UPDATE businesses SET business_type_id=?, name=?, owner_name=?, representative_name=?, representative_sex=?, slug=?, description=?, address=?,
          address_region=?, address_city=?, address_barangay=?, address_street=?,
          phone=?, email=?, permit_number=?, tax_id=?, website=?, facebook_url=?, instagram_url=?, cover_image=?, logo=?, latitude=?, longitude=?,
-         opening_hours=?, default_visit_minutes=?, visit_duration_minutes=?
+         opening_hours=?, default_visit_minutes=?, visit_duration_minutes=?, is_featured=?
          WHERE id=? AND user_id=?'
     )->execute([
         (int) $d['type_id'],
@@ -208,6 +210,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $biz && !verify_csrf()) {
         $hoursJson,
         $visit,
         $visitLimit,
+        $featuredFlag,
         $bizId,
         (int) $user['id'],
     ]);
@@ -307,6 +310,7 @@ require __DIR__ . '/../includes/business_shell_start.php';
                 $bizLatRaw = $biz['latitude'] ?? null;
                 $bizLngRaw = $biz['longitude'] ?? null;
                 $listingMarkPin = $listingApproved && ($bizLatRaw === null || $bizLngRaw === null || $bizLatRaw === '' || $bizLngRaw === '');
+                $listingMarkHours = $listingApproved && !place_has_operating_hours($biz['opening_hours'] ?? null);
                 require __DIR__ . '/../admin/_business_listing_fields.php';
                 $listingFieldsPaired = false;
                 $listingHideLogo = false;
@@ -370,7 +374,7 @@ require __DIR__ . '/../includes/business_shell_start.php';
             <div class="admin-biz-place-split__hours">
               <h3 class="h6 mb-1">Operating hours</h3>
               <p class="small text-muted mb-2">Select open days and set start / end times, or check 24 hrs. Unchecked days are closed.</p>
-              <div class="guide-profile-avail">
+              <div class="guide-profile-avail<?= !empty($listingMarkHours) ? ' is-incomplete' : '' ?>">
                 <?= opening_hours_avail_rows_html('bizHours', $availByDay, false, 'bizProfileForm') ?>
                 <div class="admin-biz-place-split__visit mt-2">
                   <?= visit_duration_field_html('bizVisit', $biz['visit_duration_minutes'] ?? null, 'bizProfileForm') ?>

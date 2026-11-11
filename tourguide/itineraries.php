@@ -1,6 +1,7 @@
 <?php
 require_once __DIR__ . '/../includes/auth.php';
 $user = require_login(ROLE_TOUR_GUIDE);
+redirect(APP_URL . '/tourguide/dashboard.php');
 ensure_itinerary_items_schema();
 ensure_place_schedule_schema();
 $pageTitle = 'Suggested Itineraries';
@@ -493,6 +494,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
         $limitMsg = itinerary_visit_limit_message((string) ($place['name'] ?? ''), $place['visit_limit_minutes'] ?? null, $visitMins);
         if ($limitMsg !== null) {
             flash('error', $limitMsg);
+            redirect(APP_URL . '/tourguide/itineraries.php?id=' . $iid);
+        }
+        $minMsg = itinerary_visit_min_message((string) ($place['name'] ?? ''), $place['min_visit_minutes'] ?? null, $visitMins);
+        if ($minMsg !== null) {
+            flash('error', $minMsg);
             redirect(APP_URL . '/tourguide/itineraries.php?id=' . $iid);
         }
 
@@ -1149,7 +1155,10 @@ require __DIR__ . '/../includes/header.php';
                               <div><?= e($it['stop_name'] ?? $it['destination_name'] ?? 'Unknown place') ?></div>
                               <div class="small text-muted"><?= e($it['location'] ?? '') ?></div>
                               <div class="small itin-stop-times" data-itin-stop-times>
-                                <span>Estimated time of arrival <span data-itin-arrive><?= e($arrive) ?></span> · Leave <span data-itin-leave><?= e($leave) ?></span></span>
+                                <span class="itin-stop-times__when">
+                                  <span>ETA · <span data-itin-arrive><?= e($arrive) ?></span></span>
+                                  <span>Leave · <span data-itin-leave><?= e($leave) ?></span></span>
+                                </span>
                                 <span class="itin-stop-times__stay">Stay <span data-itin-stay><?php
                                 $stayH = intdiv($visit, 60);
                                 $stayM = $visit % 60;

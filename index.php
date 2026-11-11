@@ -41,8 +41,44 @@ if (!$heroSlides) {
     ];
 }
 
-$featuredCards = array_slice($featured, 0, 4);
 $multiHero = count($heroSlides) > 1;
+$wallPlaces = $featured;
+try {
+    if (function_exists('ensure_business_listing_schema')) {
+        ensure_business_listing_schema();
+    }
+    $wallBiz = db()->query(
+        "SELECT id, name, address AS location, cover_image
+         FROM businesses
+         WHERE approval_status='approved' AND status='active'
+         ORDER BY name"
+    )->fetchAll() ?: [];
+    $allSites = db()->query(
+        "SELECT id, name, location, cover_image
+         FROM destinations WHERE status='published'
+         ORDER BY name"
+    )->fetchAll() ?: [];
+    $wallPlaces = [];
+    $n = max(count($allSites), count($wallBiz));
+    for ($i = 0; $i < $n; $i++) {
+        if (isset($allSites[$i])) {
+            $wallPlaces[] = $allSites[$i];
+        }
+        if (isset($wallBiz[$i])) {
+            $wallPlaces[] = $wallBiz[$i];
+        }
+    }
+} catch (Throwable $e) {
+    $wallPlaces = $featured;
+}
+$wallCols = [];
+for ($c = 0; $c < 5; $c++) {
+    $col = $wallPlaces;
+    if ($col) {
+        shuffle($col);
+    }
+    $wallCols[] = $col;
+}
 
 $pageTitle = 'Welcome';
 $bodyClass = 'landing-page';
@@ -122,39 +158,39 @@ require __DIR__ . '/includes/header.php';
   </div>
 </section>
 
-<?php if ($featuredCards): ?>
-<section class="landing-featured">
-  <div class="landing-featured__inner">
-    <div class="landing-featured__head fade-up">
-      <div>
-        <h2 class="landing-featured__title">Places of interest</h2>
-        <p class="text-muted small mb-0">A taste of Ormoc — sign in for details, itineraries, and bookings.</p>
-      </div>
-    </div>
-    <div class="row g-3">
-      <?php foreach ($featuredCards as $i => $f): ?>
-        <div class="col-md-6 col-lg-3 fade-up" style="animation-delay:<?= $i * 0.05 ?>s">
-          <a class="public-card text-decoration-none h-100 d-block" href="<?= APP_URL ?>/login.php?next=<?= urlencode('/tourist/destination.php?id=' . (int) $f['id']) ?>">
-            <div class="public-card__img" style="<?= !empty($f['cover_image']) ? 'background-image:url(' . APP_URL . '/uploads/' . e($f['cover_image']) . ')' : '' ?>"></div>
-            <div class="public-card__body">
-              <div class="fw-semibold"><?= e($f['name']) ?></div>
-              <div class="small text-muted"><?= e($f['location'] ?? '') ?></div>
+<section class="landing-flow" aria-label="Places in Ormoc">
+  <div class="landing-flow__cols">
+    <?php foreach ($wallCols as $col): ?>
+      <?php
+        if (!$col) { continue; }
+        while (count($col) < 4) {
+            $col = array_merge($col, $col);
+        }
+      ?>
+      <div class="landing-flow__col">
+        <div class="landing-flow__track">
+          <?php foreach ($col as $place):
+            $src = !empty($place['cover_image'])
+                ? APP_URL . '/uploads/' . ltrim((string) $place['cover_image'], '/')
+                : '';
+            $size = ['is-s', 'is-m', 'is-l'][random_int(0, 2)];
+          ?>
+            <div class="landing-flow__card <?= $size ?>"<?= $src !== '' ? ' style="background-image:url(\'' . e($src) . '\')"' : '' ?>>
+              <span class="landing-flow__label"><?= e((string) ($place['name'] ?? '')) ?></span>
             </div>
-          </a>
+          <?php endforeach; ?>
         </div>
-      <?php endforeach; ?>
-    </div>
+      </div>
+    <?php endforeach; ?>
   </div>
-</section>
-<?php endif; ?>
-
-<section class="landing-cta">
-  <div class="landing-cta__inner fade-up">
-    <h2 class="landing-cta__title">Ready for Ormoc?</h2>
-    <p class="landing-cta__lead">Create a free CulTour account to save favorites, plan itineraries, and book guides.</p>
-    <div class="d-flex flex-wrap justify-content-center gap-2">
-      <a class="btn btn-light btn-lg" href="<?= APP_URL ?>/register.php">Create account</a>
-      <a class="btn btn-outline-light btn-lg" href="<?= APP_URL ?>/login.php">Login</a>
+  <div class="landing-flow__overlay">
+    <div class="landing-cta__inner">
+      <h2 class="landing-cta__title">Ready for Ormoc?</h2>
+      <p class="landing-cta__lead">Create a free CulTour account to save favorites, plan itineraries, and book guides.</p>
+      <div class="d-flex flex-wrap justify-content-center gap-2">
+        <a class="btn btn-light btn-lg" href="<?= APP_URL ?>/register.php">Create account</a>
+        <a class="btn btn-outline-light btn-lg" href="<?= APP_URL ?>/login.php">Login</a>
+      </div>
     </div>
   </div>
 </section>
@@ -249,5 +285,69 @@ if ($multiHero) {
     <?php
     $extraScripts = ($extraScripts ?? '') . ob_get_clean();
 }
+ob_start();
+?>
+<script>
+(function () {
+  var sizes = ['is-s', 'is-m', 'is-l'];
+  var reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function step(el) {
+    return el.offsetHeight + (parseFloat(getComputedStyle(el).marginBottom) || 0);
+  }
+  function paint(card) {
+    sizes.forEach(function (s) { card.classList.remove(s); });
+    card.classList.add(sizes[Math.floor(Math.random() * sizes.length)]);
+  }
+  document.querySelectorAll('.landing-flow__col').forEach(function (col, index) {
+    var track = col.querySelector('.landing-flow__track');
+    if (!track || !track.firstElementChild) return;
+    var down = index % 2 === 1;
+    var guard = 0;
+    while (track.scrollHeight < col.clientHeight * 2.2 && guard < 8) {
+      Array.prototype.slice.call(track.children).forEach(function (card) {
+        var clone = card.cloneNode(true);
+        paint(clone);
+        track.appendChild(clone);
+      });
+      guard++;
+    }
+    if (reduced) return;
+    var y = 0;
+    if (down) {
+      var seed = track.lastElementChild;
+      track.insertBefore(seed, track.firstElementChild);
+      y = -step(seed);
+    }
+    var speed = 0.55;
+    function frame() {
+      var edge = down ? track.lastElementChild : track.firstElementChild;
+      if (!edge) return;
+      var h = step(edge);
+      if (down) {
+        y += speed;
+        if (y >= 0) {
+          var over = y;
+          paint(edge);
+          track.insertBefore(edge, track.firstElementChild);
+          y = -step(edge) + over;
+        }
+      } else {
+        y -= speed;
+        if (-y >= h) {
+          paint(edge);
+          y += h;
+          track.appendChild(edge);
+        }
+      }
+      track.style.transform = 'translateY(' + y + 'px)';
+      requestAnimationFrame(frame);
+    }
+    track.style.transform = 'translateY(' + y + 'px)';
+    requestAnimationFrame(frame);
+  });
+})();
+</script>
+<?php
+$extraScripts = ($extraScripts ?? '') . ob_get_clean();
 require __DIR__ . '/includes/footer.php';
 ?>

@@ -141,6 +141,31 @@ function revenue_uses_reservation(string $kind): bool
     return in_array($kind, ['food', 'wellness', 'beach'], true);
 }
 
+/** Restaurant and wellness stops, earliest visit first. */
+function itinerary_popup_reservation_ids(int $itineraryId): array
+{
+    if ($itineraryId < 1) {
+        return [];
+    }
+    $st = db()->prepare(
+        "SELECT i.id, bt.name AS type_name
+         FROM itinerary_items i
+         JOIN businesses b ON b.id = i.business_id
+         JOIN business_types bt ON bt.id = b.business_type_id
+         WHERE i.itinerary_id = ?
+         ORDER BY i.sort_order, i.id"
+    );
+    $st->execute([$itineraryId]);
+    $ids = [];
+    foreach ($st->fetchAll() ?: [] as $row) {
+        $kind = revenue_bookable_kind((string) ($row['type_name'] ?? ''));
+        if ($kind === 'food' || $kind === 'wellness') {
+            $ids[] = (int) $row['id'];
+        }
+    }
+    return $ids;
+}
+
 /** @return array<string,string> */
 function reservation_place_copy(string $kind): array
 {
@@ -403,11 +428,41 @@ function reservation_event(int $reservationId, string $status, ?string $note, in
     )->execute([$reservationId, $status, $note !== '' ? $note : null, $actorId > 0 ? $actorId : null]);
 }
 
+function reservation_tour_date(int $itineraryId, ?string $candidate): ?string
+{
+    $candidate = normalize_tour_date($candidate);
+    $placeholder = $candidate !== null && str_starts_with($candidate, '2000-');
+    if ($candidate !== null && !$placeholder) {
+        return $candidate;
+    }
+    if ($itineraryId < 1) {
+        return null;
+    }
+    $st = db()->prepare(
+        "SELECT tour_start_date, booking_date FROM bookings
+         WHERE itinerary_id=? AND status NOT IN ('cancelled','rejected','refunded')
+         ORDER BY id DESC LIMIT 1"
+    );
+    $st->execute([$itineraryId]);
+    $row = $st->fetch();
+    if (!$row) {
+        return $placeholder ? null : $candidate;
+    }
+    $real = normalize_tour_date($row['tour_start_date'] ?? null) ?: normalize_tour_date($row['booking_date'] ?? null);
+    if ($real !== null && !str_starts_with($real, '2000-')) {
+        return $real;
+    }
+    return $placeholder ? null : $candidate;
+}
+
 function reservation_latest_for_item(int $itemId): ?array
 {
     revenue_ensure_schema();
     $st = db()->prepare(
-        'SELECT * FROM restaurant_reservations WHERE itinerary_item_id=? ORDER BY id DESC LIMIT 1'
+        'SELECT r.* FROM restaurant_reservations r
+         JOIN itinerary_items ii ON ii.id = r.itinerary_item_id AND ii.business_id = r.business_id
+         WHERE r.itinerary_item_id=?
+         ORDER BY r.id DESC LIMIT 1'
     );
     $st->execute([$itemId]);
     $row = $st->fetch();
@@ -428,9 +483,44 @@ function reservation_itinerary_map(int $itineraryId): array
         return [];
     }
     revenue_ensure_schema();
+    if (!itinerary_booking_is_finalized($itineraryId)) {
+        ensure_itinerary_items_schema();
+        $st = db()->prepare(
+            'SELECT ii.id AS itinerary_item_id, ii.visit_date, ii.reservation_draft, b.name AS business_name, bt.name AS type_name
+             FROM itinerary_items ii
+             JOIN businesses b ON b.id = ii.business_id
+             JOIN business_types bt ON bt.id = b.business_type_id
+             WHERE ii.itinerary_id=? AND ii.reservation_draft IS NOT NULL AND ii.reservation_draft<>\'\'
+             ORDER BY ii.sort_order, ii.id'
+        );
+        $st->execute([$itineraryId]);
+        $byItem = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $draft = json_decode((string) ($row['reservation_draft'] ?? ''), true);
+            if (!is_array($draft) || empty($draft['order_mode'])) {
+                continue;
+            }
+            $itemId = (int) ($row['itinerary_item_id'] ?? 0);
+            $kind = revenue_bookable_kind($row['type_name'] ?? '');
+            $byItem[$itemId] = [
+                'itinerary_item_id' => $itemId,
+                'visit_date' => (string) ($row['visit_date'] ?? ''),
+                'business_name' => (string) ($row['business_name'] ?? ''),
+                'kind' => $kind,
+                'copy' => reservation_place_copy($kind),
+                'status' => '',
+                'code' => '',
+                'order_mode' => (string) $draft['order_mode'],
+                'food_total' => (float) ($draft['food_total'] ?? 0),
+                'lines' => is_array($draft['lines'] ?? null) ? $draft['lines'] : [],
+            ];
+        }
+        return $byItem;
+    }
     $st = db()->prepare(
-        'SELECT r.*, b.name AS business_name, bt.name AS type_name
+        'SELECT r.*, ii.visit_date AS stop_visit_date, b.name AS business_name, bt.name AS type_name
          FROM restaurant_reservations r
+         JOIN itinerary_items ii ON ii.id = r.itinerary_item_id AND ii.business_id = r.business_id
          JOIN businesses b ON b.id = r.business_id
          JOIN business_types bt ON bt.id = b.business_type_id
          WHERE r.itinerary_id=?
@@ -459,8 +549,16 @@ function reservation_summary_lines(array $reservation): array
     $mode = ($reservation['order_mode'] ?? '') === 'advance_order'
         ? (string) ($copy['ahead'] ?? 'Booked ahead')
         : (string) ($copy['at_place_short'] ?? 'Choose on arrival');
-    $status = ucfirst(str_replace('_', ' ', (string) ($reservation['status'] ?? '')));
-    $lines = ['Reservation ' . (string) ($reservation['code'] ?? '') . ' · ' . (string) ($reservation['business_name'] ?? '') . ' · ' . $status . ' · ' . $mode];
+    $status = trim((string) ($reservation['status'] ?? ''));
+    $statusLabel = $status !== '' ? ucfirst(str_replace('_', ' ', $status)) : '';
+    $code = trim((string) ($reservation['code'] ?? ''));
+    $head = array_values(array_filter([
+        $code !== '' ? 'Reservation ' . $code : 'Reservation',
+        (string) ($reservation['business_name'] ?? ''),
+        $statusLabel,
+        $mode,
+    ], static fn ($part) => $part !== ''));
+    $lines = [implode(' · ', $head)];
     $items = [];
     foreach ($reservation['lines'] ?? [] as $line) {
         if (!is_array($line)) {
@@ -475,8 +573,97 @@ function reservation_summary_lines(array $reservation): array
     return $lines;
 }
 
+function itinerary_guide_has_accepted(int $itineraryId): bool
+{
+    if ($itineraryId < 1) {
+        return false;
+    }
+    $st = db()->prepare(
+        "SELECT id FROM bookings
+         WHERE itinerary_id=? AND status='approved'
+           AND payment_status IN ('paid','pay_at_office')
+         LIMIT 1"
+    );
+    $st->execute([$itineraryId]);
+    return (bool) $st->fetch();
+}
+
 /** @return array{ok:bool,message:string} */
-function reservation_submit(int $touristId, int $itemId, string $date, string $time, int $guests, string $mode, array $qtyByService): array
+function itinerary_booking_is_finalized(int $itineraryId): bool
+{
+    if ($itineraryId < 1) {
+        return false;
+    }
+    $st = db()->prepare(
+        "SELECT id FROM bookings
+         WHERE itinerary_id=? AND payment_status IN ('paid','pay_at_office')
+           AND status NOT IN ('cancelled','rejected','refunded')
+         LIMIT 1"
+    );
+    $st->execute([$itineraryId]);
+    return (bool) $st->fetch();
+}
+
+function reservation_withdraw_unofficial(int $itemId): void
+{
+    revenue_ensure_schema();
+    $open = reservation_latest_for_item($itemId);
+    if (!$open || (string) ($open['status'] ?? '') !== 'pending') {
+        return;
+    }
+    $id = (int) $open['id'];
+    db()->prepare('DELETE FROM restaurant_reservation_items WHERE reservation_id=?')->execute([$id]);
+    db()->prepare('DELETE FROM restaurant_reservation_events WHERE reservation_id=?')->execute([$id]);
+    db()->prepare('DELETE FROM restaurant_reservations WHERE id=? AND status=\'pending\'')->execute([$id]);
+}
+
+function itinerary_commit_reservation_drafts(int $itineraryId, int $touristId): void
+{
+    if ($itineraryId < 1 || $touristId < 1 || !itinerary_booking_is_finalized($itineraryId)) {
+        return;
+    }
+    ensure_itinerary_items_schema();
+    $st = db()->prepare(
+        'SELECT id, reservation_draft FROM itinerary_items WHERE itinerary_id=? AND reservation_draft IS NOT NULL AND reservation_draft<>\'\''
+    );
+    $st->execute([$itineraryId]);
+    foreach ($st->fetchAll() ?: [] as $row) {
+        $draft = json_decode((string) ($row['reservation_draft'] ?? ''), true);
+        if (!is_array($draft)) {
+            continue;
+        }
+        $prior = db()->prepare(
+            "SELECT id FROM restaurant_reservations WHERE itinerary_item_id=? AND status='rejected' AND tourist_id=? LIMIT 1"
+        );
+        $prior->execute([(int) $row['id'], $touristId]);
+        $replacing = (bool) $prior->fetch();
+        if ($replacing && empty($draft['ready'])) {
+            continue;
+        }
+        $qty = [];
+        foreach ($draft['lines'] ?? [] as $line) {
+            if (!is_array($line)) {
+                continue;
+            }
+            $qty[(int) ($line['service_id'] ?? 0)] = (int) ($line['qty'] ?? 0);
+        }
+        $result = reservation_submit(
+            $touristId,
+            (int) $row['id'],
+            (string) ($draft['reserve_date'] ?? ''),
+            (string) ($draft['reserve_time'] ?? ''),
+            (int) ($draft['guests'] ?? 1),
+            (string) ($draft['order_mode'] ?? 'table_only'),
+            $qty,
+            $replacing
+        );
+        if (!empty($result['ok']) && empty($result['held'])) {
+            db()->prepare('UPDATE itinerary_items SET reservation_draft=NULL WHERE id=?')->execute([(int) $row['id']]);
+        }
+    }
+}
+
+function reservation_submit(int $touristId, int $itemId, string $date, string $time, int $guests, string $mode, array $qtyByService, bool $commitHeld = false): array
 {
     revenue_ensure_schema();
     $item = db()->prepare(
@@ -498,17 +685,20 @@ function reservation_submit(int $touristId, int $itemId, string $date, string $t
         return ['ok' => false, 'message' => 'This place does not take reservations.'];
     }
     $placeCopy = reservation_place_copy($kind);
-    $open = reservation_latest_for_item($itemId);
-    if ($open && in_array($open['status'], ['pending', 'confirmed'], true)) {
-        return ['ok' => false, 'message' => 'This stop already has an open reservation.'];
-    }
-    $date = normalize_tour_date($date);
+    $date = reservation_tour_date(
+        (int) ($stop['itinerary_id'] ?? 0),
+        normalize_tour_date($date) ?: normalize_tour_date($stop['visit_date'] ?? null) ?: normalize_tour_date($stop['start_date'] ?? null)
+    );
     $time = normalize_time_input($time);
-    if ($date === null || $time === null) {
-        return ['ok' => false, 'message' => 'Choose a reservation date and time.'];
+    if ($time === null) {
+        $rawStopTime = trim((string) ($stop['start_time'] ?? ''));
+        $time = $rawStopTime !== '' ? substr($rawStopTime, 0, 8) : '12:00:00';
     }
-    if ($guests < 1 || $guests > 50) {
-        return ['ok' => false, 'message' => 'Enter the number of guests.'];
+    if ($guests < 1) {
+        $guests = 1;
+    }
+    if ($guests > 50) {
+        $guests = 50;
     }
     if (!in_array($mode, ['table_only', 'advance_order'], true)) {
         $mode = 'table_only';
@@ -538,37 +728,75 @@ function reservation_submit(int $touristId, int $itemId, string $date, string $t
             $foodTotal += $price * $qty;
         }
         if (!$lines) {
-            return ['ok' => false, 'message' => $placeCopy['need_item']];
+            $mode = 'table_only';
         }
+    }
+    $draftPayload = json_encode([
+        'order_mode' => $mode,
+        'guests' => $guests,
+        'reserve_date' => $date,
+        'reserve_time' => $time,
+        'food_total' => round($foodTotal, 2),
+        'lines' => $lines,
+    ], JSON_UNESCAPED_UNICODE);
+    $bookingFinalized = itinerary_booking_is_finalized((int) $stop['itinerary_id']);
+    if (!$bookingFinalized) {
+        reservation_withdraw_unofficial($itemId);
+        db()->prepare('UPDATE itinerary_items SET reservation_draft=? WHERE id=? AND itinerary_id=?')
+            ->execute([$draftPayload, $itemId, (int) $stop['itinerary_id']]);
+        return ['ok' => true, 'message' => 'Saved on this tour. The restaurant is asked when the booking is finalized.'];
+    }
+    $open = reservation_latest_for_item($itemId);
+    $editingOpen = $open && in_array($open['status'], ['pending', 'confirmed'], true);
+    $priorDecline = db()->prepare(
+        "SELECT id FROM restaurant_reservations WHERE itinerary_item_id=? AND status='rejected' AND tourist_id=? LIMIT 1"
+    );
+    $priorDecline->execute([$itemId, $touristId]);
+    if (!$commitHeld && !$editingOpen && $priorDecline->fetch()) {
+        db()->prepare('UPDATE itinerary_items SET reservation_draft=? WHERE id=? AND itinerary_id=?')
+            ->execute([$draftPayload, $itemId, (int) $stop['itinerary_id']]);
+        return ['ok' => true, 'held' => true, 'message' => 'Saved. Press Proceed to send this reservation.'];
     }
     $rate = revenue_rate_for_business((int) $stop['business_id']);
     $fee = ($rate['model'] ?? '') === 'fixed' ? revenue_fee_from_rate($rate, 0) : 0.0;
-    $code = 'RES-' . strtoupper(bin2hex(random_bytes(3)));
-    db()->prepare(
-        'INSERT INTO restaurant_reservations
-         (code, tourist_id, business_id, itinerary_id, itinerary_item_id, reserve_date, reserve_time, guests, order_mode, status, fee_snapshot, food_total)
-         VALUES (?,?,?,?,?,?,?,?,?,\'pending\',?,?)'
-    )->execute([
-        $code,
-        $touristId,
-        (int) $stop['business_id'],
-        (int) $stop['itinerary_id'],
-        $itemId,
-        $date,
-        $time,
-        $guests,
-        $mode,
-        $fee,
-        round($foodTotal, 2),
-    ]);
-    $id = (int) db()->lastInsertId();
+    if ($editingOpen) {
+        $id = (int) $open['id'];
+        $code = (string) $open['code'];
+        db()->prepare(
+            'UPDATE restaurant_reservations
+             SET reserve_date=?, reserve_time=?, guests=?, order_mode=?, food_total=?, updated_at=NOW()
+             WHERE id=? AND tourist_id=?'
+        )->execute([$date, $time, $guests, $mode, round($foodTotal, 2), $id, $touristId]);
+        db()->prepare('DELETE FROM restaurant_reservation_items WHERE reservation_id=?')->execute([$id]);
+    } else {
+        $code = 'RES-' . strtoupper(bin2hex(random_bytes(3)));
+        db()->prepare(
+            'INSERT INTO restaurant_reservations
+             (code, tourist_id, business_id, itinerary_id, itinerary_item_id, reserve_date, reserve_time, guests, order_mode, status, fee_snapshot, food_total)
+             VALUES (?,?,?,?,?,?,?,?,?,\'pending\',?,?)'
+        )->execute([
+            $code,
+            $touristId,
+            (int) $stop['business_id'],
+            (int) $stop['itinerary_id'],
+            $itemId,
+            $date,
+            $time,
+            $guests,
+            $mode,
+            $fee,
+            round($foodTotal, 2),
+        ]);
+        $id = (int) db()->lastInsertId();
+    }
     $lineIns = db()->prepare(
         'INSERT INTO restaurant_reservation_items (reservation_id, service_id, item_name, qty, unit_price) VALUES (?,?,?,?,?)'
     );
     foreach ($lines as $line) {
         $lineIns->execute([$id, $line['service_id'], $line['item_name'], $line['qty'], $line['unit_price']]);
     }
-    reservation_event($id, 'pending', 'Reservation requested', $touristId);
+    reservation_event($id, $editingOpen ? (string) $open['status'] : 'pending', $editingOpen ? 'Reservation updated' : 'Reservation requested', $touristId);
+    if (!$editingOpen) {
     notify_user(
         (int) $stop['business_user_id'],
         'booking_request',
@@ -583,7 +811,87 @@ function reservation_submit(int $touristId, int $itemId, string $date, string $t
         'Your request ' . $code . ' was sent to ' . ($stop['business_name'] ?? $placeCopy['sent_to']) . '.',
         APP_URL . '/tourist/itineraries.php?id=' . (int) $stop['itinerary_id']
     );
-    return ['ok' => true, 'message' => $placeCopy['sent']];
+    }
+    db()->prepare('UPDATE itinerary_items SET reservation_draft=NULL WHERE id=?')->execute([$itemId]);
+    return ['ok' => true, 'message' => $editingOpen ? 'Reservation updated.' : $placeCopy['sent']];
+}
+
+/** Send held replacement reservations after the tourist presses Proceed. */
+function reservation_commit_held_replacements(int $touristId, int $itineraryId): array
+{
+    if ($itineraryId < 1 || !itinerary_booking_is_finalized($itineraryId)) {
+        return ['ok' => false, 'message' => 'Nothing to send.'];
+    }
+    $st = db()->prepare(
+        "SELECT ii.id, ii.reservation_draft
+         FROM itinerary_items ii
+         JOIN itineraries i ON i.id = ii.itinerary_id
+         WHERE ii.itinerary_id=? AND i.user_id=? AND ii.reservation_draft IS NOT NULL AND ii.reservation_draft<>''"
+    );
+    $st->execute([$itineraryId, $touristId]);
+    $rows = $st->fetchAll() ?: [];
+    if (!itinerary_guide_has_accepted($itineraryId)) {
+        $ready = 0;
+        $save = db()->prepare('UPDATE itinerary_items SET reservation_draft=? WHERE id=? AND itinerary_id=?');
+        foreach ($rows as $row) {
+            $prior = db()->prepare(
+                "SELECT id FROM restaurant_reservations WHERE itinerary_item_id=? AND status='rejected' AND tourist_id=? LIMIT 1"
+            );
+            $prior->execute([(int) $row['id'], $touristId]);
+            if (!$prior->fetch()) {
+                continue;
+            }
+            $draft = json_decode((string) $row['reservation_draft'], true);
+            if (!is_array($draft)) {
+                continue;
+            }
+            $draft['ready'] = true;
+            $save->execute([json_encode($draft, JSON_UNESCAPED_UNICODE), (int) $row['id'], $itineraryId]);
+            $ready++;
+        }
+        if ($ready < 1) {
+            return ['ok' => false, 'message' => 'Nothing to send.'];
+        }
+        return ['ok' => true, 'message' => 'Saved. The place is notified when your tour guide accepts.'];
+    }
+    $sent = 0;
+    foreach ($rows as $row) {
+        $prior = db()->prepare(
+            "SELECT id FROM restaurant_reservations WHERE itinerary_item_id=? AND status='rejected' AND tourist_id=? LIMIT 1"
+        );
+        $prior->execute([(int) $row['id'], $touristId]);
+        if (!$prior->fetch()) {
+            continue;
+        }
+        $draft = json_decode((string) $row['reservation_draft'], true);
+        if (!is_array($draft)) {
+            continue;
+        }
+        $qty = [];
+        foreach ($draft['lines'] ?? [] as $line) {
+            if (!is_array($line)) {
+                continue;
+            }
+            $qty[(int) ($line['service_id'] ?? 0)] = (int) ($line['qty'] ?? 0);
+        }
+        $result = reservation_submit(
+            $touristId,
+            (int) $row['id'],
+            (string) ($draft['reserve_date'] ?? ''),
+            (string) ($draft['reserve_time'] ?? ''),
+            (int) ($draft['guests'] ?? 1),
+            (string) ($draft['order_mode'] ?? 'table_only'),
+            $qty,
+            true
+        );
+        if (!empty($result['ok']) && empty($result['held'])) {
+            $sent++;
+        }
+    }
+    if ($sent < 1) {
+        return ['ok' => false, 'message' => 'Nothing to send.'];
+    }
+    return ['ok' => true, 'message' => 'Reservation sent.'];
 }
 
 /** @return array{ok:bool,message:string} */
@@ -618,7 +926,13 @@ function reservation_set_status(int $reservationId, string $next, int $actorId, 
     if ($next === 'confirmed' && $status === 'pending') {
         db()->prepare('UPDATE restaurant_reservations SET status=\'confirmed\', updated_at=NOW() WHERE id=?')->execute([$reservationId]);
         reservation_event($reservationId, 'confirmed', 'Accepted', $actorId);
-        notify_user((int) $row['tourist_id'], 'booking_approved', 'Reservation confirmed', $row['business_name'] . ' accepted ' . $row['code'] . '.', APP_URL . '/tourist/itineraries.php?id=' . (int) $row['itinerary_id']);
+        require_once __DIR__ . '/payments.php';
+        $packageOrder = package_order_for_reservation((int) $row['itinerary_id'], (int) $row['tourist_id']);
+        if ($packageOrder) {
+            package_order_approve_if_clear((int) $packageOrder['id']);
+        } else {
+            notify_user((int) $row['tourist_id'], 'booking_approved', 'Reservation confirmed', $row['business_name'] . ' accepted ' . $row['code'] . '.', APP_URL . '/tourist/itineraries.php?id=' . (int) $row['itinerary_id']);
+        }
         return ['ok' => true, 'message' => 'Reservation confirmed.'];
     }
     if ($next === 'rejected' && $status === 'pending') {
@@ -629,16 +943,28 @@ function reservation_set_status(int $reservationId, string $next, int $actorId, 
         db()->prepare('UPDATE restaurant_reservations SET status=\'rejected\', rejection_reason=?, updated_at=NOW() WHERE id=?')
             ->execute([mb_substr($reason, 0, 255), $reservationId]);
         reservation_event($reservationId, 'rejected', $reason, $actorId);
+        require_once __DIR__ . '/payments.php';
+        $packageOrder = package_order_for_reservation((int) $row['itinerary_id'], (int) $row['tourist_id']);
+        if ($packageOrder && (int) $packageOrder['business_user_id'] > 0) {
+            notify_user(
+                (int) $packageOrder['business_user_id'],
+                'booking_rejected',
+                'A place declined the package reservation',
+                $row['business_name'] . ' declined ' . $row['code'] . '. Change that stop before the tourist is told. ' . $reason,
+                APP_URL . '/business/bookings.php'
+            );
+            return ['ok' => true, 'message' => 'Reservation declined. The tour operator has to choose another place.'];
+        }
         notify_user((int) $row['tourist_id'], 'booking_rejected', 'Reservation declined', $row['business_name'] . ' declined ' . $row['code'] . '. ' . $reason, APP_URL . '/tourist/itineraries.php?id=' . (int) $row['itinerary_id']);
         return ['ok' => true, 'message' => 'Reservation declined. The itinerary stop stays in place.'];
     }
-    if ($status !== 'confirmed' || !in_array($next, ['completed', 'no_show'], true)) {
+    if ($status !== 'confirmed' || $next !== 'no_show') {
         return ['ok' => false, 'message' => 'That status change is not available.'];
     }
     db()->prepare('UPDATE restaurant_reservations SET status=?, updated_at=NOW() WHERE id=?')->execute([$next, $reservationId]);
-    reservation_event($reservationId, $next, $next === 'no_show' ? 'Marked no-show' : 'Visit completed', $actorId);
+    reservation_event($reservationId, $next, 'Marked no-show', $actorId);
     $rate = revenue_rate_for_business((int) $row['business_id']);
-    $charge = $next === 'completed' || ($next === 'no_show' && ($rate['noshow_policy'] ?? 'none') === 'charge');
+    $charge = ($rate['noshow_policy'] ?? 'none') === 'charge';
     if ($charge && (float) $row['fee_snapshot'] > 0) {
         revenue_insert_transaction(
             (int) $row['business_id'],
@@ -650,21 +976,76 @@ function reservation_set_status(int $reservationId, string $next, int $actorId, 
             (float) $row['fee_snapshot']
         );
     }
-    $label = $next === 'completed' ? 'Reservation marked completed.' : 'Reservation marked as a no-show.';
-    if ($next === 'no_show' && !$charge) {
+    $label = 'Reservation marked as a no-show.';
+    if (!$charge) {
         $label .= ' No fee was charged.';
     }
     return ['ok' => true, 'message' => $label];
+}
+
+/** Confirmed reservations finish on the visit day. The fee is recorded then. */
+function reservations_auto_complete_due(): void
+{
+    static $done = false;
+    if ($done) {
+        return;
+    }
+    $done = true;
+    revenue_ensure_schema();
+    try {
+        $st = db()->prepare(
+            "SELECT id, business_id, fee_snapshot FROM restaurant_reservations
+             WHERE status='confirmed' AND reserve_date <= ?
+             ORDER BY id ASC LIMIT 40"
+        );
+        $st->execute([app_today()]);
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $id = (int) $row['id'];
+            db()->prepare("UPDATE restaurant_reservations SET status='completed', updated_at=NOW() WHERE id=? AND status='confirmed'")
+                ->execute([$id]);
+            reservation_event($id, 'completed', 'Completed on the visit day', 0);
+            if ((float) $row['fee_snapshot'] <= 0) {
+                continue;
+            }
+            $rate = revenue_rate_for_business((int) $row['business_id']);
+            revenue_insert_transaction(
+                (int) $row['business_id'],
+                $rate['category'],
+                'reservation',
+                $id,
+                0,
+                format_money((float) $row['fee_snapshot']),
+                (float) $row['fee_snapshot']
+            );
+        }
+    } catch (Throwable $e) {
+        // ignore — never block page load
+    }
 }
 
 /** @return array{ok:bool,message:string} */
 function reservation_replace_restaurant(int $touristId, int $itemId, int $newBusinessId): array
 {
     revenue_ensure_schema();
+    $itemSt = db()->prepare(
+        'SELECT ii.business_id, ii.itinerary_id, i.user_id
+         FROM itinerary_items ii
+         JOIN itineraries i ON i.id = ii.itinerary_id
+         WHERE ii.id=? LIMIT 1'
+    );
+    $itemSt->execute([$itemId]);
+    $item = $itemSt->fetch();
     $current = reservation_latest_for_item($itemId);
-    if (!$current || $current['status'] !== 'rejected' || (int) $current['tourist_id'] !== $touristId) {
+    $priorSt = db()->prepare(
+        "SELECT id FROM restaurant_reservations WHERE itinerary_item_id=? AND status='rejected' AND tourist_id=? LIMIT 1"
+    );
+    $priorSt->execute([$itemId, $touristId]);
+    $hadDecline = (bool) $priorSt->fetch();
+    $live = $current && in_array((string) ($current['status'] ?? ''), ['pending', 'confirmed', 'completed', 'no_show'], true);
+    if (!$item || (int) $item['user_id'] !== $touristId || $live || !$hadDecline) {
         return ['ok' => false, 'message' => 'You can replace this place after it declines the reservation.'];
     }
+    $current = ['business_id' => (int) $item['business_id'], 'itinerary_id' => (int) $item['itinerary_id']];
     $typeSt = db()->prepare(
         'SELECT bt.name FROM businesses b JOIN business_types bt ON bt.id = b.business_type_id WHERE b.id=? LIMIT 1'
     );
@@ -685,8 +1066,15 @@ function reservation_replace_restaurant(int $touristId, int $itemId, int $newBus
     if ($newBusinessId === (int) $current['business_id']) {
         return ['ok' => false, 'message' => $currentCopy['replace_same']];
     }
+    $rejectedBefore = db()->prepare(
+        "SELECT id FROM restaurant_reservations WHERE itinerary_item_id=? AND business_id=? AND status='rejected' LIMIT 1"
+    );
+    $rejectedBefore->execute([$itemId, $newBusinessId]);
+    if ($rejectedBefore->fetch()) {
+        return ['ok' => false, 'message' => 'That place already declined this stop.'];
+    }
     db()->prepare(
-        'UPDATE itinerary_items SET business_id=? WHERE id=? AND itinerary_id=?'
+        'UPDATE itinerary_items SET business_id=?, reservation_draft=NULL WHERE id=? AND itinerary_id=?'
     )->execute([$newBusinessId, $itemId, (int) $current['itinerary_id']]);
     return ['ok' => true, 'message' => 'Restaurant replaced. Submit a new reservation when you are ready.'];
 }
@@ -947,7 +1335,7 @@ function reservation_hours_text(mixed $raw): string
     return implode(' · ', $bits);
 }
 
-function reservation_render_stop_panel(array $stop, array $itinerary, bool $canEdit): void
+function reservation_render_stop_panel(array $stop, array $itinerary, bool $canEdit, string $slot = 'all'): void
 {
     if (($stop['stop_kind'] ?? '') !== 'business') {
         return;
@@ -961,8 +1349,40 @@ function reservation_render_stop_panel(array $stop, array $itinerary, bool $canE
     ensure_place_schedule_schema();
     $itemId = (int) ($stop['id'] ?? 0);
     $bizId = (int) ($stop['business_id'] ?? 0);
-    $reservation = reservation_latest_for_item($itemId);
-    $lines = $reservation ? reservation_lines((int) $reservation['id']) : [];
+    $bookingFinalized = itinerary_booking_is_finalized((int) ($itinerary['id'] ?? 0));
+    $reservation = null;
+    $lines = [];
+    $heldDraft = false;
+    $loadDraft = static function (array $stop) use (&$reservation, &$lines, &$heldDraft): void {
+        $draft = json_decode((string) ($stop['reservation_draft'] ?? ''), true);
+        if (!is_array($draft) || empty($draft['order_mode'])) {
+            return;
+        }
+        $reservation = [
+            'id' => 0,
+            'status' => 'draft',
+            'order_mode' => (string) $draft['order_mode'],
+            'code' => '',
+            'reserve_date' => (string) ($draft['reserve_date'] ?? ''),
+            'reserve_time' => (string) ($draft['reserve_time'] ?? ''),
+            'guests' => (int) ($draft['guests'] ?? 0),
+            'food_total' => (float) ($draft['food_total'] ?? 0),
+            'rejection_reason' => '',
+        ];
+        $lines = is_array($draft['lines'] ?? null) ? $draft['lines'] : [];
+        $heldDraft = true;
+    };
+    if ($bookingFinalized) {
+        $reservation = reservation_latest_for_item($itemId);
+        $lines = $reservation ? reservation_lines((int) $reservation['id']) : [];
+        if (!$reservation) {
+            $loadDraft($stop);
+        }
+    } else {
+        reservation_withdraw_unofficial($itemId);
+        $loadDraft($stop);
+        $heldDraft = false;
+    }
     $menu = db()->prepare('SELECT id, name, price, description, image_path, menu_category FROM business_services WHERE business_id=? AND is_active=1 ORDER BY name');
     $menu->execute([$bizId]);
     $menu = $menu->fetchAll() ?: [];
@@ -983,30 +1403,203 @@ function reservation_render_stop_panel(array $stop, array $itinerary, bool $canE
         $guestCount = 1;
     }
     $modalId = 'reserveModal' . $itemId;
+    $editingReservation = $reservation && in_array((string) ($reservation['status'] ?? ''), ['draft', 'pending', 'confirmed'], true);
+    $savedQty = [];
+    foreach ($lines as $line) {
+        $savedQty[(int) ($line['service_id'] ?? 0)] = (int) ($line['qty'] ?? 0);
+    }
+    $orderAtPlace = $editingReservation && (string) ($reservation['order_mode'] ?? '') === 'table_only';
     $replacements = [];
-    if ($reservation && ($reservation['status'] ?? '') === 'rejected' && $canEdit) {
-        $rep = db()->prepare(
-            "SELECT b.id, b.name, bt.name AS type_name FROM businesses b
-             JOIN business_types bt ON bt.id = b.business_type_id
-             WHERE b.approval_status='approved' AND b.status='active' AND b.id<>?
-             ORDER BY b.name"
+    $rejected = $reservation && ($reservation['status'] ?? '') === 'rejected';
+    $allowReplace = $canEdit || $bookingFinalized;
+    $liveReservation = $reservation && in_array((string) ($reservation['status'] ?? ''), ['pending', 'confirmed', 'completed', 'no_show'], true);
+    $hadDecline = false;
+    if ($allowReplace && !$liveReservation) {
+        $priorSt = db()->prepare(
+            "SELECT id FROM restaurant_reservations WHERE itinerary_item_id=? AND status='rejected' LIMIT 1"
         );
-        $rep->execute([$bizId]);
+        $priorSt->execute([$itemId]);
+        $hadDecline = (bool) $priorSt->fetch();
+    }
+    $canChange = $allowReplace && ($rejected || ($hadDecline && !$liveReservation));
+    if ($canChange) {
+        $rep = db()->prepare(
+            "SELECT b.id, b.name, b.cover_image, b.address, b.description, b.phone, b.opening_hours, bt.name AS type_name,
+                    EXISTS(
+                      SELECT 1 FROM restaurant_reservations r
+                      WHERE r.itinerary_item_id=? AND r.business_id=b.id AND r.status='rejected'
+                    ) AS declined
+             FROM businesses b
+             JOIN business_types bt ON bt.id = b.business_type_id
+             WHERE b.approval_status='approved' AND b.status='active'
+             ORDER BY declined DESC, b.name"
+        );
+        $rep->execute([$itemId]);
         foreach ($rep->fetchAll() ?: [] as $place) {
             if (revenue_bookable_kind($place['type_name'] ?? '') === $kind) {
                 $replacements[] = $place;
             }
         }
+        usort($replacements, static function (array $a, array $b): int {
+            $declined = ((int) ($b['declined'] ?? 0)) <=> ((int) ($a['declined'] ?? 0));
+            if ($declined !== 0) {
+                return $declined;
+            }
+            return strcasecmp((string) $a['name'], (string) $b['name']);
+        });
     }
+    $favoriteBizIds = [];
+    $placeServices = [];
+    if ($replacements) {
+        ensure_business_favorites_schema();
+        $favStmt = db()->prepare('SELECT business_id FROM business_favorites WHERE user_id=?');
+        $favStmt->execute([(int) ($_SESSION['user_id'] ?? 0)]);
+        $favoriteBizIds = array_map('intval', $favStmt->fetchAll(PDO::FETCH_COLUMN) ?: []);
+        $placeIds = array_map(static fn (array $place): int => (int) $place['id'], $replacements);
+        $marks = implode(',', array_fill(0, count($placeIds), '?'));
+        $svcStmt = db()->prepare(
+            "SELECT business_id, name, price, image_path FROM business_services WHERE is_active=1 AND business_id IN ($marks) ORDER BY name"
+        );
+        $svcStmt->execute($placeIds);
+        foreach ($svcStmt->fetchAll() ?: [] as $svc) {
+            $placeServices[(int) $svc['business_id']][] = $svc;
+        }
+    }
+    $menuEmpty = $kind === 'wellness' ? 'No services yet.' : ($kind === 'beach' ? 'Nothing listed yet.' : 'No menu items yet.');
+    $replaceSearch = $kind === 'wellness' ? 'Search wellness places' : ($kind === 'beach' ? 'Search beaches' : 'Search restaurants');
     ?>
-    <div class="d-flex flex-wrap align-items-center gap-2 mt-2">
+    <?php if ($slot !== 'modal'): ?>
+    <div class="itin-item__reserve">
+      <?php if ($canChange): ?>
+        <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-toggle="modal" data-bs-target="#changeStop<?= $itemId ?>">Change</button>
+      <?php endif; ?>
+      <?php if (!$rejected): ?>
       <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-toggle="modal" data-bs-target="#<?= e($modalId) ?>">
-        <?= $reservation ? 'Reservation' : e($placeCopy['button']) ?>
+        <?= $editingReservation ? 'Edit reservation' : (($reservation && !in_array((string) ($reservation['status'] ?? ''), ['cancelled', 'rejected'], true)) ? 'Reservation' : e($placeCopy['button'])) ?>
       </button>
-      <?php if ($reservation): ?>
+      <?php endif; ?>
+      <?php if ($reservation && (string) ($reservation['status'] ?? '') !== 'draft'): ?>
         <?= status_badge((string) $reservation['status']) ?>
       <?php endif; ?>
     </div>
+    <?php if ($canChange && $slot === 'button'): ?>
+    <div class="modal fade change-stop-modal" id="changeStop<?= $itemId ?>" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h2 class="modal-title h5 mb-0">Pick another stop</h2>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+            <?php if (!$replacements): ?>
+              <p class="mb-0">No other approved place of this kind yet.</p>
+            <?php else: ?>
+            <div class="change-stop-tools">
+              <input type="search" class="form-control change-stop-search" placeholder="<?= e($replaceSearch) ?>" aria-label="<?= e($replaceSearch) ?>">
+              <button type="button" class="change-stop-fav" aria-pressed="false" aria-label="Show favorites">
+                <i class="bi bi-heart" aria-hidden="true"></i>
+              </button>
+            </div>
+            <?php endif; ?>
+            <div class="change-stop-list">
+            <?php foreach ($replacements as $place): ?>
+              <?php
+                $placeCover = trim((string) ($place['cover_image'] ?? ''));
+                $placeCoverUrl = $placeCover !== '' ? (APP_URL . '/uploads/' . ltrim($placeCover, '/')) : '';
+                $placeFav = in_array((int) $place['id'], $favoriteBizIds, true);
+                $placeWasDeclined = (int) ($place['declined'] ?? 0) === 1;
+                $placeDeclined = $placeWasDeclined || (int) $place['id'] === $bizId;
+                $placeHours = reservation_hours_text($place['opening_hours'] ?? null);
+                $placeAbout = trim((string) ($place['description'] ?? ''));
+              ?>
+              <?php if ($placeDeclined): ?>
+              <div class="change-stop-card is-blocked" data-name="<?= e(strtolower((string) $place['name'])) ?>" data-fav="<?= $placeFav ? '1' : '0' ?>">
+                <div class="change-stop-card__hit">
+                  <span class="change-stop-card__photo<?= $placeCoverUrl === '' ? ' is-empty' : '' ?>"<?= $placeCoverUrl !== '' ? ' style="background-image:url(' . e($placeCoverUrl) . ')"' : '' ?>></span>
+                  <span class="change-stop-card__copy">
+                    <strong><?= e($place['name']) ?></strong>
+                    <small class="<?= $placeWasDeclined ? 'is-declined' : 'is-current' ?>"><?= $placeWasDeclined ? 'Already declined this stop' : 'This is the current stop' ?></small>
+                  </span>
+                </div>
+                <button type="button" class="change-stop-card__view" data-detail="<?= (int) $place['id'] ?>">View details</button>
+              </div>
+              <?php else: ?>
+              <form method="post" class="change-stop-card" data-name="<?= e(strtolower((string) $place['name'])) ?>" data-fav="<?= $placeFav ? '1' : '0' ?>">
+                <?= csrf_field() ?>
+                <input type="hidden" name="action" value="reserve_replace">
+                <input type="hidden" name="itinerary_id" value="<?= (int) ($itinerary['id'] ?? 0) ?>">
+                <input type="hidden" name="item_id" value="<?= $itemId ?>">
+                <input type="hidden" name="business_id" value="<?= (int) $place['id'] ?>">
+                <button class="change-stop-card__hit" type="submit">
+                  <span class="change-stop-card__photo<?= $placeCoverUrl === '' ? ' is-empty' : '' ?>"<?= $placeCoverUrl !== '' ? ' style="background-image:url(' . e($placeCoverUrl) . ')"' : '' ?>></span>
+                  <span class="change-stop-card__copy">
+                    <strong><?= e($place['name']) ?></strong>
+                    <?php if (trim((string) ($place['address'] ?? '')) !== ''): ?>
+                      <small><?= e((string) $place['address']) ?></small>
+                    <?php endif; ?>
+                  </span>
+                </button>
+                <button type="button" class="change-stop-card__view" data-detail="<?= (int) $place['id'] ?>">View details</button>
+              </form>
+              <?php endif; ?>
+              <div class="change-stop-detail-src" data-id="<?= (int) $place['id'] ?>" hidden>
+                <div class="change-stop-detail__photo<?= $placeCoverUrl === '' ? ' is-empty' : '' ?>"<?= $placeCoverUrl !== '' ? ' style="background-image:url(' . e($placeCoverUrl) . ')"' : '' ?>></div>
+                <div class="change-stop-detail__body">
+                  <div class="change-stop-detail__kicker"><?= e((string) ($place['type_name'] ?? '')) ?></div>
+                  <h3><?= e($place['name']) ?></h3>
+                  <?php if (trim((string) ($place['address'] ?? '')) !== ''): ?>
+                    <p><?= e((string) $place['address']) ?></p>
+                  <?php endif; ?>
+                  <?php if (trim((string) ($place['phone'] ?? '')) !== ''): ?>
+                    <p><?= e((string) $place['phone']) ?></p>
+                  <?php endif; ?>
+                  <?php if ($placeHours !== ''): ?>
+                    <p><?= e($placeHours) ?></p>
+                  <?php endif; ?>
+                  <?php if ($placeAbout !== ''): ?>
+                    <p><?= e($placeAbout) ?></p>
+                  <?php endif; ?>
+                  <?php if ($placeWasDeclined): ?>
+                    <p class="change-stop-detail__blocked">This place already declined this stop.</p>
+                  <?php endif; ?>
+                  <ul class="change-stop-detail__menu">
+                    <?php if (empty($placeServices[(int) $place['id']])): ?>
+                      <li class="is-empty"><?= e($menuEmpty) ?></li>
+                    <?php else: ?>
+                      <?php foreach ($placeServices[(int) $place['id']] as $svc): ?>
+                        <?php
+                          $svcImg = trim((string) ($svc['image_path'] ?? ''));
+                          $svcUrl = $svcImg !== '' ? (APP_URL . '/uploads/' . ltrim($svcImg, '/')) : '';
+                        ?>
+                        <li>
+                          <span class="change-stop-detail__dish<?= $svcUrl === '' ? ' is-empty' : '' ?>"<?= $svcUrl !== '' ? ' style="background-image:url(' . e($svcUrl) . ')"' : '' ?>></span>
+                          <span class="change-stop-detail__dish-name"><?= e((string) $svc['name']) ?></span>
+                          <span class="change-stop-detail__dish-price"><?= e(format_money((float) ($svc['price'] ?? 0))) ?></span>
+                        </li>
+                      <?php endforeach; ?>
+                    <?php endif; ?>
+                  </ul>
+                </div>
+              </div>
+            <?php endforeach; ?>
+            </div>
+            <p class="change-stop-empty mb-0" hidden>No places match that search.</p>
+            <div class="change-stop-detail-layer" hidden>
+              <button type="button" class="change-stop-detail__scrim" data-detail-close aria-label="Close details"></button>
+              <div class="change-stop-detail" role="dialog" aria-modal="true" aria-label="Place details">
+                <button type="button" class="change-stop-detail__x" data-detail-close aria-label="Close">×</button>
+                <div class="change-stop-detail-slot"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <?php endif; ?>
+    <?php endif; ?>
+    <?php if ($slot === 'button') {
+        return;
+    } ?>
     <div class="modal fade reserve-modal" id="<?= e($modalId) ?>" tabindex="-1" aria-labelledby="<?= e($modalId) ?>Label" aria-hidden="true">
       <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content">
@@ -1015,9 +1608,9 @@ function reservation_render_stop_panel(array $stop, array $itinerary, bool $canE
             <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
           </div>
           <div class="modal-body">
-            <?php $showReserveForm = $canEdit && !$reservation; ?>
+            <?php $showReserveForm = ($canEdit || ($bookingFinalized && !$reservation) || $heldDraft) && (!$reservation || $editingReservation); ?>
             <?php if ($showReserveForm): ?>
-            <form method="post" class="jb-kiosk" data-empty-order="<?= e($placeCopy['empty']) ?>" data-at-place="<?= e($placeCopy['at_place']) ?>" data-add-blocked="<?= e($placeCopy['add_blocked']) ?>">
+            <form method="post" class="jb-kiosk<?= $orderAtPlace ? ' is-at-restaurant' : '' ?>" data-empty-order="<?= e($placeCopy['empty']) ?>" data-at-place="<?= e($placeCopy['at_place']) ?>" data-add-blocked="<?= e($placeCopy['add_blocked']) ?>">
               <?= csrf_field() ?>
               <input type="hidden" name="action" value="reserve_submit">
               <input type="hidden" name="itinerary_id" value="<?= (int) ($itinerary['id'] ?? 0) ?>">
@@ -1032,7 +1625,7 @@ function reservation_render_stop_panel(array $stop, array $itinerary, bool $canE
                     <div class="jb-kiosk__hours"><?= e($hours) ?></div>
                   <?php endif; ?>
                 </div>
-                <?php if ($reservation): ?>
+                <?php if ($reservation && (string) ($reservation['status'] ?? '') !== 'draft'): ?>
                   <?= status_badge((string) $reservation['status']) ?>
                 <?php endif; ?>
               </div>
@@ -1082,7 +1675,7 @@ function reservation_render_stop_panel(array $stop, array $itinerary, bool $canE
                       </span>
                     </button>
                     <?php if ($showReserveForm): ?>
-                      <input type="hidden" name="qty[<?= (int) $dish['id'] ?>]" value="0" data-dish-qty="<?= (int) $dish['id'] ?>" data-price="<?= e(number_format($dishPrice, 2, '.', '')) ?>" data-name="<?= e($dish['name']) ?>">
+                      <input type="hidden" name="qty[<?= (int) $dish['id'] ?>]" value="<?= (int) ($savedQty[(int) $dish['id']] ?? 0) ?>" data-dish-qty="<?= (int) $dish['id'] ?>" data-price="<?= e(number_format($dishPrice, 2, '.', '')) ?>" data-name="<?= e($dish['name']) ?>">
                     <?php endif; ?>
                   <?php endforeach; ?>
                 </div>
@@ -1093,13 +1686,13 @@ function reservation_render_stop_panel(array $stop, array $itinerary, bool $canE
                     <input type="hidden" name="reserve_time" value="<?= e($timeValue) ?>">
                     <input type="hidden" name="guests" value="<?= $guestCount ?>">
                     <label class="jb-kiosk__check">
-                      <input type="checkbox" data-at-restaurant>
+                      <input type="checkbox" data-at-restaurant<?= $orderAtPlace ? ' checked' : '' ?>>
                       <span><strong><?= e($placeCopy['check_title']) ?></strong><small><?= e($placeCopy['check_note']) ?></small></span>
                     </label>
                   <?php endif; ?>
                 <div class="jb-kiosk__ticket">
                   <div class="jb-kiosk__ticket-title"><?= e($placeCopy['ticket']) ?></div>
-                  <?php if ($reservation): ?>
+                  <?php if ($reservation && !$showReserveForm): ?>
                     <div class="jb-kiosk__ticket-line"><?= e($reservation['code']) ?></div>
                     <div class="jb-kiosk__ticket-line"><?= e(format_date((string) $reservation['reserve_date'])) ?> · <?= e(format_time_12h((string) $reservation['reserve_time'])) ?></div>
                     <div class="jb-kiosk__ticket-line"><?= (int) $reservation['guests'] ?> guest<?= (int) $reservation['guests'] === 1 ? '' : 's' ?> · <?= $reservation['order_mode'] === 'advance_order' ? e($placeCopy['ahead']) : e($placeCopy['at_place_short']) ?></div>
@@ -1123,28 +1716,19 @@ function reservation_render_stop_panel(array $stop, array $itinerary, bool $canE
                         <button class="btn btn-sm btn-outline-danger w-100" type="submit">Cancel reservation</button>
                       </form>
                     <?php endif; ?>
-                    <?php if ($replacements): ?>
-                      <form method="post" class="mt-2">
-                        <?= csrf_field() ?>
-                        <input type="hidden" name="action" value="reserve_replace">
-                        <input type="hidden" name="itinerary_id" value="<?= (int) ($itinerary['id'] ?? 0) ?>">
-                        <input type="hidden" name="item_id" value="<?= $itemId ?>">
-                        <label class="form-label small mb-1"><?= e($placeCopy['replace']) ?></label>
-                        <select class="form-select form-select-sm mb-2" name="business_id" required>
-                          <?php foreach ($replacements as $place): ?>
-                            <option value="<?= (int) $place['id'] ?>"><?= e($place['name']) ?></option>
-                          <?php endforeach; ?>
-                        </select>
-                        <button class="btn btn-sm btn-outline-secondary w-100" type="submit">Replace</button>
-                      </form>
-                    <?php endif; ?>
                   <?php elseif ($showReserveForm): ?>
                     <ul class="jb-kiosk__lines" data-order-list>
                       <li class="jb-kiosk__empty-order"><?= e($placeCopy['empty']) ?></li>
                     </ul>
                     <div class="jb-kiosk__total"><span><?= e($placeCopy['total']) ?></span><strong data-order-total><?= e(format_money(0)) ?></strong></div>
                     <p class="jb-kiosk__note"><?= e($placeCopy['fee_who']) ?> pays the CulTour fee<?= $fee > 0 ? ' (' . e(format_money($fee)) . ')' : '' ?>. You are not charged.</p>
-                    <button class="btn jb-kiosk__go" type="submit">Place reservation</button>
+                    <?php if ($heldDraft): ?>
+                      <p class="jb-kiosk__note">Not sent yet. Press Proceed to finalize.</p>
+                    <?php endif; ?>
+                    <button class="btn jb-kiosk__go" type="submit"><?= ($editingReservation && !$heldDraft) ? 'Save reservation' : 'Place reservation' ?></button>
+                    <?php if ($editingReservation && !$heldDraft): ?>
+                      <button class="btn btn-sm btn-outline-danger w-100 mt-2" type="submit" form="reserveCancel<?= (int) ($reservation['id'] ?: $itemId) ?>">Cancel reservation</button>
+                    <?php endif; ?>
                   <?php else: ?>
                     <div class="jb-kiosk__note">No reservation request yet.</div>
                   <?php endif; ?>
@@ -1174,6 +1758,20 @@ function reservation_render_stop_panel(array $stop, array $itinerary, bool $canE
                 <?php endif; ?>
             <?php if ($showReserveForm): ?>
             </form>
+            <?php if ($editingReservation): ?>
+            <form method="post" id="reserveCancel<?= (int) ($reservation['id'] ?: $itemId) ?>" onsubmit="return confirm('Cancel this reservation?');">
+              <?= csrf_field() ?>
+              <?php if ((string) ($reservation['status'] ?? '') === 'draft'): ?>
+              <input type="hidden" name="action" value="reserve_draft_clear">
+              <input type="hidden" name="itinerary_id" value="<?= (int) ($itinerary['id'] ?? 0) ?>">
+              <input type="hidden" name="item_id" value="<?= $itemId ?>">
+              <?php else: ?>
+              <input type="hidden" name="action" value="reserve_cancel">
+              <input type="hidden" name="itinerary_id" value="<?= (int) ($itinerary['id'] ?? 0) ?>">
+              <input type="hidden" name="reservation_id" value="<?= (int) $reservation['id'] ?>">
+              <?php endif; ?>
+            </form>
+            <?php endif; ?>
             <?php else: ?>
             </div>
             <?php endif; ?>
@@ -1188,17 +1786,93 @@ function reservation_render_stop_panel(array $stop, array $itinerary, bool $canE
         ?>
     <script>
       document.addEventListener('DOMContentLoaded', function () {
-        document.querySelectorAll('.reserve-modal').forEach(function (modal) {
+        document.querySelectorAll('.reserve-modal, .change-stop-modal').forEach(function (modal) {
           document.body.appendChild(modal);
         });
+        document.querySelectorAll('.change-stop-modal').forEach(function (modal) {
+          var search = modal.querySelector('.change-stop-search');
+          var fav = modal.querySelector('.change-stop-fav');
+          var empty = modal.querySelector('.change-stop-empty');
+          var favOnly = false;
+          function applyFilter() {
+            var q = (search && search.value || '').trim().toLowerCase();
+            var shown = 0;
+            modal.querySelectorAll('.change-stop-card').forEach(function (card) {
+              var name = card.getAttribute('data-name') || '';
+              var ok = name.indexOf(q) !== -1 && (!favOnly || card.getAttribute('data-fav') === '1');
+              card.hidden = !ok;
+              if (ok) shown += 1;
+            });
+            if (empty) empty.hidden = shown > 0 || !modal.querySelector('.change-stop-card');
+          }
+          if (search) search.addEventListener('input', applyFilter);
+          if (fav) fav.addEventListener('click', function () {
+            favOnly = !favOnly;
+            fav.setAttribute('aria-pressed', favOnly ? 'true' : 'false');
+            fav.classList.toggle('is-on', favOnly);
+            var icon = fav.querySelector('i');
+            if (icon) icon.className = favOnly ? 'bi bi-heart-fill' : 'bi bi-heart';
+            applyFilter();
+          });
+          var layer = modal.querySelector('.change-stop-detail-layer');
+          var slot = modal.querySelector('.change-stop-detail-slot');
+          modal.querySelectorAll('[data-detail]').forEach(function (btn) {
+            btn.addEventListener('click', function (event) {
+              event.preventDefault();
+              event.stopPropagation();
+              var src = modal.querySelector('.change-stop-detail-src[data-id="' + btn.getAttribute('data-detail') + '"]');
+              if (!layer || !slot || !src) return;
+              slot.innerHTML = src.innerHTML;
+              layer.hidden = false;
+            });
+          });
+          modal.querySelectorAll('[data-detail-close]').forEach(function (btn) {
+            btn.addEventListener('click', function () {
+              if (layer) layer.hidden = true;
+            });
+          });
+        });
+        document.querySelectorAll('form.jb-kiosk').forEach(function (form) { paintOrder(form); });
         var params = new URLSearchParams(window.location.search);
         var openId = params.get('reserve');
-        if (openId && window.bootstrap) {
-          var modal = document.getElementById('reserveModal' + openId);
-          if (modal) window.bootstrap.Modal.getOrCreateInstance(modal).show();
+        var queue = (params.get('queue') || '').split(',').map(function (part) {
+          return part.trim();
+        }).filter(function (part) { return /^[0-9]+$/.test(part); });
+        var leaving = false;
+        document.addEventListener('submit', function (event) {
+          if (event.target && event.target.closest && event.target.closest('.reserve-modal')) leaving = true;
+        }, true);
+        function writeQueue() {
+          document.querySelectorAll('.reserve-modal form').forEach(function (form) {
+            var input = form.querySelector('[name="reserve_queue"]');
+            if (!input) {
+              input = document.createElement('input');
+              input.type = 'hidden';
+              input.name = 'reserve_queue';
+              form.appendChild(input);
+            }
+            input.value = queue.join(',');
+          });
+        }
+        function showReserve(id) {
+          writeQueue();
+          var modal = document.getElementById('reserveModal' + id);
+          if (!modal || !window.bootstrap) {
+            if (queue.length) showReserve(queue.shift());
+            return;
+          }
+          modal.addEventListener('hidden.bs.modal', function () {
+            if (leaving || !queue.length) return;
+            showReserve(queue.shift());
+          }, { once: true });
+          window.bootstrap.Modal.getOrCreateInstance(modal).show();
+        }
+        if (openId && /^[0-9]+$/.test(openId)) {
           params.delete('reserve');
+          params.delete('queue');
           var next = window.location.pathname + (params.toString() ? '?' + params.toString() : '') + window.location.hash;
           window.history.replaceState({}, '', next);
+          showReserve(openId);
         }
       });
       function peso(amount) {

@@ -218,6 +218,17 @@ function app_today(): string
     return app_local_clock()['today'];
 }
 
+/** First date a tour can be booked. Today is not bookable. */
+function booking_earliest_date(): string
+{
+    $dt = DateTime::createFromFormat('!Y-m-d', app_today());
+    if (!$dt) {
+        $dt = new DateTime('today');
+    }
+    $dt->modify('+1 day');
+    return $dt->format('Y-m-d');
+}
+
 /** Minutes from midnight on this PC (cookie) or the server clock. */
 function app_now_mins(): int
 {
@@ -225,7 +236,7 @@ function app_now_mins(): int
 }
 
 /**
- * Capitalize the first letter of a name (rest unchanged aside from trim).
+ * First letter of each word capital, the rest lowercase, even if typed with Caps Lock.
  */
 function capitalize_name(string $name): string
 {
@@ -233,10 +244,15 @@ function capitalize_name(string $name): string
     if ($name === '') {
         return '';
     }
-    if (function_exists('mb_substr') && function_exists('mb_strtoupper')) {
-        return mb_strtoupper(mb_substr($name, 0, 1, 'UTF-8'), 'UTF-8') . mb_substr($name, 1, null, 'UTF-8');
-    }
-    return ucfirst($name);
+    $out = preg_replace_callback('/[\p{L}]+/u', static function (array $m): string {
+        $word = $m[0];
+        if (function_exists('mb_substr') && function_exists('mb_strtoupper') && function_exists('mb_strtolower')) {
+            return mb_strtoupper(mb_substr($word, 0, 1, 'UTF-8'), 'UTF-8')
+                . mb_strtolower(mb_substr($word, 1, null, 'UTF-8'), 'UTF-8');
+        }
+        return ucfirst(strtolower($word));
+    }, $name);
+    return is_string($out) ? $out : $name;
 }
 
 /**
@@ -581,6 +597,8 @@ function normalize_spoken_languages(string $raw): string
         if ($part === '') {
             continue;
         }
+        $part = mb_strtolower($part, 'UTF-8');
+        $part = mb_strtoupper(mb_substr($part, 0, 1, 'UTF-8'), 'UTF-8') . mb_substr($part, 1, null, 'UTF-8');
         $parts[] = $part;
     }
     $out = implode(', ', $parts);
@@ -646,6 +664,10 @@ function user_parse_identity(array $input, bool $required = true): array
     $sex = trim((string) ($input['sex'] ?? ''));
     $dobRaw = trim((string) ($input['date_of_birth'] ?? ''));
     $nationality = trim((string) ($input['nationality'] ?? ''));
+    if ($nationality !== '') {
+        $nationality = mb_strtoupper(mb_substr($nationality, 0, 1, 'UTF-8'), 'UTF-8')
+            . mb_strtolower(mb_substr($nationality, 1, null, 'UTF-8'), 'UTF-8');
+    }
     $languages = normalize_spoken_languages((string) ($input['tourist_languages'] ?? ''));
     if ($languages === '') {
         $languages = normalize_spoken_languages((string) ($input['languages'] ?? ''));
@@ -1769,6 +1791,9 @@ function ensure_itinerary_items_schema(): void
         if (!in_array('visit_date', $cols, true)) {
             $pdo->exec('ALTER TABLE itinerary_items ADD COLUMN visit_date DATE NULL AFTER sort_order');
         }
+        if (!in_array('reservation_draft', $cols, true)) {
+            $pdo->exec('ALTER TABLE itinerary_items ADD COLUMN reservation_draft TEXT NULL');
+        }
 
         $itinCols = $pdo->query('SHOW COLUMNS FROM itineraries')->fetchAll(PDO::FETCH_COLUMN);
         if (!in_array('meetup_time', $itinCols, true)) {
@@ -2235,6 +2260,9 @@ function ensure_place_schedule_schema(): void
         if (!in_array('visit_duration_minutes', $bizCols, true)) {
             $pdo->exec('ALTER TABLE businesses ADD COLUMN visit_duration_minutes INT UNSIGNED NULL AFTER default_visit_minutes');
         }
+        if (!in_array('min_visit_minutes', $bizCols, true)) {
+            $pdo->exec('ALTER TABLE businesses ADD COLUMN min_visit_minutes INT UNSIGNED NULL AFTER visit_duration_minutes');
+        }
 
         $pdo->exec(
             "CREATE TABLE IF NOT EXISTS destination_images (
@@ -2314,7 +2342,7 @@ function itinerary_items_with_places(int $itineraryId): array
          LEFT JOIN businesses b ON b.id = ii.business_id
          LEFT JOIN business_types bt ON bt.id = b.business_type_id
          WHERE ii.itinerary_id = ?
-         ORDER BY COALESCE(ii.visit_date, '1970-01-01'), ii.sort_order, ii.id"
+         ORDER BY ii.sort_order, ii.id"
     );
     $s->execute([$itineraryId]);
     $rows = $s->fetchAll() ?: [];
@@ -2840,7 +2868,7 @@ function itinerary_place_coords(array $ref): ?array
     }
     if (!empty($ref['business_id'])) {
         $s = db()->prepare(
-            "SELECT name, latitude, longitude, opening_hours, default_visit_minutes, visit_duration_minutes FROM businesses
+            "SELECT name, latitude, longitude, opening_hours, default_visit_minutes, visit_duration_minutes, min_visit_minutes FROM businesses
              WHERE id=? AND approval_status='approved' AND status='active'"
         );
         $s->execute([(int) $ref['business_id']]);
@@ -2863,9 +2891,96 @@ function itinerary_place_coords(array $ref): ?array
             'opening_hours' => $oh !== null ? (string) $oh : null,
             'default_visit_minutes' => $visit,
             'visit_limit_minutes' => place_visit_limit($row['visit_duration_minutes'] ?? null),
+            'min_visit_minutes' => place_min_visit($row['min_visit_minutes'] ?? null),
         ];
     }
     return null;
+}
+
+function business_uses_min_visit(?string $typeName): bool
+{
+    $kind = revenue_bookable_kind($typeName);
+    return $kind === 'food' || $kind === 'wellness';
+}
+
+/** Stored minimum stay, or null when the business has not set one. */
+function place_min_visit(mixed $raw): ?int
+{
+    if ($raw === null || $raw === '') {
+        return null;
+    }
+    $mins = (int) $raw;
+    if ($mins <= 0) {
+        return null;
+    }
+    return max(15, min(ITIN_MAX_VISIT_MINUTES, $mins));
+}
+
+/** Error when a stop's stay is shorter than the place requires, or null if OK. */
+function itinerary_visit_min_message(string $name, ?int $min, int $visitMins): ?string
+{
+    if ($min === null || $visitMins >= $min) {
+        return null;
+    }
+    $label = format_visit_duration_label($min);
+    return ($name !== '' ? $name : 'This place') . ' needs a minimum visit of ' . $label
+        . '. Set the stay to ' . $label . ' or more.';
+}
+
+/**
+ * Minimum visit from the business hours form: "HH:MM" in min_visit.
+ * @return array{ok:bool,minutes:?int,message?:string}
+ */
+function parse_min_visit_post(array $post): array
+{
+    if (!empty($post['min_visit_none'])) {
+        return ['ok' => true, 'minutes' => null];
+    }
+    $raw = trim((string) ($post['min_visit'] ?? ''));
+    if ($raw === '') {
+        return ['ok' => false, 'minutes' => null, 'message' => 'Enter a minimum visit time, like 01:00.'];
+    }
+    if (!preg_match('/^(\d{1,2}):(\d{2})$/', $raw, $m)) {
+        return ['ok' => false, 'minutes' => null, 'message' => 'Enter the minimum visit as hours and minutes, like 01:30.'];
+    }
+    $mins = ((int) $m[1] * 60) + (int) $m[2];
+    if ((int) $m[2] > 59) {
+        return ['ok' => false, 'minutes' => null, 'message' => 'Minutes must be between 00 and 59.'];
+    }
+    if ($mins < 15) {
+        return ['ok' => false, 'minutes' => null, 'message' => 'Minimum visit must be at least 15 minutes.'];
+    }
+    if ($mins > ITIN_MAX_VISIT_MINUTES) {
+        return ['ok' => false, 'minutes' => null, 'message' => 'Minimum visit can be at most ' . format_visit_duration_label(ITIN_MAX_VISIT_MINUTES) . '.'];
+    }
+    return ['ok' => true, 'minutes' => $mins];
+}
+
+function min_visit_field_html(string $idPrefix, mixed $stored): string
+{
+    $mins = place_min_visit($stored);
+    $none = $mins === null;
+    $id = e($idPrefix);
+    $clock = $none ? '' : sprintf('%02d:%02d', intdiv($mins, 60), $mins % 60);
+    $unit = $none ? '' : (intdiv($mins, 60) < 1 ? 'mins' : (intdiv($mins, 60) === 1 ? 'hour' : 'hours'));
+    $html = '<div class="visit-duration-field" data-visit-duration data-min-visit>';
+    $html .= '<label class="form-label small mb-1" for="' . $id . 'Clock">Minimum visit time</label>';
+    $html .= '<div class="visit-duration-field__row">';
+    $html .= '<div class="itin-visit-clock-wrap' . ($unit === '' ? ' is-empty' : '') . '">';
+    $html .= '<input type="text" class="form-control form-control-sm itin-visit-clock" id="' . $id . 'Clock" name="min_visit"'
+        . ' data-visit-duration-clock inputmode="numeric" autocomplete="off" placeholder="01:00" maxlength="5"'
+        . ' aria-label="Minimum visit hours and minutes" value="' . e($clock) . '"' . ($none ? ' disabled' : '') . '>';
+    $html .= '<span class="itin-visit-clock__unit" data-itin-visit-unit>' . e($unit) . '</span>';
+    $html .= '</div>';
+    $html .= '<div class="form-check mb-0">';
+    $html .= '<input class="form-check-input" type="checkbox" name="min_visit_none" value="1" id="' . $id . 'None"'
+        . ' data-visit-no-limit' . ($none ? ' checked' : '') . '>';
+    $html .= '<label class="form-check-label small" for="' . $id . 'None">No minimum visit time</label>';
+    $html .= '</div></div>';
+    $html .= '<div class="form-text text-danger d-none" data-visit-duration-warn></div>';
+    $html .= '<div class="form-text">Shortest stay a tourist can schedule here. Check No minimum visit time to allow any length.</div>';
+    $html .= '</div>';
+    return $html;
 }
 
 /** Stored visit duration → limit in minutes, or null when the place has no limit. */
@@ -3260,11 +3375,11 @@ function opening_hours_avail_rows_html(string $idPrefix, array $byDay, bool $sho
         $html .= '</div><div class="guide-profile-avail__times"><div>';
         $html .= '<label class="form-label small mb-0" for="' . $id . 'Start' . $i . '">Start</label>';
         $html .= '<input type="time" class="form-control form-control-sm" id="' . $id . 'Start' . $i . '" name="day_start[' . $i . ']" value="'
-            . $start . '" step="60"' . ($timesOn ? ' required' : ' disabled') . $formAttr . '>';
+            . $start . '" step="900"' . ($timesOn ? ' required' : ' disabled') . $formAttr . '>';
         $html .= '</div><div>';
         $html .= '<label class="form-label small mb-0" for="' . $id . 'End' . $i . '">End</label>';
         $html .= '<input type="time" class="form-control form-control-sm" id="' . $id . 'End' . $i . '" name="day_end[' . $i . ']" value="'
-            . $end . '" step="60" data-avail-end' . ($timesOn ? ' required' : ' disabled') . $formAttr . '>';
+            . $end . '" step="900" data-avail-end' . ($timesOn ? ' required' : ' disabled') . $formAttr . '>';
         $html .= '</div>';
         $html .= '<div class="form-check guide-profile-avail__24h mb-0">';
         $html .= '<input class="form-check-input" type="checkbox" name="day_24h[]" value="' . $i . '" id="' . $id . 'AllDay' . $i . '"'
@@ -3428,6 +3543,14 @@ function itinerary_update_stop_stay_and_reflow_day(int $itineraryId, int $itemId
         );
         if ($limitMsg !== null) {
             return $limitMsg;
+        }
+        $minMsg = itinerary_visit_min_message(
+            (string) $editedPlace['name'],
+            $editedPlace['min_visit_minutes'] ?? null,
+            $visitMins
+        );
+        if ($minMsg !== null) {
+            return $minMsg;
         }
     }
 
@@ -3871,6 +3994,18 @@ HTML;
 
 function redirect(string $url): never
 {
+    if (!empty($GLOBALS['CULTOUR_PACKAGE_MAKER']) && str_contains($url, '/tourist/itineraries.php')) {
+        $extra = '';
+        $query = parse_url($url, PHP_URL_QUERY);
+        if (is_string($query) && $query !== '') {
+            parse_str($query, $params);
+            unset($params['id'], $params['drafts']);
+            if ($params) {
+                $extra = '&' . http_build_query($params);
+            }
+        }
+        $url = APP_URL . '/business/package.php?id=' . (int) ($GLOBALS['CULTOUR_PACKAGE_ID'] ?? 0) . $extra;
+    }
     header('Location: ' . $url);
     exit;
 }
@@ -4027,6 +4162,9 @@ function ensure_booking_payment_schema(): void
             'transportation_business_id' => 'INT UNSIGNED NULL',
             'transportation_service_id' => 'INT UNSIGNED NULL',
             'transportation_declined' => 'TINYINT(1) NOT NULL DEFAULT 0',
+            'accommodation_decision' => "VARCHAR(20) NOT NULL DEFAULT 'none'",
+            'transportation_decision' => "VARCHAR(20) NOT NULL DEFAULT 'none'",
+            'guide_ready' => 'TINYINT(1) NOT NULL DEFAULT 0',
         ];
         foreach ($stayCols as $stayCol => $stayDef) {
             if (!in_array($stayCol, $cols, true)) {
@@ -4034,6 +4172,16 @@ function ensure_booking_payment_schema(): void
                 $cols[] = $stayCol;
             }
         }
+        $pdo->exec(
+            "UPDATE bookings SET accommodation_decision='pending'
+             WHERE accommodation_decision='none' AND accommodation_declined=0
+               AND accommodation_business_id IS NOT NULL AND status='pending'"
+        );
+        $pdo->exec(
+            "UPDATE bookings SET transportation_decision='pending'
+             WHERE transportation_decision='none' AND transportation_declined=0
+               AND transportation_business_id IS NOT NULL AND status='pending'"
+        );
         $billCols = [
             'accommodation_units' => 'INT UNSIGNED NULL',
             'accommodation_extra_guests' => 'INT UNSIGNED NULL',
@@ -4126,8 +4274,8 @@ function guide_booking_availability_message(
     if ($ts === false) {
         return 'Enter a valid booking date.';
     }
-    if ($date < app_today()) {
-        return 'Tour date cannot be in the past. Choose today or a future date.';
+    if ($date < booking_earliest_date()) {
+        return 'Tours cannot be booked for today. Choose tomorrow or a later date.';
     }
 
     $itinId = ($itineraryId && $itineraryId > 0) ? $itineraryId : null;
@@ -5513,7 +5661,7 @@ function auto_generate_itinerary_for_tourist(
     )->fetchAll() ?: [];
 
     $bizRows = db()->query(
-        "SELECT b.id, b.name, b.default_visit_minutes, " . business_itinerary_ready_columns() . "
+        "SELECT b.id, b.name, b.default_visit_minutes, b.min_visit_minutes, " . business_itinerary_ready_columns() . "
          FROM businesses b
          WHERE b.approval_status='approved' AND b.status='active'
            AND b.latitude IS NOT NULL AND b.longitude IS NOT NULL
@@ -5549,7 +5697,10 @@ function auto_generate_itinerary_for_tourist(
             'lat' => (float) $b['latitude'],
             'lng' => (float) $b['longitude'],
             'opening_hours' => $b['opening_hours'] ?? null,
-            'default_visit_minutes' => max(15, (int) ($b['default_visit_minutes'] ?? 60)),
+            'default_visit_minutes' => max(
+                place_min_visit($b['min_visit_minutes'] ?? null) ?? 15,
+                max(15, (int) ($b['default_visit_minutes'] ?? 60))
+            ),
         ];
     }
 
@@ -6569,10 +6720,61 @@ function package_pax_from_post(array $post): array
     return ['ok' => true, 'message' => '', 'pax' => $pax];
 }
 
-function package_pax_label(int $pax): string
+function package_slots_taken_map(array $serviceIds): array
+{
+    $serviceIds = array_values(array_unique(array_filter(array_map('intval', $serviceIds))));
+    if (!$serviceIds) {
+        return [];
+    }
+    if (!function_exists('ensure_package_order_schema')) {
+        require_once __DIR__ . '/payments.php';
+    }
+    ensure_package_order_schema();
+    $placeholders = implode(',', array_fill(0, count($serviceIds), '?'));
+    $stmt = db()->prepare(
+        "SELECT service_id, COALESCE(SUM(package_pax), 0) AS taken
+         FROM package_orders
+         WHERE service_id IN ($placeholders) AND payment_status IN ('paid', 'pay_at_office')
+         GROUP BY service_id"
+    );
+    $stmt->execute($serviceIds);
+    $map = [];
+    foreach ($stmt->fetchAll() ?: [] as $row) {
+        $map[(int) $row['service_id']] = (int) $row['taken'];
+    }
+    return $map;
+}
+
+function package_tour_earliest_date(): string
+{
+    $dt = DateTime::createFromFormat('!Y-m-d', app_today());
+    if (!$dt) {
+        $dt = new DateTime('today');
+    }
+    $dt->modify('+2 days');
+    return $dt->format('Y-m-d');
+}
+
+function package_cutoff_date(?string $tourDate): ?string
+{
+    $tourDate = normalize_tour_date($tourDate);
+    if ($tourDate === null) {
+        return null;
+    }
+    $dt = DateTimeImmutable::createFromFormat('Y-m-d', $tourDate);
+    if (!$dt) {
+        return null;
+    }
+    return $dt->modify('-2 days')->format('Y-m-d');
+}
+
+function package_pax_label(int $pax, int $min = 0): string
 {
     if ($pax < 1) {
         return '';
+    }
+    if ($min >= 1 && $min < $pax) {
+        return $min . ' – ' . $pax . ' pax';
     }
     return $pax === 1 ? '1 pax' : $pax . ' pax';
 }
@@ -6613,6 +6815,298 @@ function package_days_label(int $days): string
         return '';
     }
     return $days === 1 ? '1 day' : $days . ' days';
+}
+
+function package_stops_ensure_schema(): void
+{
+    static $done = false;
+    if ($done) {
+        return;
+    }
+    $done = true;
+    db()->exec(
+        "CREATE TABLE IF NOT EXISTS package_stops (
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            service_id INT UNSIGNED NOT NULL,
+            day_number INT UNSIGNED NOT NULL DEFAULT 1,
+            sort_order INT NOT NULL DEFAULT 0,
+            destination_id INT UNSIGNED NULL,
+            business_id INT UNSIGNED NULL,
+            visit_minutes INT UNSIGNED NOT NULL DEFAULT 60,
+            KEY idx_package_stops_service (service_id, day_number, sort_order)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    );
+    $cols = db()->query('SHOW COLUMNS FROM business_services')->fetchAll(PDO::FETCH_COLUMN) ?: [];
+    $add = [
+        'package_guide_id' => 'INT UNSIGNED NULL',
+        'package_stay_json' => 'TEXT NULL',
+        'package_ride_json' => 'TEXT NULL',
+        'package_itinerary_id' => 'INT UNSIGNED NULL',
+        'package_made' => 'TINYINT UNSIGNED NOT NULL DEFAULT 1',
+        'package_date_mode' => "VARCHAR(20) NOT NULL DEFAULT 'fixed'",
+        'package_fixed_date' => 'DATE NULL',
+        'package_close_date' => 'DATE NULL',
+        'package_inclusions' => 'TEXT NULL',
+        'package_min_pax' => 'INT UNSIGNED NULL',
+        'package_awaiting' => 'TINYINT UNSIGNED NOT NULL DEFAULT 0',
+    ];
+    foreach ($add as $col => $def) {
+        if (!in_array($col, $cols, true)) {
+            db()->exec('ALTER TABLE business_services ADD ' . $col . ' ' . $def);
+        }
+    }
+}
+
+function package_clearance_ensure_schema(): void
+{
+    static $done = false;
+    if ($done) {
+        return;
+    }
+    $done = true;
+    package_stops_ensure_schema();
+    db()->exec(
+        "CREATE TABLE IF NOT EXISTS package_clearances (
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            service_id INT UNSIGNED NOT NULL,
+            business_id INT UNSIGNED NULL,
+            guide_id INT UNSIGNED NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            KEY idx_pkg_clear_service (service_id, status),
+            KEY idx_pkg_clear_business (business_id, status),
+            KEY idx_pkg_clear_guide (guide_id, status)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    );
+}
+
+function package_clearance_replace(int $serviceId, array $businessIds, int $guideId): void
+{
+    package_clearance_ensure_schema();
+    db()->prepare('DELETE FROM package_clearances WHERE service_id=?')->execute([$serviceId]);
+    $ins = db()->prepare('INSERT INTO package_clearances (service_id, business_id, guide_id, status) VALUES (?,?,?,\'pending\')');
+    foreach ($businessIds as $businessId) {
+        $businessId = (int) $businessId;
+        if ($businessId > 0) {
+            $ins->execute([$serviceId, $businessId, null]);
+        }
+    }
+    if ($guideId > 0) {
+        $ins->execute([$serviceId, null, $guideId]);
+    }
+}
+
+function package_clearance_publish_if_ready(int $serviceId): void
+{
+    package_clearance_ensure_schema();
+    $pending = db()->prepare("SELECT COUNT(*) FROM package_clearances WHERE service_id=? AND status<>'accepted'");
+    $pending->execute([$serviceId]);
+    if ((int) $pending->fetchColumn() > 0) {
+        return;
+    }
+    $pkg = db()->prepare('SELECT s.name, b.user_id FROM business_services s JOIN businesses b ON b.id=s.business_id WHERE s.id=? LIMIT 1');
+    $pkg->execute([$serviceId]);
+    $pkg = $pkg->fetch();
+    if (!$pkg) {
+        return;
+    }
+    db()->prepare('UPDATE business_services SET package_made=1, is_active=1, package_awaiting=0 WHERE id=?')->execute([$serviceId]);
+    notify_user(
+        (int) $pkg['user_id'],
+        'booking_request',
+        'Inclusive package listed',
+        (string) $pkg['name'] . ' is now under Packages made and tour packages.',
+        APP_URL . '/business/services.php'
+    );
+}
+
+function package_clearance_respond(int $clearanceId, int $actorUserId, string $who, bool $accept): array
+{
+    package_clearance_ensure_schema();
+    if ($who === 'guide') {
+        $st = db()->prepare(
+            'SELECT c.id, c.service_id, s.name
+             FROM package_clearances c
+             JOIN business_services s ON s.id=c.service_id
+             JOIN tour_guide_profiles g ON g.id=c.guide_id
+             WHERE c.id=? AND g.user_id=? AND c.status=\'pending\' LIMIT 1'
+        );
+    } else {
+        $st = db()->prepare(
+            'SELECT c.id, c.service_id, s.name
+             FROM package_clearances c
+             JOIN business_services s ON s.id=c.service_id
+             JOIN businesses b ON b.id=c.business_id
+             WHERE c.id=? AND b.user_id=? AND c.status=\'pending\' LIMIT 1'
+        );
+    }
+    $st->execute([$clearanceId, $actorUserId]);
+    $row = $st->fetch();
+    if (!$row) {
+        return ['ok' => false, 'message' => 'That request is no longer waiting.'];
+    }
+    db()->prepare('UPDATE package_clearances SET status=? WHERE id=?')->execute([$accept ? 'accepted' : 'declined', $clearanceId]);
+    if ($accept) {
+        package_clearance_publish_if_ready((int) $row['service_id']);
+        return ['ok' => true, 'message' => 'Accepted.'];
+    }
+    $owner = db()->prepare('SELECT b.user_id FROM business_services s JOIN businesses b ON b.id=s.business_id WHERE s.id=?');
+    $owner->execute([(int) $row['service_id']]);
+    $ownerId = (int) $owner->fetchColumn();
+    if ($ownerId > 0) {
+        notify_user($ownerId, 'booking_request', 'Inclusive package declined', (string) $row['name'] . ' was declined, so it stays off the package lists.', APP_URL . '/business/package.php?id=' . (int) $row['service_id']);
+    }
+    return ['ok' => true, 'message' => 'Declined. The package stays hidden.'];
+}
+
+function package_stops_delete_for_service(int $serviceId): void
+{
+    if ($serviceId < 1) {
+        return;
+    }
+    package_stops_ensure_schema();
+    db()->prepare('DELETE FROM package_stops WHERE service_id=?')->execute([$serviceId]);
+}
+
+/**
+ * Places a travel business can drop into a package. Same rules as the itinerary maker.
+ * @return array{destinations:list<array{id:int,name:string,subtitle:string}>,businesses:list<array{id:int,name:string,subtitle:string}>}
+ */
+function package_maker_places(int $ownBusinessId): array
+{
+    package_stops_ensure_schema();
+    $destRows = db()->query(
+        "SELECT id, name, location, opening_hours FROM destinations WHERE status='published' ORDER BY name"
+    )->fetchAll() ?: [];
+    $destinations = [];
+    foreach ($destRows as $row) {
+        if (!destination_itinerary_ready($row)) {
+            continue;
+        }
+        $destinations[] = [
+            'id' => (int) $row['id'],
+            'name' => (string) $row['name'],
+            'subtitle' => trim((string) ($row['location'] ?? '')) !== '' ? (string) $row['location'] : 'Government site',
+        ];
+    }
+    $bizRows = db()->query(
+        "SELECT b.id, b.name, bt.name AS type_name, " . business_itinerary_ready_columns() . "
+         FROM businesses b
+         JOIN business_types bt ON bt.id = b.business_type_id
+         WHERE b.approval_status='approved' AND b.status='active'
+         ORDER BY b.name"
+    )->fetchAll() ?: [];
+    $businesses = [];
+    foreach ($bizRows as $row) {
+        $id = (int) $row['id'];
+        if ($id === $ownBusinessId || business_excluded_from_itinerary_stops($row['type_name'] ?? '')) {
+            continue;
+        }
+        if (!business_itinerary_ready($row)) {
+            continue;
+        }
+        $kind = revenue_bookable_kind((string) ($row['type_name'] ?? ''));
+        $photo = trim((string) ($row['cover_image'] ?? ''));
+        if ($photo === '') {
+            $photo = trim((string) ($row['logo'] ?? ''));
+        }
+        $businesses[] = [
+            'id' => $id,
+            'name' => (string) $row['name'],
+            'subtitle' => (string) ($row['type_name'] ?? 'Business'),
+            'kind' => $kind,
+            'popup' => in_array($kind, ['food', 'wellness', 'beach'], true),
+            'photo' => $photo !== '' ? APP_URL . '/uploads/' . ltrim($photo, '/') : '',
+            'menu' => [],
+        ];
+    }
+    $popupIds = [];
+    foreach ($businesses as $place) {
+        if (!empty($place['popup'])) {
+            $popupIds[] = (int) $place['id'];
+        }
+    }
+    if ($popupIds) {
+        $in = implode(',', array_fill(0, count($popupIds), '?'));
+        $menuSt = db()->prepare(
+            "SELECT id, business_id, name, description, price, image_path
+             FROM business_services
+             WHERE is_active=1 AND business_id IN ($in)
+             ORDER BY name"
+        );
+        $menuSt->execute($popupIds);
+        $menus = [];
+        foreach ($menuSt->fetchAll() ?: [] as $item) {
+            $menus[(int) $item['business_id']][] = [
+                'name' => (string) $item['name'],
+                'description' => (string) ($item['description'] ?? ''),
+                'price' => round((float) ($item['price'] ?? 0), 2),
+                'photo' => trim((string) ($item['image_path'] ?? '')),
+            ];
+        }
+        foreach ($businesses as $i => $place) {
+            $businesses[$i]['menu'] = $menus[(int) $place['id']] ?? [];
+        }
+    }
+    return ['destinations' => $destinations, 'businesses' => $businesses];
+}
+
+/**
+ * Accommodation or transportation listings for the package maker.
+ *
+ * @return array{businesses:list<array<string,mixed>>,offers:array<int,list<array<string,mixed>>>}
+ */
+function package_offer_catalog(string $mode): array
+{
+    package_stops_ensure_schema();
+    $rows = db()->query(
+        "SELECT b.id, b.name, b.address, b.description, b.cover_image, b.logo, b.avg_rating, b.review_count,
+                bt.name AS type_name
+         FROM businesses b
+         JOIN business_types bt ON bt.id = b.business_type_id
+         WHERE b.approval_status='approved' AND b.status='active'
+         ORDER BY b.name"
+    )->fetchAll() ?: [];
+    $businesses = [];
+    foreach ($rows as $row) {
+        if (business_catalog_mode($row['type_name'] ?? '') !== $mode) {
+            continue;
+        }
+        $businesses[] = $row;
+    }
+    $offers = [];
+    if ($businesses) {
+        $ids = array_map(static fn (array $row): int => (int) $row['id'], $businesses);
+        $in = implode(',', array_fill(0, count($ids), '?'));
+        $st = db()->prepare(
+            "SELECT id, business_id, name, description, price, capacity, image_path, amenities
+             FROM business_services WHERE is_active=1 AND business_id IN ($in) ORDER BY name"
+        );
+        $st->execute($ids);
+        foreach ($st->fetchAll() ?: [] as $offer) {
+            $offers[(int) $offer['business_id']][] = $offer;
+        }
+    }
+    return ['businesses' => $businesses, 'offers' => $offers];
+}
+
+/** @return list<array<string,mixed>> */
+function package_stops_for_service(int $serviceId): array
+{
+    package_stops_ensure_schema();
+    $st = db()->prepare(
+        "SELECT ps.id, ps.service_id, ps.day_number, ps.sort_order, ps.destination_id, ps.business_id, ps.visit_minutes,
+                COALESCE(d.name, b.name, 'Place') AS place_name,
+                COALESCE(d.location, b.address, '') AS location,
+                COALESCE(d.latitude, b.latitude) AS latitude,
+                COALESCE(d.longitude, b.longitude) AS longitude
+         FROM package_stops ps
+         LEFT JOIN destinations d ON d.id = ps.destination_id
+         LEFT JOIN businesses b ON b.id = ps.business_id
+         WHERE ps.service_id=?
+         ORDER BY ps.day_number ASC, ps.sort_order ASC, ps.id ASC"
+    );
+    $st->execute([$serviceId]);
+    return $st->fetchAll() ?: [];
 }
 
 function package_tour_span_label(string $start, int $days): string
@@ -7682,6 +8176,9 @@ function business_listing_finish_gaps(array $biz, int $photoCount = 0): array
     if ($lat === null || $lng === null || $lat === '' || $lng === '') {
         $gaps[] = 'a map pin';
     }
+    if (!place_has_operating_hours($biz['opening_hours'] ?? null)) {
+        $gaps[] = 'operating hours';
+    }
     return $gaps;
 }
 
@@ -7711,6 +8208,7 @@ function ensure_business_listing_schema(): void
             'address_city' => "VARCHAR(120) NULL AFTER `address_region`",
             'address_barangay' => "VARCHAR(120) NULL AFTER `address_city`",
             'address_street' => "VARCHAR(150) NULL AFTER `address_barangay`",
+            'is_featured' => "TINYINT(1) NOT NULL DEFAULT 0 AFTER `status`",
         ];
         foreach ($add as $col => $def) {
             if (in_array($col, $cols, true)) {
@@ -8173,8 +8671,10 @@ function guide_profile_apply_post(array $profileUser, array $profile, array $day
     $last = capitalize_name((string) ($_POST['last_name'] ?? ''));
     $phone = trim((string) ($_POST['phone'] ?? ''));
     $_POST['use_structured_address'] = '1';
-    $_POST['require_current_province'] = ph_guide_locked_province();
-    $_POST['current_address_region'] = ph_guide_locked_province();
+    if (empty($GLOBALS['inhouseGuideAddressFree'])) {
+        $_POST['require_current_province'] = ph_guide_locked_province();
+        $_POST['current_address_region'] = ph_guide_locked_province();
+    }
     unset($_POST['address_lock_province']);
     $identity = user_parse_identity($_POST, true);
     if (!$identity['ok']) {
@@ -8522,7 +9022,8 @@ function status_badge(string $status): string
         'reviewed' => 'Review',
         default => ucfirst($status),
     };
-    return '<span class="badge bg-' . $class . '">' . e($label) . '</span>';
+    $extra = strtolower($status) === 'pending' ? ' text-dark' : '';
+    return '<span class="badge bg-' . $class . $extra . '">' . e($label) . '</span>';
 }
 
 /**
@@ -8806,7 +9307,7 @@ function render_guide_setup_modal(?array $user): bool
 }
 
 /**
- * Popup when an approved business still needs description, logo, photos, or a map pin.
+ * Popup when an approved business still needs description, logo, photos, a map pin, or operating hours.
  * @return array{gaps:list<string>}|null
  */
 function business_setup_prompt_state(?array $user): ?array

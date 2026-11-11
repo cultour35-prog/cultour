@@ -58,4 +58,55 @@ $tbLinkedAccounts = $tbLinkedAccounts ?? (isset($user) ? switchable_linked_accou
     </div>
   </nav>
 </div>
+<?php
+if (!empty($user['id']) && (int) ($user['role_id'] ?? 0) === ROLE_TOURIST && empty($GLOBALS['CULTOUR_PACKAGE_MAKER'])) {
+    start_app_session();
+    $rejectSql = "SELECT r.id, r.rejection_reason, r.itinerary_id, b.name AS business_name
+      FROM restaurant_reservations r
+      JOIN businesses b ON b.id = r.business_id
+      JOIN itinerary_items ii ON ii.id = r.itinerary_item_id AND ii.business_id = r.business_id
+      WHERE r.tourist_id=? AND r.status='rejected'
+      ORDER BY r.id DESC LIMIT 1";
+    $rejectParams = [(int) $user['id']];
+    try {
+        revenue_ensure_schema();
+        $rejectSt = db()->prepare($rejectSql);
+        $rejectSt->execute($rejectParams);
+        $rejectPop = $rejectSt->fetch() ?: null;
+        $viewingItinerary = (int) ($GLOBALS['CULTOUR_VIEW_ITINERARY_ID'] ?? 0);
+        if ($rejectPop && $viewingItinerary > 0 && $viewingItinerary === (int) $rejectPop['itinerary_id']) {
+            $rejectPop = null;
+        }
+    } catch (Throwable $e) {
+        $rejectPop = null;
+    }
+    if ($rejectPop):
+        $rejectUrl = APP_URL . '/tourist/itineraries.php?id=' . (int) $rejectPop['itinerary_id'];
+?>
+<div class="modal fade reject-notice" id="rejectNoticeModal" data-reject-id="<?= (int) $rejectPop['id'] ?>" tabindex="-1" aria-labelledby="rejectNoticeTitle" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content reject-notice__card">
+      <button type="button" class="btn-close reject-notice__close" data-bs-dismiss="modal" aria-label="Close"></button>
+      <div class="reject-notice__mark" aria-hidden="true">!</div>
+      <p class="reject-notice__kicker">Reservation declined</p>
+      <h2 class="reject-notice__title" id="rejectNoticeTitle"><?= e((string) $rejectPop['business_name']) ?></h2>
+      <p class="reject-notice__lead">did not accept this stop.</p>
+      <div class="reject-notice__reason">
+        <span>Their reason</span>
+        <p><?= e(trim((string) $rejectPop['rejection_reason']) !== '' ? (string) $rejectPop['rejection_reason'] : 'No reason was given.') ?></p>
+      </div>
+      <a class="btn btn-ct reject-notice__go" href="<?= e($rejectUrl) ?>">Open the tour</a>
+    </div>
+  </div>
+</div>
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  var el = document.getElementById('rejectNoticeModal');
+  if (el && window.bootstrap) bootstrap.Modal.getOrCreateInstance(el).show();
+});
+</script>
+<?php
+    endif;
+}
+?>
 <script src="<?= APP_URL ?>/assets/js/app-tutorial.js?v=<?= @filemtime(ROOT_PATH . '/assets/js/app-tutorial.js') ?: time() ?>"></script>

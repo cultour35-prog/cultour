@@ -83,14 +83,11 @@ if ($biz && $_SERVER['REQUEST_METHOD'] === 'POST' && !verify_csrf()) {
         $own->execute([$svcId, $biz['id']]);
         $own = $own->fetch();
         $svc = $own ? parse_place_service_post($_POST) : ['ok' => false, 'message' => 'Package not found.'];
-        $daysParsed = ($own && !empty($svc['ok'])) ? package_days_from_post($_POST) : null;
-        $paxParsed = ($own && !empty($svc['ok']) && $daysParsed && $daysParsed['ok']) ? package_pax_from_post($_POST) : null;
+        $paxParsed = ($own && !empty($svc['ok'])) ? package_pax_from_post($_POST) : null;
         if (!$own) {
             flash('error', 'Package not found.');
         } elseif (empty($svc['ok'])) {
             flash('error', (string) ($svc['message'] ?? 'Name is required.'));
-        } elseif (!$daysParsed['ok']) {
-            flash('error', $daysParsed['message']);
         } elseif (!$paxParsed['ok']) {
             flash('error', $paxParsed['message']);
         } else {
@@ -104,16 +101,88 @@ if ($biz && $_SERVER['REQUEST_METHOD'] === 'POST' && !verify_csrf()) {
                 $image = $uploaded;
             }
             $d = $svc['data'];
+            $description = trim((string) ($d['description'] ?? ''));
+            if (mb_strlen($description) > 120) {
+                $description = mb_substr($description, 0, 120);
+            }
+            $minPax = (int) ($_POST['package_min_pax'] ?? 0);
+            $maxPax = (int) $paxParsed['pax'];
+            if ($minPax < 1) {
+                $minPax = 1;
+            }
+            if ($minPax > $maxPax) {
+                $minPax = $maxPax;
+            }
+            $inclusionTags = [];
+            foreach (preg_split('/,/', (string) ($_POST['package_inclusions'] ?? '')) ?: [] as $inclusionTag) {
+                $inclusionTag = trim($inclusionTag);
+                if ($inclusionTag === '' || mb_strlen($inclusionTag) > 40 || isset($inclusionTags[mb_strtolower($inclusionTag)])) {
+                    continue;
+                }
+                $inclusionTags[mb_strtolower($inclusionTag)] = $inclusionTag;
+                if (count($inclusionTags) >= 8) {
+                    break;
+                }
+            }
             db()->prepare(
                 'UPDATE business_services
-                 SET name=?, description=?, price=?, package_days=?, capacity=?, image_path=?
+                 SET name=?, description=?, price=?, capacity=?, package_min_pax=?, package_inclusions=?, image_path=?
+                 WHERE id=? AND business_id=?'
+            )->execute([
+                $d['name'],
+                $description !== '' ? $description : null,
+                $d['price'],
+                $maxPax,
+                $minPax,
+                $inclusionTags ? implode(', ', $inclusionTags) : null,
+                $image !== '' ? $image : null,
+                $svcId,
+                $biz['id'],
+            ]);
+            flash('success', $copy['updated']);
+        }
+    } elseif (($_POST['action'] ?? '') === 'update_vehicle' && $isVehicles) {
+        $svcId = (int) ($_POST['id'] ?? 0);
+        $own = db()->prepare('SELECT image_path FROM business_services WHERE id=? AND business_id=? LIMIT 1');
+        $own->execute([$svcId, $biz['id']]);
+        $own = $own->fetch();
+        $svc = $own ? parse_place_service_post($_POST) : ['ok' => false, 'message' => 'Vehicle not found.'];
+        $capRaw = trim((string) ($_POST['capacity'] ?? ''));
+        $unitsRaw = trim((string) ($_POST['unit_count'] ?? ''));
+        if (!$own) {
+            flash('error', 'Vehicle not found.');
+        } elseif (empty($svc['ok'])) {
+            flash('error', (string) ($svc['message'] ?? 'Name is required.'));
+        } elseif ($capRaw === '' || (int) $capRaw < 1) {
+            flash('error', 'Enter how many seats this vehicle has.');
+        } elseif ($unitsRaw !== '' && (int) $unitsRaw < 1) {
+            flash('error', 'Enter how many of this vehicle you have, or leave it blank for no limit.');
+        } else {
+            $image = trim((string) ($own['image_path'] ?? ''));
+            if (!empty($_FILES['image']['name'])) {
+                $uploaded = upload_file($_FILES['image'], 'businesses');
+                if (!$uploaded) {
+                    flash('error', 'Photo upload failed. Use a JPG, PNG, or WebP image.');
+                    redirect(posted_return_to(APP_URL . '/business/services.php'));
+                }
+                $image = $uploaded;
+            }
+            $d = $svc['data'];
+            $amenityRaw = trim((string) ($d['amenities'] ?? ''));
+            if (strlen($amenityRaw) > 255) {
+                $amenityRaw = substr($amenityRaw, 0, 255);
+            }
+            db()->prepare(
+                'UPDATE business_services
+                 SET name=?, description=?, price=?, capacity=?, unit_count=?, amenities=?, image_path=?
                  WHERE id=? AND business_id=?'
             )->execute([
                 $d['name'],
                 $d['description'],
                 $d['price'],
-                $daysParsed['days'],
-                $paxParsed['pax'],
+                (int) $capRaw,
+                $unitsRaw === '' ? null : (int) $unitsRaw,
+                $amenityRaw !== '' ? $amenityRaw : null,
                 $image !== '' ? $image : null,
                 $svcId,
                 $biz['id'],
@@ -167,6 +236,9 @@ if ($biz && $_SERVER['REQUEST_METHOD'] === 'POST' && !verify_csrf()) {
         flash(!empty($result['ok']) ? 'success' : 'error', (string) ($result['message'] ?? 'Could not update categories.'));
     } elseif (($_POST['action'] ?? '') === 'delete') {
         db()->prepare('DELETE FROM business_services WHERE id=? AND business_id=?')->execute([(int) $_POST['id'], $biz['id']]);
+        if ($mode === 'packages') {
+            package_stops_delete_for_service((int) $_POST['id']);
+        }
         flash('success', $copy['removed']);
     } else {
         $svc = parse_place_service_post($_POST);
@@ -224,6 +296,11 @@ if ($biz && $_SERVER['REQUEST_METHOD'] === 'POST' && !verify_csrf()) {
             $image,
             $mode === 'menu' ? menu_category_key($_POST['menu_category'] ?? '', (int) $biz['id']) : null,
         ]);
+        $newPackageId = (int) db()->lastInsertId();
+        if ($mode === 'packages' && $newPackageId > 0) {
+            flash('success', 'Package saved. Add the places for each day and set the price.');
+            redirect(APP_URL . '/business/package.php?id=' . $newPackageId);
+        }
         flash('success', $copy['added']);
     }
     redirect(posted_return_to(APP_URL . '/business/services.php'));
@@ -235,6 +312,11 @@ if ($biz) {
     $s = db()->prepare('SELECT * FROM business_services WHERE business_id=? ORDER BY is_active DESC, name');
     $s->execute([$biz['id']]);
     $rows = $s->fetchAll();
+    if ($mode === 'packages') {
+        package_stops_ensure_schema();
+        $rows = array_values(array_filter($rows, static fn (array $row): bool => (int) ($row['package_made'] ?? 1) === 1));
+        $GLOBALS['packageSlotsTaken'] = package_slots_taken_map(array_map(static fn (array $row): int => (int) $row['id'], $rows));
+    }
     if ($mode === 'menu') {
         $menuCategories = menu_category_options((int) $biz['id']);
     }
@@ -255,6 +337,7 @@ $detailHint = $isRooms ? 'Amenities, separated by commas' : 'Features, separated
       <?php if ($m = flash('success')): ?><div class="alert alert-success" data-autohide="1"><?= e($m) ?></div><?php endif; ?>
       <?php if ($m = flash('error')): ?><div class="alert alert-danger"><?= e($m) ?></div><?php endif; ?>
       <div class="<?= $isRooms ? 'room-manage' : 'row g-3' ?>">
+        <?php if ($mode !== 'packages'): ?>
         <div class="<?= $isRooms ? 'room-manage__add' : 'col-lg-4' ?>">
           <div class="glass p-3 p-md-4">
             <h2 class="h6 mb-3">Add a <?= e($noun) ?></h2>
@@ -333,9 +416,9 @@ $detailHint = $isRooms ? 'Amenities, separated by commas' : 'Features, separated
                   <?php endif; ?>
                 </div>
               <?php endif; ?>
-              <?php if ($mode === 'menu'): ?>
+              <?php if ($mode === 'menu' || $isVehicles): ?>
               <div class="mb-3">
-                <label class="form-label">Food photo</label>
+                <label class="form-label"><?= $isVehicles ? 'Vehicle photo' : 'Food photo' ?></label>
                 <div class="room-photo-stage" id="menuAddStage">
                   <span class="room-photo-stage__empty">Photo preview</span>
                   <img id="menuAddPreview" alt="" hidden>
@@ -366,9 +449,10 @@ $detailHint = $isRooms ? 'Amenities, separated by commas' : 'Features, separated
             </form>
           </div>
         </div>
-        <div class="<?= $isRooms ? 'room-manage__list' : 'col-lg-8' ?>">
+        <?php endif; ?>
+        <div class="<?= $isRooms ? 'room-manage__list' : ($mode === 'packages' ? 'col-12' : 'col-lg-8') ?>">
           <?php if (!$rows): ?>
-            <div class="glass p-4 text-muted"><?= e($copy['empty']) ?></div>
+            <div class="glass p-4 text-muted"><?= $mode === 'packages' ? 'No finished packages yet. Build one in Package maker, then save the package price. It will show up here.' : e($copy['empty']) ?></div>
           <?php else: ?>
             <?php if ($mode === 'menu'): ?>
               <?php
@@ -392,7 +476,14 @@ $detailHint = $isRooms ? 'Amenities, separated by commas' : 'Features, separated
                   <?php endforeach; ?>
                 </div>
             <?php endif; ?>
-            <div class="offer-manage-grid<?= $mode === 'packages' ? ' offer-manage-grid--paper' : '' ?><?= $mode === 'menu' ? ' offer-manage-grid--menu' : '' ?>">
+            <?php if ($mode === 'packages'): ?>
+              <div class="pkg-offer-tabs" role="tablist" aria-label="Package type">
+                <button type="button" class="pkg-offer-tabs__btn is-on" data-offer-tab="all">All</button>
+                <button type="button" class="pkg-offer-tabs__btn" data-offer-tab="inclusive">Inclusive</button>
+                <button type="button" class="pkg-offer-tabs__btn" data-offer-tab="exclusive">Exclusive</button>
+              </div>
+            <?php endif; ?>
+            <div class="offer-manage-grid<?= $mode === 'packages' ? ' offer-manage-grid--paper' : '' ?><?= ($mode === 'menu' || $isVehicles) ? ' offer-manage-grid--menu' : '' ?>">
               <?php foreach ($rows as $r): ?>
                 <?php
                   $img = trim((string) ($r['image_path'] ?? ''));
@@ -400,9 +491,15 @@ $detailHint = $isRooms ? 'Amenities, separated by commas' : 'Features, separated
                   $pkgHidden = $mode === 'packages' && (int) ($r['is_active'] ?? 1) !== 1;
                   $pkgDays = (int) ($r['package_days'] ?? 0);
                   $pkgPax = (int) ($r['capacity'] ?? 0);
+                  $pkgMinPax = (int) ($r['package_min_pax'] ?? 0);
+                  $pkgOffer = $mode === 'packages'
+                      && (string) ($r['package_date_mode'] ?? 'tourist') === 'fixed'
+                      && trim((string) ($r['package_close_date'] ?? '')) !== ''
+                      ? 'inclusive'
+                      : 'exclusive';
                 ?>
-                <article class="offer-manage-card glass<?= $isRooms ? ' room-manage-card' : '' ?><?= $mode === 'menu' ? ' menu-food-card' : '' ?><?= $pkgHidden ? ' is-hidden' : '' ?>"<?= $mode === 'menu' ? ' data-kiosk-item="' . e(menu_category_key($r['menu_category'] ?? '', (int) $biz['id'])) . '"' . (menu_category_key($r['menu_category'] ?? '', (int) $biz['id']) === ($firstMenuCat ?? '') ? '' : ' hidden') : '' ?>>
-                  <?php if ($mode === 'menu'): ?>
+                <article class="offer-manage-card glass<?= $isRooms ? ' room-manage-card' : '' ?><?= ($mode === 'menu' || $isVehicles) ? ' menu-food-card' : '' ?><?= $mode === 'packages' ? ' pkg-card' : '' ?><?= $pkgHidden ? ' is-hidden' : '' ?>"<?= $mode === 'packages' ? ' data-package-offer="' . $pkgOffer . '"' : '' ?><?= $mode === 'menu' ? ' data-kiosk-item="' . e(menu_category_key($r['menu_category'] ?? '', (int) $biz['id'])) . '"' . (menu_category_key($r['menu_category'] ?? '', (int) $biz['id']) === ($firstMenuCat ?? '') ? '' : ' hidden') : '' ?>>
+                  <?php if ($mode === 'menu' || $isVehicles): ?>
                     <div class="menu-food-card__photo<?= $imgUrl === '' ? ' is-empty' : '' ?>"<?= $imgUrl !== '' ? ' style="background-image:url(\'' . e($imgUrl) . '\')"' : '' ?>>
                       <?php if ($imgUrl === ''): ?><span>No photo yet</span><?php endif; ?>
                     </div>
@@ -415,19 +512,58 @@ $detailHint = $isRooms ? 'Amenities, separated by commas' : 'Features, separated
                     <?php else: ?>
                       <div class="room-photo-empty">No photo yet</div>
                     <?php endif; ?>
+                  <?php elseif ($mode === 'packages'): ?>
+                    <div class="pkg-card__media">
+                      <?php if ($imgUrl !== ''): ?>
+                        <img class="offer-manage-card__photo" src="<?= e($imgUrl) ?>" alt="">
+                      <?php else: ?>
+                        <div class="offer-manage-card__photo pkg-card__empty">No photo yet</div>
+                      <?php endif; ?>
+                      <span class="pkg-card__offer pkg-card__offer--<?= $pkgOffer ?>"><?= $pkgOffer === 'inclusive' ? 'Inclusive' : 'Exclusive' ?></span>
+                    </div>
                   <?php elseif ($imgUrl !== ''): ?>
                     <img class="offer-manage-card__photo" src="<?= e($imgUrl) ?>" alt="">
                   <?php endif; ?>
                   <div class="offer-manage-card__body">
+                    <?php if ($mode === 'packages'): ?>
+                      <?php
+                        $pkgDateMode = (string) ($r['package_date_mode'] ?? 'tourist') === 'fixed' ? 'fixed' : 'tourist';
+                        $pkgClose = trim((string) ($r['package_close_date'] ?? ''));
+                        $pkgInclusive = $pkgDateMode === 'fixed' && $pkgClose !== '';
+                        $pkgDateLabel = $pkgDateMode === 'fixed' && !empty($r['package_fixed_date'])
+                            ? 'Tour date · ' . format_date((string) $r['package_fixed_date'])
+                            : 'Tourist chooses the date';
+                      ?>
+                      <h3 class="h6 mb-1 fw-bold">
+                        <?= e($r['name']) ?>
+                        <?php if ($pkgOffer === 'inclusive'): ?>
+                          <?php
+                            $pkgSlotsLeft = max(0, $pkgPax - (int) (($GLOBALS['packageSlotsTaken'] ?? [])[(int) $r['id']] ?? 0));
+                          ?>
+                          <span class="fw-normal">· <?= (int) $pkgSlotsLeft ?> slot<?= $pkgSlotsLeft === 1 ? '' : 's' ?> left</span>
+                        <?php endif; ?>
+                        <?php if ($pkgHidden): ?><span class="offer-manage-card__hidden">Hidden</span><?php endif; ?>
+                      </h3>
+                      <div class="small mb-1">Price per person · <strong><?= e(format_money($r['price'])) ?></strong></div>
+                      <div class="small text-muted mb-1"><?= $pkgDays > 0 ? e(package_days_label($pkgDays)) : 'Days not set' ?></div>
+                      <?php if (!$pkgInclusive && $pkgPax > 0): ?>
+                        <div class="small text-muted mb-1"><?= e(package_pax_label($pkgPax, $pkgMinPax)) ?></div>
+                      <?php endif; ?>
+                      <div class="small text-muted mb-1"><?= e($pkgDateLabel) ?></div>
+                      <?php if ($pkgInclusive): ?>
+                        <div class="small text-muted mb-1">Cut off · <?= e(format_date($pkgClose)) ?></div>
+                      <?php endif; ?>
+                    <?php else: ?>
                     <div class="d-flex justify-content-between gap-2">
                       <h3 class="h6 mb-1">
                         <?= e($r['name']) ?>
                         <?php if ($pkgHidden): ?><span class="offer-manage-card__hidden">Hidden</span><?php endif; ?>
                       </h3>
-                      <?php if (in_array($mode, ['rooms', 'vehicles', 'packages', 'menu'], true)): ?>
+                      <?php if (in_array($mode, ['rooms', 'vehicles', 'menu'], true)): ?>
                         <strong><?= e(format_money($r['price'])) ?></strong>
                       <?php endif; ?>
                     </div>
+                    <?php endif; ?>
                     <?php if ($isRooms || $isVehicles): ?>
                       <div class="small text-muted mb-1">
                         <?= $isRooms ? 'Per night' : 'Per day' ?>
@@ -435,16 +571,14 @@ $detailHint = $isRooms ? 'Amenities, separated by commas' : 'Features, separated
                           · <?= (int) $r['capacity'] ?> <?= $isRooms ? 'guest' : 'seat' ?><?= (int) $r['capacity'] === 1 ? '' : 's' ?>
                         <?php endif; ?>
                       </div>
-                    <?php elseif ($mode === 'packages'): ?>
-                      <div class="small text-muted mb-1"><?= $pkgDays > 0 ? e(package_days_label($pkgDays)) : 'Days not set' ?><?= $pkgPax > 0 ? ' · ' . e(package_pax_label($pkgPax)) : '' ?></div>
                     <?php endif; ?>
-                    <?php if (in_array($mode, ['rooms', 'vehicles', 'packages', 'menu'], true) && !empty($r['description'])): ?>
+                    <?php if (in_array($mode, ['rooms', 'vehicles', 'menu'], true) && !empty($r['description'])): ?>
                       <p class="small mb-1"><?= e($r['description']) ?></p>
                     <?php endif; ?>
                     <?php if (!empty($r['amenities']) && !($isRooms || $isVehicles)): ?>
                       <p class="small text-muted mb-2"><?= e($r['amenities']) ?></p>
                     <?php endif; ?>
-                    <?php if ($isRooms || $isVehicles): ?>
+                    <?php if ($isRooms): ?>
                       <?php
                         $unitTotal = ($r['unit_count'] ?? null) === null || $r['unit_count'] === '' ? null : (int) $r['unit_count'];
                         $unitLeft = $unitTotal === null ? null : offering_units_free((int) $r['id'], date('Y-m-d'), date('Y-m-d'));
@@ -455,14 +589,13 @@ $detailHint = $isRooms ? 'Amenities, separated by commas' : 'Features, separated
                       <form method="post" class="row g-2 align-items-end mb-2" data-unsaved-ignore><?= csrf_field() ?>
                         <input type="hidden" name="id" value="<?= (int) $r['id'] ?>">
                         <div class="col-6 col-lg-3">
-                          <label class="form-label small mb-1"><?= $isRooms ? 'Rooms of this type' : 'Vehicles' ?></label>
-                          <input type="number" min="1" class="form-control form-control-sm" name="unit_count" value="<?= $unitTotal ?? '' ?>"<?= $isRooms ? ' required' : '' ?>>
+                          <label class="form-label small mb-1">Rooms of this type</label>
+                          <input type="number" min="1" class="form-control form-control-sm" name="unit_count" value="<?= $unitTotal ?? '' ?>" required>
                         </div>
                         <div class="col-6 col-lg-3">
-                          <label class="form-label small mb-1"><?= $isRooms ? 'Guests included' : 'Seats' ?></label>
-                          <input type="number" min="1" class="form-control form-control-sm" name="capacity" value="<?= e($capValue) ?>"<?= $isVehicles ? ' required' : '' ?>>
+                          <label class="form-label small mb-1">Guests included</label>
+                          <input type="number" min="1" class="form-control form-control-sm" name="capacity" value="<?= e($capValue) ?>">
                         </div>
-                        <?php if ($isRooms): ?>
                         <div class="col-6 col-lg-3">
                           <label class="form-label small mb-1">Extra-person fee</label>
                           <input type="number" step="0.01" min="0" class="form-control form-control-sm" name="extra_guest_fee" value="<?= e($feeValue) ?>">
@@ -471,23 +604,37 @@ $detailHint = $isRooms ? 'Amenities, separated by commas' : 'Features, separated
                           <label class="form-label small mb-1">Extra guests</label>
                           <input type="number" min="0" class="form-control form-control-sm" name="extra_guest_limit" value="<?= e($limitValue) ?>">
                         </div>
-                        <?php endif; ?>
                         <div class="col-12">
-                          <label class="form-label small mb-1"><?= $isRooms ? 'Amenities' : 'Features' ?></label>
-                          <input class="form-control form-control-sm js-tag-input" name="amenities" maxlength="255" value="<?= e((string) ($r['amenities'] ?? '')) ?>"<?= $isRooms ? ' placeholder="Queen bed"' : '' ?>>
-                          <div class="form-text">Type one <?= $isRooms ? 'amenity' : 'feature' ?>, then a comma.</div>
+                          <label class="form-label small mb-1">Amenities</label>
+                          <input class="form-control form-control-sm js-tag-input" name="amenities" maxlength="255" value="<?= e((string) ($r['amenities'] ?? '')) ?>" placeholder="Queen bed">
+                          <div class="form-text">Type one amenity, then a comma.</div>
                         </div>
                         <div class="col-12">
                           <button name="action" value="update_units" class="btn btn-sm btn-outline-secondary">Save</button>
                         </div>
                       </form>
-                      <?php if ($isRooms && $unitLeft === null): ?>
+                      <?php if ($unitLeft === null): ?>
                         <p class="small text-muted mb-2">Set how many rooms you have. Bookings will use them for those dates.</p>
-                      <?php elseif ($isVehicles && $unitLeft === null): ?>
-                        <p class="small text-muted mb-2">Leave the vehicle count blank for no limit.</p>
                       <?php endif; ?>
                     <?php endif; ?>
-                    <?php if ($mode === 'menu'): ?>
+                    <?php if ($isVehicles): ?>
+                      <div class="offer-manage-card__actions">
+                        <button type="button" class="btn btn-sm btn-outline-secondary"
+                                data-bs-toggle="modal" data-bs-target="#vehicleEditModal"
+                                data-car-id="<?= (int) $r['id'] ?>"
+                                data-car-name="<?= e($r['name']) ?>"
+                                data-car-desc="<?= e((string) ($r['description'] ?? '')) ?>"
+                                data-car-price="<?= e((string) ($r['price'] ?? '0')) ?>"
+                                data-car-seats="<?= e((string) ($r['capacity'] ?? '')) ?>"
+                                data-car-count="<?= e((string) ($r['unit_count'] ?? '')) ?>"
+                                data-car-features="<?= e((string) ($r['amenities'] ?? '')) ?>"
+                                data-car-photo="<?= e($imgUrl) ?>">Edit</button>
+                        <form method="post" data-unsaved-ignore><?= csrf_field() ?>
+                          <input type="hidden" name="id" value="<?= (int) $r['id'] ?>">
+                          <button name="action" value="delete" class="btn btn-sm btn-outline-danger">Remove</button>
+                        </form>
+                      </div>
+                    <?php elseif ($mode === 'menu'): ?>
                       <div class="offer-manage-card__actions">
                         <button type="button" class="btn btn-sm btn-outline-secondary"
                                 data-bs-toggle="modal" data-bs-target="#menuEditModal"
@@ -512,6 +659,9 @@ $detailHint = $isRooms ? 'Amenities, separated by commas' : 'Features, separated
                                 data-pkg-price="<?= e((string) ($r['price'] ?? '0')) ?>"
                                 data-pkg-days="<?= $pkgDays > 0 ? $pkgDays : '' ?>"
                                 data-pkg-pax="<?= $pkgPax > 0 ? $pkgPax : '' ?>"
+                                data-pkg-min="<?= $pkgMinPax > 0 ? $pkgMinPax : '' ?>"
+                                data-pkg-inclusions="<?= e((string) ($r['package_inclusions'] ?? '')) ?>"
+                                data-pkg-itin="<?= (int) ($r['package_itinerary_id'] ?? 0) ?>"
                                 data-pkg-photo="<?= e($imgUrl) ?>">Edit</button>
                         <form method="post" data-unsaved-ignore><?= csrf_field() ?>
                           <input type="hidden" name="id" value="<?= (int) $r['id'] ?>">
@@ -632,47 +782,124 @@ require __DIR__ . '/../includes/business_shell_end.php';
         </div>
       <?php endif; ?>
       <?php if ($mode === 'packages'): ?>
-        <div class="modal fade" id="packageEditModal" tabindex="-1" aria-labelledby="packageEditLabel" aria-hidden="true">
+        <div class="modal fade package-view-modal" id="packageEditModal" tabindex="-1" aria-labelledby="packageEditLabel" aria-hidden="true">
+          <div class="modal-dialog modal-dialog-centered">
+            <form class="modal-content package-view-card" method="post" enctype="multipart/form-data" data-unsaved-ignore>
+              <?= csrf_field() ?>
+              <input type="hidden" name="action" value="update_package">
+              <input type="hidden" name="id" id="packageEditId" value="">
+              <div class="package-view-card__media">
+                <img id="packageEditPreview" class="package-view-card__photo" alt="" hidden>
+              </div>
+              <div class="package-view-card__panel">
+                <div class="modal-header border-0">
+                  <h2 class="modal-title h5 mb-0" id="packageEditLabel">Edit package</h2>
+                  <a class="btn btn-outline-secondary btn-sm ms-auto me-2" id="packageViewItinerary" href="<?= APP_URL ?>/itinerary-share.php?from=package" target="_blank" rel="noopener">View itinerary</a>
+                  <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body pt-0">
+                  <div class="mb-2">
+                    <label class="form-label" for="packageEditName">Package name</label>
+                    <input class="form-control form-control-sm" id="packageEditName" name="name" required>
+                  </div>
+                  <div class="mb-2">
+                    <label class="form-label" for="packageEditDesc">Description</label>
+                    <textarea class="form-control form-control-sm" id="packageEditDesc" name="description" rows="4" maxlength="120"></textarea>
+                    <div class="small text-muted" id="packageEditDescCount">0 / 120</div>
+                  </div>
+                  <div class="mb-2">
+                    <label class="form-label" for="packageEditInclusionEntry">Inclusions</label>
+                    <div class="tag-input" id="packageEditInclusionTags">
+                      <input class="tag-input__entry" id="packageEditInclusionEntry" type="text" maxlength="40" placeholder="Type an inclusion and press Enter">
+                    </div>
+                    <input type="hidden" name="package_inclusions" id="packageEditInclusions" value="">
+                    <div class="small text-muted" id="packageEditInclusionCount">0 / 8</div>
+                  </div>
+                  <div class="row g-2">
+                    <div class="col-6">
+                      <label class="form-label" for="packageEditMin">Min</label>
+                      <input type="number" min="1" class="form-control form-control-sm" id="packageEditMin" name="package_min_pax">
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label" for="packageEditPax">Max</label>
+                      <input type="text" inputmode="numeric" pattern="[0-9]*" maxlength="2" class="form-control form-control-sm" id="packageEditPax" name="capacity" required autocomplete="off" oninput="this.value=this.value.replace(/\D/g,'')">
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label" for="packageEditPrice">Price per person</label>
+                      <div class="input-group input-group-sm">
+                        <span class="input-group-text peso-mark">₱</span>
+                        <input type="number" step="0.01" min="0" class="form-control" id="packageEditPrice" name="price" required>
+                      </div>
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label" aria-hidden="true">&nbsp;</label>
+                      <a class="btn btn-outline-secondary btn-sm w-100" id="packageEditItinerary" href="<?= APP_URL ?>/business/package.php">Edit itinerary</a>
+                    </div>
+                    <div class="col-12">
+                      <label class="form-label" for="packageEditPhoto">Cover photo</label>
+                      <input class="form-control form-control-sm" id="packageEditPhoto" type="file" name="image" accept="image/jpeg,image/png,image/webp">
+                    </div>
+                  </div>
+                </div>
+                <div class="modal-footer border-0 pt-0">
+                  <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                  <button class="btn btn-ct" type="submit">Save</button>
+                </div>
+              </div>
+            </form>
+          </div>
+        </div>
+      <?php endif; ?>
+      <?php if ($isVehicles): ?>
+        <div class="modal fade" id="vehicleEditModal" tabindex="-1" aria-labelledby="vehicleEditLabel" aria-hidden="true">
           <div class="modal-dialog modal-dialog-centered">
             <div class="modal-content">
               <form method="post" enctype="multipart/form-data" data-unsaved-ignore>
                 <?= csrf_field() ?>
-                <input type="hidden" name="action" value="update_package">
-                <input type="hidden" name="id" id="packageEditId" value="">
+                <input type="hidden" name="action" value="update_vehicle">
+                <input type="hidden" name="id" id="vehicleEditId" value="">
                 <div class="modal-header">
-                  <h2 class="modal-title h5 mb-0" id="packageEditLabel">Edit package</h2>
+                  <h2 class="modal-title h5 mb-0" id="vehicleEditLabel">Edit vehicle</h2>
                   <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
                 </div>
                 <div class="modal-body">
                   <div class="mb-2">
-                    <label class="form-label" for="packageEditName">Package name</label>
-                    <input class="form-control" id="packageEditName" name="name" required>
+                    <label class="form-label" for="vehicleEditName">Vehicle</label>
+                    <input class="form-control" id="vehicleEditName" name="name" required>
                   </div>
                   <div class="mb-2">
-                    <label class="form-label" for="packageEditDesc">Description</label>
-                    <textarea class="form-control" id="packageEditDesc" name="description" rows="3"></textarea>
+                    <label class="form-label" for="vehicleEditDesc">Description</label>
+                    <textarea class="form-control" id="vehicleEditDesc" name="description" rows="3"></textarea>
                   </div>
                   <div class="row g-2 mb-2">
                     <div class="col-6">
-                      <label class="form-label" for="packageEditPrice">Price</label>
-                      <input type="number" step="0.01" min="0" class="form-control" id="packageEditPrice" name="price" required>
+                      <label class="form-label" for="vehicleEditPrice">Price per day</label>
+                      <input type="number" step="0.01" min="0" class="form-control" id="vehicleEditPrice" name="price">
                     </div>
                     <div class="col-6">
-                      <label class="form-label" for="packageEditDays">How many days</label>
-                      <input type="text" inputmode="numeric" pattern="[0-9]*" maxlength="2" class="form-control" id="packageEditDays" name="package_days" required autocomplete="off" oninput="this.value=this.value.replace(/\D/g,'')">
+                      <label class="form-label" for="vehicleEditSeats">Seats</label>
+                      <input type="number" min="1" class="form-control" id="vehicleEditSeats" name="capacity" required>
                     </div>
-                    <div class="col-6">
-                      <label class="form-label" for="packageEditPax">Pax</label>
-                      <input type="text" inputmode="numeric" pattern="[0-9]*" maxlength="2" class="form-control" id="packageEditPax" name="capacity" required autocomplete="off" oninput="this.value=this.value.replace(/\D/g,'')">
-                      <div class="form-text">How many people this package is for.</div>
+                    <div class="col-12">
+                      <label class="form-label" for="vehicleEditCount">How many vehicles</label>
+                      <input type="number" min="1" class="form-control" id="vehicleEditCount" name="unit_count">
+                      <div class="form-text">Leave blank for no limit.</div>
                     </div>
+                  </div>
+                  <div class="mb-2">
+                    <label class="form-label" for="vehicleEditFeatures">Features</label>
+                    <input class="form-control js-tag-input" id="vehicleEditFeatures" name="amenities" maxlength="255">
+                    <div class="form-text">Type one feature, then a comma.</div>
                   </div>
                   <div class="mb-1">
-                    <label class="form-label" for="packageEditPhoto">Photo</label>
-                    <input class="form-control" id="packageEditPhoto" type="file" name="image" accept="image/jpeg,image/png,image/webp">
+                    <label class="form-label" for="vehicleEditPhoto">Vehicle photo</label>
+                    <div class="room-photo-stage mb-2" id="vehicleEditStage">
+                      <span class="room-photo-stage__empty">Photo preview</span>
+                      <img id="vehicleEditPreview" alt="" hidden>
+                    </div>
+                    <input class="form-control js-room-photo" id="vehicleEditPhoto" type="file" name="image" accept="image/jpeg,image/png,image/webp" data-preview="vehicleEditPreview">
                     <div class="form-text">Leave this blank to keep the current photo.</div>
                   </div>
-                  <img id="packageEditPreview" class="offer-manage-card__photo mt-2 rounded" alt="" hidden>
                 </div>
                 <div class="modal-footer">
                   <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
@@ -687,7 +914,7 @@ require __DIR__ . '/../includes/business_shell_end.php';
 if ($biz) {
     render_unsaved_changes_modal();
 }
-if ($isRooms || $mode === 'menu') {
+if ($isRooms || $mode === 'menu' || $isVehicles) {
     $extraScripts = '<script>
       document.querySelectorAll(".js-room-photo").forEach(function (input) {
         input.addEventListener("change", function () {
@@ -759,8 +986,52 @@ if ($mode === 'menu') {
       });
     </script>';
 }
+if ($isVehicles) {
+    $extraScripts = ($extraScripts ?? '') . '<script>
+      document.getElementById("vehicleEditModal")?.addEventListener("show.bs.modal", function (event) {
+        var btn = event.relatedTarget;
+        if (!btn) return;
+        var id = document.getElementById("vehicleEditId");
+        var name = document.getElementById("vehicleEditName");
+        var desc = document.getElementById("vehicleEditDesc");
+        var price = document.getElementById("vehicleEditPrice");
+        var seats = document.getElementById("vehicleEditSeats");
+        var count = document.getElementById("vehicleEditCount");
+        var features = document.getElementById("vehicleEditFeatures");
+        var photo = document.getElementById("vehicleEditPhoto");
+        if (id) id.value = btn.getAttribute("data-car-id") || "";
+        if (name) name.value = btn.getAttribute("data-car-name") || "";
+        if (desc) desc.value = btn.getAttribute("data-car-desc") || "";
+        if (price) price.value = btn.getAttribute("data-car-price") || "0";
+        if (seats) seats.value = btn.getAttribute("data-car-seats") || "";
+        if (count) count.value = btn.getAttribute("data-car-count") || "";
+        if (features) features.value = btn.getAttribute("data-car-features") || "";
+        if (photo) photo.value = "";
+        var preview = document.getElementById("vehicleEditPreview");
+        var stage = document.getElementById("vehicleEditStage");
+        var src = btn.getAttribute("data-car-photo") || "";
+        if (preview) {
+          preview.hidden = src === "";
+          if (src !== "") preview.src = src;
+          else preview.removeAttribute("src");
+        }
+        if (stage) stage.classList.toggle("has-photo", src !== "");
+      });
+    </script>';
+}
 if ($mode === 'packages') {
     $extraScripts = '<script>
+      document.querySelectorAll("[data-offer-tab]").forEach(function (tab) {
+        tab.addEventListener("click", function () {
+          document.querySelectorAll("[data-offer-tab]").forEach(function (btn) {
+            btn.classList.toggle("is-on", btn === tab);
+          });
+          var offer = tab.getAttribute("data-offer-tab") || "all";
+          document.querySelectorAll("[data-package-offer]").forEach(function (card) {
+            card.hidden = offer !== "all" && card.getAttribute("data-package-offer") !== offer;
+          });
+        });
+      });
       document.getElementById("packageEditModal")?.addEventListener("show.bs.modal", function (event) {
         var btn = event.relatedTarget;
         if (!btn) return;
@@ -768,22 +1039,106 @@ if ($mode === 'packages') {
         var name = document.getElementById("packageEditName");
         var desc = document.getElementById("packageEditDesc");
         var price = document.getElementById("packageEditPrice");
-        var days = document.getElementById("packageEditDays");
+        var itinerary = document.getElementById("packageEditItinerary");
+        var viewItinerary = document.getElementById("packageViewItinerary");
         var pax = document.getElementById("packageEditPax");
+        var minPax = document.getElementById("packageEditMin");
+        var inclusions = document.getElementById("packageEditInclusions");
         var photo = document.getElementById("packageEditPhoto");
         var preview = document.getElementById("packageEditPreview");
         if (id) id.value = btn.getAttribute("data-pkg-id") || "";
         if (name) name.value = btn.getAttribute("data-pkg-name") || "";
         if (desc) desc.value = btn.getAttribute("data-pkg-desc") || "";
+        var descCount = document.getElementById("packageEditDescCount");
+        if (desc && descCount) descCount.textContent = String(desc.value.length) + " / 120";
         if (price) price.value = btn.getAttribute("data-pkg-price") || "0";
-        if (days) days.value = btn.getAttribute("data-pkg-days") || "";
+        if (itinerary) itinerary.href = ' . json_encode(APP_URL . '/business/package.php?id=') . ' + (btn.getAttribute("data-pkg-id") || "");
+        if (viewItinerary) {
+          var itinId = btn.getAttribute("data-pkg-itin") || "";
+          viewItinerary.hidden = itinId === "" || itinId === "0";
+          viewItinerary.href = ' . json_encode(APP_URL . '/itinerary-share.php?from=package&id=') . ' + itinId;
+        }
         if (pax) pax.value = btn.getAttribute("data-pkg-pax") || "";
+        if (minPax) minPax.value = btn.getAttribute("data-pkg-min") || "";
+        if (window.packageEditSetInclusions) window.packageEditSetInclusions(btn.getAttribute("data-pkg-inclusions") || "");
         if (photo) photo.value = "";
         var src = btn.getAttribute("data-pkg-photo") || "";
         if (preview) {
           preview.hidden = src === "";
           preview.src = src;
         }
+      });
+      (function () {
+        var box = document.getElementById("packageEditInclusionTags");
+        var entry = document.getElementById("packageEditInclusionEntry");
+        var hidden = document.getElementById("packageEditInclusions");
+        if (!box || !entry || !hidden) return;
+        function tags() {
+          return Array.prototype.map.call(box.querySelectorAll(".tag-input__chip"), function (chip) {
+            return chip.firstChild && chip.firstChild.nodeType === 3 ? chip.firstChild.textContent.trim() : "";
+          }).filter(Boolean);
+        }
+        function sync() {
+          var count = tags().length;
+          hidden.value = tags().join(", ");
+          var full = count >= 8;
+          entry.readOnly = full;
+          if (full) entry.value = "";
+          entry.placeholder = full ? "" : (count ? "" : "Type an inclusion and press Enter");
+          var countEl = document.getElementById("packageEditInclusionCount");
+          if (countEl) countEl.textContent = count + " / 8";
+        }
+        function add(text) {
+          text = String(text || "").replace(/,/g, "").trim();
+          if (!text || text.length > 40 || tags().length >= 8) return;
+          var lower = text.toLowerCase();
+          if (tags().some(function (tag) { return tag.toLowerCase() === lower; })) return;
+          var chip = document.createElement("span");
+          chip.className = "tag-input__chip";
+          chip.appendChild(document.createTextNode(text));
+          var remove = document.createElement("button");
+          remove.type = "button";
+          remove.className = "tag-input__remove";
+          remove.setAttribute("aria-label", "Remove " + text);
+          remove.textContent = "×";
+          chip.appendChild(remove);
+          box.insertBefore(chip, entry);
+          sync();
+        }
+        window.packageEditSetInclusions = function (raw) {
+          box.querySelectorAll(".tag-input__chip").forEach(function (chip) { chip.remove(); });
+          String(raw || "").split(",").forEach(add);
+          entry.value = "";
+          sync();
+        };
+        box.addEventListener("click", function (e) {
+          var remove = e.target.closest(".tag-input__remove");
+          if (!remove || !remove.parentElement) return;
+          remove.parentElement.remove();
+          sync();
+        });
+        entry.addEventListener("keydown", function (e) {
+          if (e.key === "Enter" || e.key === ",") {
+            e.preventDefault();
+            add(entry.value);
+            entry.value = "";
+          } else if (e.key === "Backspace" && entry.value === "") {
+            var chips = box.querySelectorAll(".tag-input__chip");
+            if (chips.length) chips[chips.length - 1].remove();
+            sync();
+          }
+        });
+      })();
+      document.getElementById("packageEditDesc")?.addEventListener("input", function () {
+        var descCount = document.getElementById("packageEditDescCount");
+        if (descCount) descCount.textContent = String(this.value.length) + " / 120";
+      });
+      document.getElementById("packageEditPhoto")?.addEventListener("change", function () {
+        var preview = document.getElementById("packageEditPreview");
+        var file = this.files && this.files[0];
+        if (!preview || !file) return;
+        preview.src = URL.createObjectURL(file);
+        preview.hidden = false;
       });
     </script>';
 }

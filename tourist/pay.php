@@ -73,7 +73,7 @@ if (isset($_GET['poll'])) {
 }
 
 $scanUrl = ($intent !== '' && !$alreadyPaid && !$pendingReview) ? payment_scan_url((int) $booking['id'], $intent) : '';
-$qrDataUri = $scanUrl !== '' ? payment_qr_data_uri($scanUrl) : '';
+$qrSvg = $scanUrl !== '' ? payment_qr_svg($scanUrl) : '';
 $pageTitle = 'Pay with GCash';
 $pageHeading = 'GCash payment';
 $activeNav = 'bookings';
@@ -97,18 +97,22 @@ require __DIR__ . '/../includes/header.php';
           </div>
           <div class="gcash-pay__body">
             <?php if ($alreadyPaid): ?>
-              <div class="alert alert-success mb-0">
-                Already paid<?= !empty($booking['payment_reference']) ? ' · Ref ' . e($booking['payment_reference']) : '' ?>.
-                <?php if (($booking['status'] ?? '') === 'pending'): ?>
-                  Your tour guide still needs to accept this booking.
-                <?php endif; ?>
-                <a href="<?= APP_URL ?>/tourist/bookings.php">Back to bookings</a>
+              <div class="gcash-pay__done">
+                <div class="alert alert-success mb-0">
+                  Already paid<?= !empty($booking['payment_reference']) ? ' · Ref ' . e($booking['payment_reference']) : '' ?>.
+                  <?php if (($booking['status'] ?? '') === 'pending'): ?>
+                    Your tour guide still needs to accept this booking.
+                  <?php endif; ?>
+                </div>
+                <a class="btn btn-ct w-100" href="<?= APP_URL ?>/tourist/bookings.php">Back to bookings</a>
               </div>
             <?php elseif ($pendingReview): ?>
-              <div class="alert alert-info mb-0">
-                Reference submitted<?= !empty($booking['payment_reference']) ? ' · Ref ' . e($booking['payment_reference']) : '' ?>.
-                Waiting for the Tourism Office to confirm this GCash payment.
-                <div class="mt-2"><a href="<?= APP_URL ?>/tourist/bookings.php">Back to bookings</a></div>
+              <div class="gcash-pay__done">
+                <div class="alert alert-info mb-0">
+                  Reference submitted<?= !empty($booking['payment_reference']) ? ' · Ref ' . e($booking['payment_reference']) : '' ?>.
+                  Waiting for the Tourism Office to confirm this GCash payment.
+                </div>
+                <a class="btn btn-ct w-100" href="<?= APP_URL ?>/tourist/bookings.php">Back to bookings</a>
               </div>
             <?php else: ?>
               <div class="small text-muted">Amount to pay</div>
@@ -162,9 +166,9 @@ require __DIR__ . '/../includes/header.php';
                 </dl>
               <?php endif; ?>
               <div hidden data-pay-wait data-pay-poll="<?= e(payment_checkout_url((int) $booking['id'], $intent) . '&poll=1') ?>"></div>
-              <?php if ($qrDataUri !== ''): ?>
+              <?php if ($qrSvg !== ''): ?>
                 <div class="gcash-pay__qr-wrap">
-                  <img class="gcash-pay__qr-img" src="<?= e($qrDataUri) ?>" alt="Scan to pay" width="280" height="280">
+                  <?= $qrSvg ?>
                 </div>
               <?php else: ?>
                 <div class="alert alert-warning">Could not build the payment QR on this computer.</div>

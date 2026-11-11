@@ -13,8 +13,8 @@ if ($bizVisitView === 'calendar') {
     $pageHeading = 'Visit calendar';
     $activeNav = 'calendar';
 } elseif ($bizVisitView === 'report') {
-    $pageTitle = 'Visit report';
-    $pageHeading = 'Visit report';
+    $pageTitle = 'Report';
+    $pageHeading = 'Report';
     $activeNav = 'report';
 } else {
     $pageTitle = 'Business Dashboard';
@@ -22,6 +22,11 @@ if ($bizVisitView === 'calendar') {
     $activeNav = 'dashboard';
 }
 
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf() && (string) ($_POST['action'] ?? '') === 'package_clearance') {
+    $res = package_clearance_respond((int) ($_POST['clearance_id'] ?? 0), (int) $user['id'], 'business', (string) ($_POST['decision'] ?? '') === 'accept');
+    flash($res['ok'] ? 'success' : 'error', $res['message']);
+    redirect(APP_URL . '/business/dashboard.php');
+}
 $annBundle = announcements_for_role(ROLE_BUSINESS, (int) $user['id']);
 $biz = db()->prepare('SELECT b.*, bt.name AS type_name FROM businesses b JOIN business_types bt ON bt.id=b.business_type_id WHERE b.user_id=? LIMIT 1');
 $biz->execute([$user['id']]);
@@ -98,6 +103,42 @@ require __DIR__ . '/../includes/business_shell_start.php';
 <?php require __DIR__ . '/../includes/business_shell_end.php'; ?>
 <?php require __DIR__ . '/../includes/footer.php'; return; endif; ?>
 
+      <?php
+        $packageClearances = [];
+        if ($biz && $bizVisitView === '') {
+            package_clearance_ensure_schema();
+            $clearSt = db()->prepare(
+                "SELECT c.id, s.name, s.package_fixed_date
+                 FROM package_clearances c
+                 JOIN business_services s ON s.id=c.service_id
+                 WHERE c.business_id=? AND c.status='pending'
+                 ORDER BY c.id DESC"
+            );
+            $clearSt->execute([(int) $biz['id']]);
+            $packageClearances = $clearSt->fetchAll() ?: [];
+        }
+      ?>
+      <?php if ($packageClearances): ?>
+        <div class="glass p-3 mb-3">
+          <div class="fw-semibold mb-2">Inclusive package requests</div>
+          <?php foreach ($packageClearances as $clearance): ?>
+            <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
+              <div>
+                <strong><?= e((string) $clearance['name']) ?></strong>
+                <?php if (!empty($clearance['package_fixed_date'])): ?>
+                  <span class="text-muted small"><?= e(format_date((string) $clearance['package_fixed_date'])) ?></span>
+                <?php endif; ?>
+              </div>
+              <form method="post" class="d-flex gap-2"><?= csrf_field() ?>
+                <input type="hidden" name="action" value="package_clearance">
+                <input type="hidden" name="clearance_id" value="<?= (int) $clearance['id'] ?>">
+                <button class="btn btn-ct btn-sm" name="decision" value="accept" type="submit">Accept</button>
+                <button class="btn btn-outline-secondary btn-sm" name="decision" value="decline" type="submit">Decline</button>
+              </form>
+            </div>
+          <?php endforeach; ?>
+        </div>
+      <?php endif; ?>
       <?php if ($bizVisitView === ''): ?>
       <div data-live-page="announcement_board" data-live-version="<?= e(announcement_board_version($annBundle)) ?>">
         <?php render_announcements_board($annBundle); ?>
@@ -109,7 +150,7 @@ require __DIR__ . '/../includes/business_shell_start.php';
         <?php if (!business_listing_is_approved($biz)): ?>
           <div class="alert alert-warning">
             Approval status: <?= status_badge($biz['approval_status']) ?> · <?= e($biz['name']) ?> (<?= e($biz['type_name']) ?>)
-            Logo, description, photos, and your map pin can be added after approval.
+            Logo, description, photos, operating hours, and your map pin can be added after approval.
           </div>
         <?php endif; ?>
         <?php if ($bizVisitView === ''): ?>
@@ -168,13 +209,18 @@ require __DIR__ . '/../includes/business_shell_start.php';
                       b.tour_start_date, b.start_time,
                       ii.visit_date, ii.start_time AS stop_time,
                       i.title AS tour_title, i.start_date AS itin_start, i.party_size AS itin_party,
-                      CONCAT(u.first_name, ' ', u.last_name) AS tourist_name
+                      CONCAT(u.first_name, ' ', u.last_name) AS tourist_name,
+                      (
+                        SELECT rr.status FROM restaurant_reservations rr
+                        WHERE rr.itinerary_id = b.itinerary_id AND rr.business_id = ii.business_id
+                        ORDER BY rr.id DESC LIMIT 1
+                      ) AS reservation_status
                FROM itinerary_items ii
                JOIN bookings b ON b.itinerary_id = ii.itinerary_id
                JOIN users u ON u.id = b.tourist_id
                LEFT JOIN itineraries i ON i.id = ii.itinerary_id
                WHERE ii.business_id = ?
-                 AND b.status IN ('pending','approved','completed')"
+                 AND b.status IN ('approved','completed')"
           );
           $visitStmt->execute([(int) $biz['id']]);
           $visitRows = $visitStmt->fetchAll() ?: [];
@@ -205,7 +251,10 @@ require __DIR__ . '/../includes/business_shell_start.php';
               if (!isset($visitsByDate[$vDate])) {
                   $visitsByDate[$vDate] = ['coming' => 0, 'visited' => 0, 'groups' => []];
               }
-              $status = (string) ($vr['status'] ?? '');
+              $status = strtolower(trim((string) ($vr['reservation_status'] ?? '')));
+              if ($status === '') {
+                  $status = 'pending';
+              }
               if ($status === 'completed') {
                   $visitsByDate[$vDate]['visited'] += $party;
               } else {
@@ -224,6 +273,7 @@ require __DIR__ . '/../includes/business_shell_start.php';
                   'tour' => trim((string) ($vr['tour_title'] ?? '')),
                   'party' => $party,
                   'status' => $status,
+                  'tour_pending' => (string) ($vr['status'] ?? '') === 'pending',
                   'time' => $when,
               ];
           }
@@ -328,7 +378,6 @@ require __DIR__ . '/../includes/business_shell_start.php';
                       </div>
                       <div class="text-end">
                         <div class="fw-semibold"><?= (int) $g['party'] ?> <?= (int) $g['party'] === 1 ? 'person' : 'people' ?></div>
-                        <div><?= status_badge($g['status']) ?></div>
                       </div>
                     </div>
                   <?php endforeach; ?>
@@ -340,16 +389,27 @@ require __DIR__ . '/../includes/business_shell_start.php';
         <?php endif; ?>
 
         <?php if ($bizVisitView === 'report'): ?>
+        <?php
+          $reportTab = (string) ($_GET['section'] ?? 'visits');
+          if (!in_array($reportTab, ['visits', 'fees', 'statement'], true)) {
+              $reportTab = 'visits';
+          }
+          $reportBase = 'view=report&amp;month=' . e($visitYm) . '&amp;section=';
+        ?>
         <div class="glass p-3 p-md-4 mb-4 biz-report">
-          <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
-            <h3 class="panel-title mb-0">Visit report · <?= e($visitMonthLabel) ?></h3>
-            <?php if ($bizVisitView === 'report'): ?>
-              <div class="d-flex align-items-center gap-2">
-                <a class="btn btn-sm btn-outline-secondary" href="?view=report&amp;month=<?= e($visitPrevYm) ?>">&larr;</a>
-                <a class="btn btn-sm btn-outline-secondary" href="?view=report&amp;month=<?= e($visitNextYm) ?>">&rarr;</a>
-              </div>
-            <?php endif; ?>
+          <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+            <h3 class="panel-title mb-0"><?= e($visitMonthLabel) ?></h3>
+            <div class="d-flex align-items-center gap-2">
+              <a class="btn btn-sm btn-outline-secondary" href="?view=report&amp;month=<?= e($visitPrevYm) ?>&amp;section=<?= e($reportTab) ?>">&larr;</a>
+              <a class="btn btn-sm btn-outline-secondary" href="?view=report&amp;month=<?= e($visitNextYm) ?>&amp;section=<?= e($reportTab) ?>">&rarr;</a>
+            </div>
           </div>
+          <div class="d-flex flex-wrap gap-2 mb-3">
+            <a class="btn btn-sm <?= $reportTab === 'visits' ? 'btn-ct' : 'btn-outline-secondary' ?>" href="?<?= $reportBase ?>visits">Visit report</a>
+            <a class="btn btn-sm <?= $reportTab === 'fees' ? 'btn-ct' : 'btn-outline-secondary' ?>" href="?<?= $reportBase ?>fees">Fees</a>
+            <a class="btn btn-sm <?= $reportTab === 'statement' ? 'btn-ct' : 'btn-outline-secondary' ?>" href="?<?= $reportBase ?>statement">Monthly statement</a>
+          </div>
+          <?php if ($reportTab === 'visits'): ?>
           <div class="row g-3 mb-3">
             <div class="col-md-4">
               <div class="biz-report__stat">
@@ -465,6 +525,63 @@ require __DIR__ . '/../includes/business_shell_start.php';
                 </tbody>
               </table>
             </div>
+          <?php endif; ?>
+          <?php endif; ?>
+          <?php if ($biz && $reportTab === 'fees'): ?>
+          <?php
+            revenue_ensure_schema();
+            revenue_mark_overdue();
+            $feeSt = db()->prepare('SELECT * FROM revenue_transactions WHERE business_id=? AND period_ym=? ORDER BY id DESC');
+            $feeSt->execute([(int) $biz['id'], $visitYm]);
+            $feeRows = $feeSt->fetchAll() ?: [];
+          ?>
+          <?php if (!$feeRows): ?>
+            <p class="text-muted mb-0">No fees this month.</p>
+          <?php else: ?>
+            <div class="table-responsive">
+              <table class="table table-sm table-ct align-middle mb-0 biz-report__table">
+                <thead><tr><th>Record</th><th>Base</th><th>Rate</th><th>Fee</th><th>Status</th></tr></thead>
+                <tbody>
+                  <?php foreach ($feeRows as $feeRow): ?>
+                    <tr>
+                      <td><?= e(ucfirst((string) $feeRow['source_type'])) ?> #<?= (int) $feeRow['source_id'] ?></td>
+                      <td><?= e(format_money((float) $feeRow['base_amount'])) ?></td>
+                      <td><?= e((string) $feeRow['rate_label']) ?></td>
+                      <td><?= e(format_money((float) $feeRow['fee_amount'])) ?></td>
+                      <td><?= status_badge((string) $feeRow['status']) ?></td>
+                    </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            </div>
+          <?php endif; ?>
+          <?php endif; ?>
+          <?php if ($biz && $reportTab === 'statement'): ?>
+          <?php
+            revenue_ensure_schema();
+            revenue_mark_overdue();
+            $stmtSt = db()->prepare('SELECT * FROM revenue_statements WHERE business_id=? AND period_ym=? LIMIT 1');
+            $stmtSt->execute([(int) $biz['id'], $visitYm]);
+            $feeStatements = $stmtSt->fetchAll() ?: [];
+          ?>
+          <?php if (!$feeStatements): ?>
+            <p class="text-muted mb-0">No statement for this month.</p>
+          <?php else: ?>
+            <div class="table-responsive">
+              <table class="table table-sm table-ct align-middle mb-0 biz-report__table">
+                <thead><tr><th>Month</th><th>Total</th><th>Status</th></tr></thead>
+                <tbody>
+                  <?php foreach ($feeStatements as $feeStatement): ?>
+                    <tr>
+                      <td><?= e((string) $feeStatement['period_ym']) ?></td>
+                      <td><?= e(format_money((float) $feeStatement['total_amount'])) ?></td>
+                      <td><?= status_badge((string) $feeStatement['status']) ?></td>
+                    </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            </div>
+          <?php endif; ?>
           <?php endif; ?>
         </div>
         <?php endif; ?>

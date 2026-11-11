@@ -686,6 +686,56 @@ function guide_booking_cutoff_mins(?string $endTime): ?int
     return max(0, $close - GUIDE_BOOKING_CUTOFF_BEFORE_END_MINS);
 }
 
+/**
+ * Earliest start and latest booking cutoff per weekday for public tour guides.
+ * Used to limit the tourist itinerary meetup time picker.
+ *
+ * @return array<string, array{min:string,max:string}>
+ */
+function tourist_meetup_hour_windows(): array
+{
+    try {
+        $rows = db()->query(
+            "SELECT ga.day_of_week, ga.start_time, ga.end_time
+             FROM guide_availability ga
+             JOIN tour_guide_profiles g ON g.id = ga.guide_id
+             JOIN users u ON u.id = g.user_id
+             WHERE ga.is_available = 1
+               AND g.approval_status = 'approved'
+               AND u.status = 'active'
+               AND g.guide_type <> 'in_house'"
+        )->fetchAll() ?: [];
+    } catch (Throwable $e) {
+        return [];
+    }
+    $acc = [];
+    foreach ($rows as $row) {
+        $dow = (int) ($row['day_of_week'] ?? -1);
+        if ($dow < 0 || $dow > 6) {
+            continue;
+        }
+        $open = itin_time_to_minutes((string) ($row['start_time'] ?? ''));
+        $cut = guide_booking_cutoff_mins((string) ($row['end_time'] ?? ''));
+        if ($open === null || $cut === null || $cut <= $open) {
+            continue;
+        }
+        if (!isset($acc[$dow])) {
+            $acc[$dow] = ['open' => $open, 'cut' => $cut];
+            continue;
+        }
+        $acc[$dow]['open'] = min($acc[$dow]['open'], $open);
+        $acc[$dow]['cut'] = max($acc[$dow]['cut'], $cut);
+    }
+    $out = [];
+    foreach ($acc as $dow => $w) {
+        $out[(string) $dow] = [
+            'min' => sprintf('%02d:%02d', intdiv((int) $w['open'], 60), ((int) $w['open']) % 60),
+            'max' => sprintf('%02d:%02d', intdiv((int) $w['cut'], 60), ((int) $w['cut']) % 60),
+        ];
+    }
+    return $out;
+}
+
 /** 12h label for the cutoff, e.g. "6:00 PM". */
 function guide_booking_cutoff_display(?string $endTime): string
 {
@@ -1714,7 +1764,12 @@ function booking_insert_pending(array $row): int
         $row['status'] ?? 'pending',
         $row['payment_status'] ?? 'unpaid',
     ]);
-    return (int) db()->lastInsertId();
+    $bookingId = (int) db()->lastInsertId();
+    $stayDecision = ((int) ($row['accommodation_declined'] ?? 0) === 1 || (int) ($row['accommodation_business_id'] ?? 0) < 1) ? 'none' : 'pending';
+    $rideDecision = ((int) ($row['transportation_declined'] ?? 0) === 1 || (int) ($row['transportation_business_id'] ?? 0) < 1) ? 'none' : 'pending';
+    db()->prepare('UPDATE bookings SET accommodation_decision=?, transportation_decision=? WHERE id=?')
+        ->execute([$stayDecision, $rideDecision, $bookingId]);
+    return $bookingId;
 }
 
 /**
@@ -2573,14 +2628,14 @@ function validate_booking_request(
             return $fail('Enter a valid booking date.');
         }
     }
-    $today = app_today();
-    if ($date < $today) {
-        return $fail('Tour date cannot be in the past. Choose today or a future date.');
+    $earliest = booking_earliest_date();
+    if ($date < $earliest) {
+        return $fail('Tours cannot be booked for today. Choose tomorrow or a later date.');
     }
     if ($itineraryId) {
         foreach (itinerary_visit_dates_list($itineraryId) as $visitDate) {
-            if ($visitDate < $today) {
-                return $fail('Tour date cannot be in the past. Choose today or a future date.');
+            if ($visitDate < $earliest) {
+                return $fail('Tours cannot be booked for today. Choose tomorrow or a later date.');
             }
         }
     }
@@ -2675,6 +2730,49 @@ function resolve_booking_decline_reason(string $preset, string $detail = ''): ar
  * Payment does not approve the tour. The guide still has to accept it.
  * @return array{ok:bool,message:string}
  */
+function booking_place_decide(int $bookingId, int $businessUserId, string $kind, bool $accept, string $reason = ''): array
+{
+    ensure_booking_payment_schema();
+    $column = $kind === 'transportation' ? 'transportation' : 'accommodation';
+    $st = db()->prepare(
+        "SELECT b.*, u.first_name, u.last_name
+         FROM bookings b
+         JOIN businesses biz ON biz.id = b.{$column}_business_id
+         JOIN users u ON u.id = b.tourist_id
+         WHERE b.id=? AND biz.user_id=? AND b.{$column}_decision='pending' LIMIT 1"
+    );
+    $st->execute([$bookingId, $businessUserId]);
+    $booking = $st->fetch();
+    if (!$booking) {
+        return ['ok' => false, 'message' => 'That booking is no longer waiting.'];
+    }
+    if (!$accept) {
+        $why = trim($reason);
+        if ($why === '') {
+            return ['ok' => false, 'message' => 'Enter a reason for rejecting this booking.'];
+        }
+        db()->prepare("UPDATE bookings SET {$column}_decision='rejected', status='rejected', rejection_reason=? WHERE id=? AND status='pending'")
+            ->execute([mb_substr($why, 0, 255), $bookingId]);
+        notify_user((int) $booking['tourist_id'], 'booking_request', 'Booking declined', ($booking['booking_code'] ?? 'Your booking') . ' was declined. ' . $why, APP_URL . '/tourist/bookings.php');
+        return ['ok' => true, 'message' => 'Rejected. The tourist stays off this booking.'];
+    }
+    db()->prepare("UPDATE bookings SET {$column}_decision='accepted' WHERE id=?")->execute([$bookingId]);
+    $fresh = db()->prepare('SELECT * FROM bookings WHERE id=?');
+    $fresh->execute([$bookingId]);
+    $fresh = $fresh->fetch() ?: $booking;
+    $still = (string) ($fresh['accommodation_decision'] ?? '') === 'pending' || (string) ($fresh['transportation_decision'] ?? '') === 'pending';
+    if ($still || (int) ($fresh['guide_ready'] ?? 0) !== 1) {
+        return ['ok' => true, 'message' => 'Accepted. The tourist stays pending until the other places and the tour guide accept.'];
+    }
+    $guide = db()->prepare('SELECT u.* FROM tour_guide_profiles g JOIN users u ON u.id=g.user_id WHERE g.id=?');
+    $guide->execute([(int) $fresh['guide_id']]);
+    $guideUser = $guide->fetch();
+    if (!$guideUser) {
+        return ['ok' => true, 'message' => 'Accepted. Waiting for the tour guide.'];
+    }
+    return booking_guide_approve($fresh, $guideUser);
+}
+
 function booking_guide_approve(array $booking, array $guideUser): array
 {
     $pay = (string) ($booking['payment_status'] ?? '');
@@ -2696,6 +2794,16 @@ function booking_guide_approve(array $booking, array $guideUser): array
     );
     if ($availMsg !== null) {
         return ['ok' => false, 'message' => $availMsg];
+    }
+
+    $hold = db()->prepare('SELECT accommodation_decision, transportation_decision FROM bookings WHERE id=?');
+    $hold->execute([$id]);
+    $hold = $hold->fetch() ?: [];
+    $waitingPlace = in_array((string) ($hold['accommodation_decision'] ?? ''), ['pending'], true)
+        || in_array((string) ($hold['transportation_decision'] ?? ''), ['pending'], true);
+    if ($waitingPlace) {
+        db()->prepare('UPDATE bookings SET guide_ready=1 WHERE id=? AND status=\'pending\'')->execute([$id]);
+        return ['ok' => true, 'message' => 'Accepted. The tourist stays pending until accommodation and transportation accept.'];
     }
 
     if (!assert_booking_transition($id, 'pending', 'approved')) {
@@ -2730,6 +2838,7 @@ function booking_guide_approve(array $booking, array $guideUser): array
     $booking['status'] = 'approved';
     require_once __DIR__ . '/qr.php';
     booking_qr_for($booking, $tourist, $guideUser, $destination, $itinerary);
+    itinerary_commit_reservation_drafts((int) ($booking['itinerary_id'] ?? 0), (int) ($booking['tourist_id'] ?? 0));
 
     return ['ok' => true, 'message' => 'Booking approved. Ticket and QR are ready for the tourist.'];
 }
@@ -4077,8 +4186,20 @@ function booking_mark_payment(array $booking, string $status, ?string $reference
                 'Payment for ' . ($row['booking_code'] ?? '') . ' was received. Your tour guide still needs to accept the booking.',
                 APP_URL . '/tourist/bookings.php'
             );
+            foreach (['accommodation', 'transportation'] as $placeKind) {
+                if ((string) ($row[$placeKind . '_decision'] ?? '') !== 'pending') {
+                    continue;
+                }
+                $owner = db()->prepare('SELECT user_id, name FROM businesses WHERE id=?');
+                $owner->execute([(int) ($row[$placeKind . '_business_id'] ?? 0)]);
+                $owner = $owner->fetch();
+                if ($owner) {
+                    notify_user((int) $owner['user_id'], 'booking_request', 'New booking', $who . ' booked ' . (string) $owner['name'] . ' on ' . format_date($row['booking_date'] ?? '') . '. Accept or reject it.', APP_URL . '/business/bookings.php');
+                }
+            }
             return ['ok' => true, 'message' => 'Paid. Waiting for the tour guide to accept.'];
         }
+        itinerary_commit_reservation_drafts((int) ($booking['itinerary_id'] ?? 0), (int) ($booking['tourist_id'] ?? 0));
         notify_user(
             (int) $booking['tourist_id'],
             'approval',
@@ -4089,6 +4210,9 @@ function booking_mark_payment(array $booking, string $status, ?string $reference
         return ['ok' => true, 'message' => 'Marked as paid.'];
     }
     db()->prepare("UPDATE bookings SET payment_status='pay_at_office' WHERE id=?")->execute([$id]);
+    if (($booking['status'] ?? '') === 'approved') {
+        itinerary_commit_reservation_drafts((int) ($booking['itinerary_id'] ?? 0), (int) ($booking['tourist_id'] ?? 0));
+    }
     notify_user(
         (int) $booking['tourist_id'],
         'approval',
@@ -4594,6 +4718,10 @@ function tourist_book_guides_list(
         : null;
     $itinId = ($itineraryId && $itineraryId > 0) ? $itineraryId : null;
 
+    if (is_file(__DIR__ . '/inhouse_guides.php')) {
+        require_once __DIR__ . '/inhouse_guides.php';
+        inhouse_guides_ensure_schema();
+    }
     $guideRows = db()->query(
         "SELECT g.id, g.user_id, g.bio, g.languages, g.years_experience, g.hourly_rate, g.license_number,
                 g.avg_rating, g.total_tours,
@@ -4602,6 +4730,7 @@ function tourist_book_guides_list(
          FROM tour_guide_profiles g
          JOIN users u ON u.id = g.user_id
          WHERE g.approval_status='approved' AND u.status='active'
+           AND g.guide_type <> 'in_house'
            AND " . guide_profile_complete_sql('g', 'u') . "
          ORDER BY g.avg_rating DESC, g.total_tours DESC"
     )->fetchAll() ?: [];
@@ -4719,14 +4848,78 @@ function tourist_book_guides_list(
             'busy_by_day' => $busyByDay,
         ];
     }
-    usort($out, static function (array $a, array $b): int {
-        $fa = ((int) !empty($b['full_day_ok'])) <=> ((int) !empty($a['full_day_ok']));
-        if ($fa !== 0) {
-            return $fa;
-        }
-        return ((int) !empty($b['ok'])) <=> ((int) !empty($a['ok']));
-    });
+    sort_guides_for_tourist($out, tourist_preferred_languages($viewerUserId));
     return $out;
+}
+
+/** True when any of the guide's languages is one the tourist prefers. */
+function guide_speaks_language(string $guideLanguages, string $touristLanguages): bool
+{
+    $wanted = [];
+    foreach (preg_split('/[,;]+/', $touristLanguages) ?: [] as $part) {
+        $part = strtolower(trim($part));
+        if ($part !== '') {
+            $wanted[$part] = true;
+        }
+    }
+    if (!$wanted) {
+        return false;
+    }
+    foreach (preg_split('/[,;]+/', $guideLanguages) ?: [] as $part) {
+        $part = strtolower(trim($part));
+        if ($part !== '' && isset($wanted[$part])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function tourist_preferred_languages(int $userId): string
+{
+    if ($userId < 1) {
+        return '';
+    }
+    try {
+        $st = db()->prepare('SELECT languages FROM users WHERE id=? LIMIT 1');
+        $st->execute([$userId]);
+        return normalize_spoken_languages((string) ($st->fetchColumn() ?: ''));
+    } catch (Throwable $e) {
+        return '';
+    }
+}
+
+/**
+ * Available guides first, then language match, then rating, then review count.
+ *
+ * @param list<array<string,mixed>> $rows
+ */
+function sort_guides_for_tourist(array &$rows, string $touristLanguages): void
+{
+    usort($rows, static function (array $a, array $b) use ($touristLanguages): int {
+        $ok = ((int) !empty($b['ok'])) <=> ((int) !empty($a['ok']));
+        if ($ok !== 0) {
+            return $ok;
+        }
+        $matchA = guide_speaks_language((string) ($a['languages'] ?? ''), $touristLanguages) ? 1 : 0;
+        $matchB = guide_speaks_language((string) ($b['languages'] ?? ''), $touristLanguages) ? 1 : 0;
+        if ($matchA !== $matchB) {
+            return $matchB <=> $matchA;
+        }
+        $ratedA = (int) ($a['reviews'] ?? 0) > 0 ? 1 : 0;
+        $ratedB = (int) ($b['reviews'] ?? 0) > 0 ? 1 : 0;
+        if ($ratedA !== $ratedB) {
+            return $ratedB <=> $ratedA;
+        }
+        $rate = ((float) ($b['rating'] ?? 0)) <=> ((float) ($a['rating'] ?? 0));
+        if ($rate !== 0) {
+            return $rate;
+        }
+        $reviews = ((int) ($b['reviews'] ?? 0)) <=> ((int) ($a['reviews'] ?? 0));
+        if ($reviews !== 0) {
+            return $reviews;
+        }
+        return strcasecmp((string) ($a['name'] ?? ''), (string) ($b['name'] ?? ''));
+    });
 }
 
 /**
@@ -4907,6 +5100,9 @@ function render_guide_bookings_live_html(array $rows, int $guideProfileId): stri
             && (time() - strtotime((string) $r['created_at'])) < 120;
 
         $html .= '<div class="col-12" data-booking-id="' . $id . '"'
+            . ' data-sort-date="' . e(trim((string) ($r['booking_date'] ?? '') . ' ' . (string) ($r['start_time'] ?? ''))) . '"'
+            . ' data-sort-status="' . e($status) . '"'
+            . ' data-sort-name="' . e(strtolower((string) ($r['tourist_name'] ?? ''))) . '"'
             . ($isNew ? ' data-booking-new="1"' : '') . '>';
         $html .= '<div class="glass p-3 p-md-4' . ($isNew ? ' guide-booking--pulse' : '') . '">';
         $html .= '<div class="d-flex flex-wrap justify-content-between gap-2 mb-2">';
@@ -4937,17 +5133,9 @@ function render_guide_bookings_live_html(array $rows, int $guideProfileId): stri
             $html .= '—';
         }
         $html .= '</div></div>';
-        if (!empty($r['notes'])) {
-            $html .= '<div class="col-12"><div class="text-muted">Notes</div><div>'
-                . e($r['notes']) . '</div></div>';
-        }
         $accHtml = booking_accessibility_html($r);
         if ($accHtml !== '') {
             $html .= '<div class="col-12">' . $accHtml . '</div>';
-        }
-        if (!empty($r['payment_reference'])) {
-            $html .= '<div class="col-12"><div class="text-muted">Payment ref</div><div>'
-                . e($r['payment_reference']) . '</div></div>';
         }
         if ($status === 'rejected' && !empty($r['rejection_reason'])) {
             $html .= '<div class="col-12 text-danger">Declined: '
@@ -4969,7 +5157,7 @@ function render_guide_bookings_live_html(array $rows, int $guideProfileId): stri
             if (!$canDecide) {
                 $html .= '<div class="alert alert-info py-2 small mb-0">Waiting for payment.</div>';
             } else {
-                $html .= '<div class="d-flex flex-wrap gap-2">';
+                $html .= '<div class="d-flex flex-wrap gap-2 guide-booking-actions">';
                 $html .= '<form method="post">' . csrf_field()
                     . '<input type="hidden" name="id" value="' . $id . '">'
                     . '<button name="action" value="approve" class="btn btn-sm btn-ct">Accept</button></form>';

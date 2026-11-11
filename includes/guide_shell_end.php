@@ -6,7 +6,7 @@
 $activeNav = $activeNav ?? '';
 $pendingGuideBookings = $pendingGuideBookings ?? 0;
 $tbLinkedAccounts = $tbLinkedAccounts ?? (isset($user) ? switchable_linked_accounts($user) : []);
-$moreActive = in_array($activeNav, ['availability', 'itineraries', 'ratings', 'profile', 'chat'], true);
+$moreActive = in_array($activeNav, ['availability', 'ratings', 'profile', 'chat'], true);
 ?>
     </div>
   </main>

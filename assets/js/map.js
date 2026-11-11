@@ -302,12 +302,8 @@
       } else {
         legend.innerHTML =
           '<div class="ct-cat-legend__block">' +
-          '<div class="ct-cat-legend__title">Destination categories</div>' +
+          '<div class="ct-cat-legend__title">Categories</div>' +
           '<div class="ct-cat-legend__items" data-legend="categories"></div>' +
-          '</div>' +
-          '<div class="ct-cat-legend__block">' +
-          '<div class="ct-cat-legend__title">Business categories</div>' +
-          '<div class="ct-cat-legend__items" data-legend="types"></div>' +
           '</div>';
       }
       row.appendChild(legend);
@@ -350,13 +346,10 @@
 
   function renderMapLegend(legendEl, categories, businessTypes) {
     if (!legendEl) return;
+    const items = (categories || []).concat(businessTypes || []);
     renderLegendGroup(
       legendEl.querySelector('[data-legend="categories"]'),
-      categories
-    );
-    renderLegendGroup(
-      legendEl.querySelector('[data-legend="types"]'),
-      businessTypes
+      items
     );
   }
 
@@ -373,6 +366,28 @@
   }
 
   function syncFilterDropdowns(state, categories, businessTypes) {
+    state.categories = categories || [];
+    state.businessTypes = businessTypes || [];
+    if (state.sortSelect) {
+      const current = state.filter || 'all';
+      state.sortSelect.innerHTML =
+        optionHtml('all', 'All places', '') +
+        state.categories
+          .map(function (c) {
+            return optionHtml('cat:' + c.id, c.name, c.color);
+          })
+          .join('') +
+        state.businessTypes
+          .map(function (t) {
+            return optionHtml('type:' + t.id, t.name, t.color);
+          })
+          .join('');
+      const hasOption = Array.prototype.some.call(state.sortSelect.options, function (opt) {
+        return opt.value === current;
+      });
+      state.sortSelect.value = hasOption ? current : 'all';
+      return;
+    }
     const host = state.filterExtra;
     if (!host) return;
 
@@ -644,6 +659,12 @@
     syncPinLabels(state.map, !!String(query).trim());
 
     updateSubfilterVisibility(state);
+    if (state.sortSelect && state.sortSelect.value !== next) {
+      const hasOption = Array.prototype.some.call(state.sortSelect.options, function (opt) {
+        return opt.value === next;
+      });
+      if (hasOption) state.sortSelect.value = next;
+    }
 
     const primary = primaryFilterKey(next);
     if (state.filterRoot) {
@@ -769,7 +790,8 @@
             : opts.filterRoot;
       }
       let filterExtra = null;
-      if (filterRoot) {
+      const sortSelect = (filterRoot && filterRoot.querySelector('[data-map-sort]')) || document.querySelector('[data-map-sort]');
+      if (filterRoot && !sortSelect) {
         filterExtra = filterRoot.querySelector('[data-map-filter-extra]');
         if (!filterExtra) {
           filterExtra = document.createElement('div');
@@ -788,6 +810,7 @@
         filterRoot: filterRoot,
         filterExtra: filterExtra,
         filter: opts.filter || 'all',
+        sortSelect: sortSelect,
         searchQuery: '',
         categories: [],
         businessTypes: [],
@@ -811,7 +834,13 @@
           setMapFilter(state, btn.getAttribute('data-map-filter'));
         });
 
-        const searchInput = filterRoot.querySelector('[data-map-search]');
+        const sortSelectEl = filterRoot.querySelector('[data-map-sort]');
+        if (sortSelectEl) {
+          sortSelectEl.addEventListener('change', function () {
+            setMapFilter(state, sortSelectEl.value || 'all');
+          });
+        }
+        const searchInput = filterRoot.querySelector('[data-map-search]') || document.querySelector('[data-map-search]');
         if (searchInput) {
           let searchTimer = null;
           const applySearch = function () {

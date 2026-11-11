@@ -479,6 +479,7 @@ function require_login(?int $roleId = null): array
 
     // Approved tours whose itinerary/booking date has passed → completed
     bookings_auto_complete_past_tours();
+    reservations_auto_complete_due();
     bookings_notify_guides_before_tours();
 
     return $user;
@@ -651,7 +652,7 @@ function register_user(array $data): array
             $linkMsg = 'This email already exists as a ' . role_label($counterpartId)
                 . '. Link that account to register as ' . role_label($roleId) . '.';
             // Tourist → Tour Guide only when the tourist currently resides in Leyte.
-            if ($roleId === ROLE_TOUR_GUIDE && $counterpartId === ROLE_TOURIST) {
+            if ($roleId === ROLE_TOUR_GUIDE && $counterpartId === ROLE_TOURIST && empty($data['skip_ormoc_residence'])) {
                 $src = db()->prepare('SELECT * FROM users WHERE email=? AND role_id=? LIMIT 1');
                 $src->execute([$email, ROLE_TOURIST]);
                 $srcRow = $src->fetch() ?: null;
@@ -702,6 +703,13 @@ function register_user(array $data): array
         $guideLanguages = trim((string) ($data['languages'] ?? ''));
         if ($guideLanguages === '') {
             return ['ok' => false, 'message' => 'Please list the languages you can guide in.'];
+        }
+        $guideLicense = trim((string) ($data['license_number'] ?? ''));
+        if ($guideLicense === '') {
+            return ['ok' => false, 'message' => 'License number is required.'];
+        }
+        if (mb_strlen($guideLicense) > 80) {
+            return ['ok' => false, 'message' => 'License number is too long.'];
         }
         $guideYears = max(0, min(80, (int) ($data['years_experience'] ?? 0)));
         if (!registration_has_files($data['credential_files'] ?? [])
@@ -833,14 +841,15 @@ function register_user(array $data): array
         $guideApproval = $adminCreated ? 'approved' : 'pending';
         $approvedBy = $adminCreated ? ((int) ($data['approved_by'] ?? 0) ?: null) : null;
         db()->prepare(
-            'INSERT INTO tour_guide_profiles (user_id, bio, languages, years_experience, hourly_rate, credential_file, approval_status, approved_by, approved_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+            'INSERT INTO tour_guide_profiles (user_id, bio, languages, years_experience, hourly_rate, license_number, credential_file, approval_status, approved_by, approved_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         )->execute([
             $userId,
             null,
             $guideLanguages,
             $guideYears,
             guide_office_daily_rate(),
+            $guideLicense,
             null,
             $guideApproval,
             $approvedBy,

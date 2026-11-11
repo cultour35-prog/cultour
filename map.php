@@ -26,6 +26,23 @@ $markers = array_merge($destinations, $businesses);
 $markersJson = json_encode($markers, JSON_UNESCAPED_SLASHES);
 $useTouristShell = $isTourist;
 $useBusinessShell = (int) $user['role_id'] === ROLE_BUSINESS;
+$searchPlaceholder = (int) $user['role_id'] === ROLE_ADMIN
+    ? 'Search government sites or businesses…'
+    : 'Search destinations or businesses…';
+if ($useTouristShell) {
+    $pageHeadingTools = '<div class="booking-list-tools" id="exploreMapFilters">'
+        . '<label class="guide-bookings-search">'
+        . '<i class="bi bi-search" aria-hidden="true"></i>'
+        . '<input type="search" id="mapMarkerSearch" data-map-search placeholder="' . e($searchPlaceholder) . '" aria-label="Search places" autocomplete="off">'
+        . '</label>'
+        . '<select class="booking-list-sort" data-map-sort aria-label="Filter places"><option value="all">All places</option></select>'
+        . '</div>';
+} elseif ($useBusinessShell) {
+    $pageHeadingTools = '<label class="guide-bookings-search">'
+        . '<i class="bi bi-search" aria-hidden="true"></i>'
+        . '<input type="search" id="mapMarkerSearch" data-map-search placeholder="' . e($searchPlaceholder) . '" aria-label="Search places" autocomplete="off">'
+        . '</label>';
+}
 if ($useTouristShell) {
     $bodyClass = trim(($bodyClass ?? '') . ' tourist-app map-explore-page');
 } elseif ($useBusinessShell) {
@@ -46,19 +63,18 @@ if ($useTouristShell) {
     <?php require __DIR__ . '/includes/topbar.php'; ?>
     <div class="page-content">
 <?php } ?>
+      <?php if (!$isTourist): ?>
       <div class="mb-3" id="exploreMapFilters">
         <div class="d-flex flex-wrap gap-2 align-items-center">
           <button type="button" class="quick-chip is-active fw-semibold" data-map-filter="all">All</button>
           <button type="button" class="quick-chip" data-map-filter="destinations"><?= (int) $user['role_id'] === ROLE_ADMIN ? 'Government sites' : 'Destinations' ?></button>
           <button type="button" class="quick-chip" data-map-filter="businesses">Businesses</button>
-          <div class="map-search flex-grow-1" style="min-width:12rem;max-width:20rem">
-            <label class="visually-hidden" for="mapMarkerSearch">Search places</label>
-            <div class="input-group input-group-sm">
-              <span class="input-group-text"><i class="bi bi-search"></i></span>
-              <input type="search" class="form-control" id="mapMarkerSearch" data-map-search
-                     placeholder="<?= (int) $user['role_id'] === ROLE_ADMIN ? 'Search government sites or businesses…' : 'Search destinations or businesses…' ?>" autocomplete="off">
-            </div>
-          </div>
+          <?php if (empty($pageHeadingTools)): ?>
+          <label class="guide-bookings-search">
+            <i class="bi bi-search" aria-hidden="true"></i>
+            <input type="search" id="mapMarkerSearch" data-map-search placeholder="<?= e($searchPlaceholder) ?>" aria-label="Search places" autocomplete="off">
+          </label>
+          <?php endif; ?>
           <?php if ((int) $user['role_id'] === ROLE_ADMIN): ?>
             <a class="quick-chip" href="<?= APP_URL ?>/admin/destinations.php"><i class="bi bi-geo-fill"></i> Pin government sites</a>
           <?php elseif ((int) $user['role_id'] === ROLE_BUSINESS): ?>
@@ -66,6 +82,7 @@ if ($useTouristShell) {
           <?php endif; ?>
         </div>
       </div>
+      <?php endif; ?>
 
       <div class="glass p-3 p-md-4 fade-up">
         <?php if (!$markers): ?>

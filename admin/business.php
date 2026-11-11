@@ -94,8 +94,9 @@ map_leaflet_head();
             <?php endif; ?>
           </div>
           <div class="admin-guide-profile__intro">
-            <div class="small text-muted mb-1">
+            <div class="small text-muted mb-1 biz-status-row">
               <?= e($biz['type_name'] ?? 'Business') ?> · <?= status_badge($biz['approval_status']) ?>
+              <?= !empty($biz['is_featured']) ? '<span class="badge text-bg-primary">Featured</span>' : '' ?>
               <?php if (($biz['approval_status'] ?? '') === 'approved'): ?>
                 · <?= status_badge($listingStatus === 'inactive' || ($biz['account_status'] ?? '') === 'suspended' ? 'hidden on map' : $listingStatus) ?>
               <?php endif; ?>

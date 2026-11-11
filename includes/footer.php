@@ -24,6 +24,7 @@
   <script src="<?= APP_URL ?>/assets/js/lang-tags.js?v=<?= @filemtime(ROOT_PATH . '/assets/js/lang-tags.js') ?: time() ?>"></script>
   <?php endif; ?>
   <script src="<?= APP_URL ?>/assets/js/app.js?v=<?= (@filemtime(ROOT_PATH . '/assets/js/app.js') ?: time()) . '-a7' ?>"></script>
+  <script src="<?= APP_URL ?>/assets/js/date-mdy.js?v=<?= @filemtime(ROOT_PATH . '/assets/js/date-mdy.js') ?: time() ?>"></script>
   <?php if (!empty($user)): ?>
   <script src="<?= APP_URL ?>/assets/js/live-page.js?v=<?= (@filemtime(ROOT_PATH . '/assets/js/live-page.js') ?: time()) ?>"></script>
   <?php endif; ?>

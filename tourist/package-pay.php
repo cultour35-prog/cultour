@@ -47,7 +47,7 @@ if (isset($_GET['poll'])) {
 }
 
 $scanUrl = (!$alreadyPaid && !$pendingReview) ? package_payment_scan_url((int) $order['id'], $intent) : '';
-$qrDataUri = $scanUrl !== '' ? payment_qr_data_uri($scanUrl) : '';
+$qrSvg = $scanUrl !== '' ? payment_qr_svg($scanUrl) : '';
 $pageTitle = 'Pay with GCash';
 $pageHeading = 'GCash payment';
 $activeNav = 'packages';
@@ -71,23 +71,27 @@ require __DIR__ . '/../includes/header.php';
           </div>
           <div class="gcash-pay__body">
             <?php if ($alreadyPaid): ?>
-              <div class="alert alert-success mb-0">
-                Already paid<?= !empty($order['payment_reference']) ? ' · Ref ' . e($order['payment_reference']) : '' ?>.
-                <a href="<?= APP_URL ?>/tourist/packages.php">Back to tour packages</a>
+              <div class="gcash-pay__done">
+                <div class="alert alert-success mb-0">
+                  Already paid<?= !empty($order['payment_reference']) ? ' · Ref ' . e($order['payment_reference']) : '' ?>.
+                </div>
+                <a class="btn btn-ct w-100" href="<?= APP_URL ?>/tourist/packages.php">Back to tour packages</a>
               </div>
             <?php elseif ($pendingReview): ?>
-              <div class="alert alert-info mb-0">
-                Reference submitted<?= !empty($order['payment_reference']) ? ' · Ref ' . e($order['payment_reference']) : '' ?>.
-                Waiting for the Tourism Office to confirm this GCash payment.
-                <div class="mt-2"><a href="<?= APP_URL ?>/tourist/packages.php">Back to tour packages</a></div>
+              <div class="gcash-pay__done">
+                <div class="alert alert-info mb-0">
+                  Reference submitted<?= !empty($order['payment_reference']) ? ' · Ref ' . e($order['payment_reference']) : '' ?>.
+                  Waiting for the Tourism Office to confirm this GCash payment.
+                </div>
+                <a class="btn btn-ct w-100" href="<?= APP_URL ?>/tourist/packages.php">Back to tour packages</a>
               </div>
             <?php else: ?>
               <div class="small text-muted">Amount to pay</div>
               <div class="gcash-pay__amount"><?= e(format_money($amount)) ?></div>
               <div hidden data-pay-wait data-pay-poll="<?= e(package_payment_checkout_url((int) $order['id'], $intent) . '&poll=1') ?>"></div>
-              <?php if ($qrDataUri !== ''): ?>
+              <?php if ($qrSvg !== ''): ?>
                 <div class="gcash-pay__qr-wrap">
-                  <img class="gcash-pay__qr-img" src="<?= e($qrDataUri) ?>" alt="Scan to pay" width="280" height="280">
+                  <?= $qrSvg ?>
                 </div>
               <?php else: ?>
                 <div class="alert alert-warning">Could not build the payment QR on this computer.</div>

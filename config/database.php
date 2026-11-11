@@ -37,7 +37,18 @@ function cultour_is_local_request(): bool
     $host = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'localhost';
     $host = strtolower(trim((string) $host));
     $host = preg_replace('/:\d+$/', '', $host) ?? $host;
-    return in_array($host, ['localhost', '127.0.0.1', '::1'], true);
+    if (in_array($host, ['localhost', '127.0.0.1', '::1'], true)) {
+        return true;
+    }
+    if (str_ends_with($host, '.trycloudflare.com')) {
+        return true;
+    }
+    // The GCash QR uses this PC's Wi-Fi address so a phone can open it.
+    // That address is still this XAMPP site, not the live server.
+    if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        return !filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+    }
+    return false;
 }
 
 /**

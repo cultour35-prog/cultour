@@ -59,6 +59,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'credential_files' => $_FILES['resume_files'] ?? [],
                 'languages' => $_POST['languages'] ?? '',
                 'years_experience' => $_POST['years_experience'] ?? '',
+                'license_number' => $_POST['license_number'] ?? '',
                 'representative_first_name' => $_POST['representative_first_name'] ?? '',
                 'representative_middle_name' => $_POST['representative_middle_name'] ?? '',
                 'representative_last_name' => $_POST['representative_last_name'] ?? '',
@@ -273,10 +274,11 @@ $bizPhonePosted = ph_phone_local_digits((string) ($_POST['business_phone_local']
                   id="phoneLocal"
                   inputmode="numeric"
                   autocomplete="off"
-                  maxlength="10"
-                  placeholder="9XXXXXXXXX"
+                  maxlength="12"
+                  placeholder="9XX XXX XXXX"
                   value="<?= e($phonePosted) ?>"
                   aria-describedby="phoneLocalWarn"
+                  <?= $roleSelected === ROLE_BUSINESS ? '' : 'required' ?>
                 >
           </div>
               <div class="form-text text-danger d-none" id="phoneLocalWarn"></div>
@@ -563,8 +565,8 @@ $bizPhonePosted = ph_phone_local_digits((string) ($_POST['business_phone_local']
                 id="bizPhoneLocal"
                 inputmode="numeric"
                 autocomplete="off"
-                maxlength="10"
-                placeholder="9XXXXXXXXX"
+                maxlength="12"
+                placeholder="9XX XXX XXXX"
                 value="<?= e($bizPhonePosted) ?>"
                 aria-describedby="bizPhoneWarn"
                 <?= $roleSelected === ROLE_BUSINESS ? 'required' : '' ?>
@@ -616,15 +618,21 @@ $bizPhonePosted = ph_phone_local_digits((string) ($_POST['business_phone_local']
           $guideYearsPosted = preg_replace('/\D+/', '', (string) ($_POST['years_experience'] ?? '')) ?? '';
         ?>
         <div id="guideLangFields" class="mt-3 <?= $roleSelected === ROLE_TOUR_GUIDE ? '' : 'd-none' ?>" data-link-gap="languages">
-          <div class="row g-3 align-items-end">
-            <div class="col-12 col-md-3">
-              <label class="form-label">Years of experience</label>
+          <div class="row g-3">
+            <div class="col-12 col-md-6">
+              <label class="form-label" for="guideLicenseNumber">License no. <span class="text-danger">*</span></label>
+              <input class="form-control" name="license_number" id="guideLicenseNumber" maxlength="80"
+                     value="<?= e($_POST['license_number'] ?? '') ?>"
+                     <?= $roleSelected === ROLE_TOUR_GUIDE ? 'required' : '' ?>>
+            </div>
+            <div class="col-12 col-md-6">
+              <label class="form-label" for="guideYearsExp">Years of experience</label>
               <input type="number" class="form-control" name="years_experience" id="guideYearsExp"
                      value="<?= e($guideYearsPosted) ?>" min="0" max="80" step="1" inputmode="numeric"
                      placeholder="0">
             </div>
-            <div class="col-12 col-md-9">
-              <label class="form-label">Languages <span class="text-danger">*</span></label>
+            <div class="col-12">
+              <label class="form-label" for="guideLanguages">Languages <span class="text-danger">*</span></label>
               <input class="form-control js-lang-tags" name="languages" id="guideLanguages" maxlength="255"
                      value="<?= e($_POST['languages'] ?? '') ?>"
                      placeholder="Type a language, then press Enter"
@@ -682,8 +690,8 @@ $bizPhonePosted = ph_phone_local_digits((string) ($_POST['business_phone_local']
                   id="emergPhone"
                   inputmode="numeric"
                   autocomplete="off"
-                  maxlength="10"
-                  placeholder="9XXXXXXXXX"
+                  maxlength="12"
+                  placeholder="9XX XXX XXXX"
                   value="<?= e($emergPhonePosted) ?>"
                   aria-describedby="emergPhoneWarn emergDupWarn"
                   <?= $emergRequired ?>
@@ -878,6 +886,8 @@ roleSelect.addEventListener('change', function () {
   if (first) first.required = !isBiz;
   if (last) last.required = !isBiz;
   if (accEmail) accEmail.required = !isBiz;
+  const accountPhone = document.getElementById('phoneLocal');
+  if (accountPhone) accountPhone.required = !isBiz;
   const repFirst = document.getElementById('repFirst');
   const repLast = document.getElementById('repLast');
   const bizEmail = document.getElementById('bizEmail');
@@ -926,6 +936,11 @@ roleSelect.addEventListener('change', function () {
     guideLang.required = v === '<?= ROLE_TOUR_GUIDE ?>';
     guideLang.disabled = v !== '<?= ROLE_TOUR_GUIDE ?>';
     if (window.CulTourLangTags) CulTourLangTags.sync(guideLang);
+  }
+  const guideLicense = document.getElementById('guideLicenseNumber');
+  if (guideLicense) {
+    guideLicense.required = isGuide;
+    guideLicense.disabled = !isGuide;
   }
   const touristLangWrap = document.getElementById('touristLangWrap');
   const touristLang = document.getElementById('touristLanguages');
@@ -1130,16 +1145,23 @@ roleSelect.addEventListener('change', function () {
 
 (function () {
   function capFirst(el) {
-    if (!el) return;
+    if (!el || (el.name && /suffix/i.test(el.name))) return;
     const v = el.value;
     if (!v) return;
-    el.value = v.charAt(0).toUpperCase() + v.slice(1);
+    const next = v.replace(/[A-Za-zÀ-ÖØ-öø-ÿÑñ]+/g, function (word) {
+      return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+    });
+    if (next === v) return;
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    el.value = next;
+    if (typeof start === 'number' && el.setSelectionRange) {
+      try { el.setSelectionRange(start, end); } catch (err) {}
+    }
   }
   document.querySelectorAll('.name-cap').forEach(function (el) {
     el.addEventListener('blur', function () { capFirst(el); });
-    el.addEventListener('input', function () {
-      if (el.value.length === 1) capFirst(el);
-    });
+    el.addEventListener('input', function () { capFirst(el); });
   });
 
   function nameLettersLabel(input) {
@@ -1465,9 +1487,12 @@ roleSelect.addEventListener('change', function () {
         input.classList.remove('is-invalid');
       }
     }
+    function digits() {
+      return String(input.value || '').replace(/\D+/g, '').slice(0, 10);
+    }
     function checkTaken() {
       if (!emailInputId) return;
-      const d = String(input.value || '');
+      const d = digits();
       if (d.length !== 10 || phoneMessage(d, true)) return;
       const emailEl = document.getElementById(emailInputId);
       const email = emailEl ? String(emailEl.value || '').trim().toLowerCase() : '';
@@ -1479,7 +1504,7 @@ roleSelect.addEventListener('change', function () {
       })
         .then(function (r) { return r.json(); })
         .then(function (data) {
-          if (seq !== checkSeq || String(input.value || '') !== d) return;
+          if (seq !== checkSeq || digits() !== d) return;
           if (data && data.ok && data.available === false) {
             input._phoneTaken = true;
             show((data.message && String(data.message)) || 'This phone number is already used by another CulTour account.');
@@ -1492,15 +1517,11 @@ roleSelect.addEventListener('change', function () {
         });
     }
     input.addEventListener('input', function () {
-      let d = input.value.replace(/\D+/g, '');
-      if (d.indexOf('63') === 0 && d.length > 10) d = d.slice(2);
-      while (d.charAt(0) === '0') d = d.slice(1);
-      input.value = d.slice(0, 10);
       input._phoneTaken = false;
-      show(phoneMessage(input.value, false));
+      show(phoneMessage(digits(), false));
     });
     input.addEventListener('blur', function () {
-      const msg = phoneMessage(input.value, true);
+      const msg = phoneMessage(digits(), true);
       show(msg);
       if (!msg) checkTaken();
     });
@@ -1508,7 +1529,7 @@ roleSelect.addEventListener('change', function () {
       const emailEl = document.getElementById(emailInputId);
       if (emailEl) {
         emailEl.addEventListener('blur', function () {
-          if (String(input.value || '').length === 10) checkTaken();
+          if (digits().length === 10) checkTaken();
         });
       }
     }
@@ -2021,7 +2042,7 @@ roleSelect.addEventListener('change', function () {
         }
       }
       if (role !== '<?= ROLE_BUSINESS ?>' && phone) {
-        const msg = phoneMessage(phone.value, true);
+        const msg = phoneMessage(String(phone.value || '').replace(/\D+/g, ''), true);
         if (msg) {
           e.preventDefault();
           if (phone._showPhoneWarn) phone._showPhoneWarn(msg);
@@ -2036,7 +2057,7 @@ roleSelect.addEventListener('change', function () {
         }
       }
       if ((role === '<?= ROLE_TOURIST ?>' || role === '<?= ROLE_TOUR_GUIDE ?>') && emergPhone) {
-        const emsg = phoneMessage(emergPhone.value, true);
+        const emsg = phoneMessage(String(emergPhone.value || '').replace(/\D+/g, ''), true);
         if (emsg) {
           e.preventDefault();
           if (emergPhone._showPhoneWarn) emergPhone._showPhoneWarn(emsg);
@@ -2054,7 +2075,7 @@ roleSelect.addEventListener('change', function () {
         }
       }
       if (role === '<?= ROLE_BUSINESS ?>' && bizPhoneLocal) {
-        const bmsg = phoneMessage(bizPhoneLocal.value, true);
+        const bmsg = phoneMessage(String(bizPhoneLocal.value || '').replace(/\D+/g, ''), true);
         if (bmsg) {
           e.preventDefault();
           if (bizPhoneLocal._showPhoneWarn) bizPhoneLocal._showPhoneWarn(bmsg);

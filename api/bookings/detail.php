@@ -42,5 +42,6 @@ json_response([
     'ok' => true,
     'code' => (string) $booking['booking_code'],
     'status' => (string) $booking['status'],
-    'html' => booking_detail_cards_html($booking, $certUrl),
+    'itinerary_id' => (int) ($booking['itinerary_id'] ?? 0),
+    'html' => booking_tourist_summary_html($booking),
 ]);

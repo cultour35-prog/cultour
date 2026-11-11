@@ -1,13 +1,56 @@
 <?php
 require_once __DIR__ . '/../includes/auth.php';
-$user = require_login(ROLE_TOURIST);
+$packageMaker = !empty($GLOBALS['CULTOUR_PACKAGE_MAKER']);
+if (!$packageMaker) {
+    $user = require_login(ROLE_TOURIST);
+} elseif (empty($user['id'])) {
+    redirect(APP_URL . '/business/dashboard.php');
+}
 ensure_itinerary_items_schema();
 ensure_place_schedule_schema();
-$pageTitle = 'Itineraries';
-$pageHeading = 'My Itineraries';
-$pageSub = 'CulTour · Ormoc City';
+
+function itinerary_content_hash(int $itineraryId): string
+{
+    if ($itineraryId < 1) {
+        return '';
+    }
+    $head = db()->prepare('SELECT title, start_date, end_date, party_size FROM itineraries WHERE id=? LIMIT 1');
+    $head->execute([$itineraryId]);
+    $itin = $head->fetch(PDO::FETCH_ASSOC) ?: [];
+    $items = db()->prepare(
+        'SELECT destination_id, business_id, visit_date, start_time, end_time, travel_minutes, visit_minutes, sort_order
+         FROM itinerary_items WHERE itinerary_id=? ORDER BY sort_order, id'
+    );
+    $items->execute([$itineraryId]);
+    $meetups = [];
+    try {
+        $meet = db()->prepare(
+            'SELECT day_number, destination_id, business_id, meetup_time, visit_date
+             FROM itinerary_day_meetups WHERE itinerary_id=? ORDER BY day_number'
+        );
+        $meet->execute([$itineraryId]);
+        $meetups = $meet->fetchAll(PDO::FETCH_ASSOC) ?: [];
+    } catch (Throwable $e) {
+        $meetups = [];
+    }
+    $payload = [
+        'title' => trim((string) ($itin['title'] ?? '')),
+        'start' => (string) ($itin['start_date'] ?? ''),
+        'end' => (string) ($itin['end_date'] ?? ''),
+        'party' => (int) ($itin['party_size'] ?? 0),
+        'stops' => $items->fetchAll(PDO::FETCH_ASSOC) ?: [],
+        'meetups' => $meetups,
+    ];
+    return hash('sha256', json_encode($payload, JSON_UNESCAPED_UNICODE));
+}
+if (!$packageMaker) {
+    $GLOBALS['CULTOUR_VIEW_ITINERARY_ID'] = (int) ($_GET['id'] ?? 0);
+}
+$pageTitle = $packageMaker ? 'Package maker' : 'Itineraries';
+$pageHeading = $packageMaker ? 'Package maker' : 'My Itineraries';
+$pageSub = $packageMaker ? (string) ($GLOBALS['CULTOUR_PACKAGE_NAME'] ?? 'Tour and travel') : 'CulTour · Ormoc City';
 $touristHidePagehead = true; // custom title row with tour chips beside heading
-$activeNav = 'itineraries';
+$activeNav = $packageMaker ? 'package-maker' : 'itineraries';
 $bodyClass = 'itin-page';
 
 $skipPlaceCatalog = $_SERVER['REQUEST_METHOD'] === 'POST'
@@ -16,6 +59,7 @@ $skipPlaceCatalog = $_SERVER['REQUEST_METHOD'] === 'POST'
 $destinations = [];
 $businesses = [];
 $placeVisitLimits = [];
+$placeVisitMins = [];
 $favoriteDestinations = [];
 $favoriteDestIds = [];
 $favoriteBizIds = [];
@@ -30,7 +74,7 @@ if (!$skipPlaceCatalog) {
     )->fetchAll();
     $businesses = db()->query(
         "SELECT b.id, b.name, b.address, b.description, b.cover_image, b.latitude, b.longitude,
-                b.default_visit_minutes, b.visit_duration_minutes, bt.name AS type_name, " . business_itinerary_ready_columns() . "
+                b.default_visit_minutes, b.visit_duration_minutes, b.min_visit_minutes, bt.name AS type_name, " . business_itinerary_ready_columns() . "
          FROM businesses b
          JOIN business_types bt ON bt.id = b.business_type_id
          WHERE b.approval_status='approved' AND b.status='active'
@@ -41,6 +85,7 @@ if (!$skipPlaceCatalog) {
     }
     foreach ($businesses as $b) {
         $placeVisitLimits['b' . (int) $b['id']] = place_visit_limit($b['visit_duration_minutes'] ?? null);
+        $placeVisitMins['b' . (int) $b['id']] = place_min_visit($b['min_visit_minutes'] ?? null);
     }
     $destinations = array_values(array_filter($destinations, 'destination_itinerary_ready'));
     $businesses = array_values(array_filter($businesses, 'business_itinerary_ready'));
@@ -96,6 +141,15 @@ function itin_reject_if_booked(int $iid): void
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
     $action = $_POST['action'] ?? 'create';
+    if ($packageMaker && $action === 'itinerary_changed') {
+        $iid = (int) ($_POST['itinerary_id'] ?? 0);
+        $baseline = (string) ($_POST['baseline'] ?? '');
+        $now = $iid > 0 && itin_owned($iid, (int) $user['id']) ? itinerary_content_hash($iid) : '';
+        $changed = $now !== '' && strlen($baseline) === 64 && !hash_equals($baseline, $now);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['ok' => true, 'changed' => $changed], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
     $bookedLockActions = [
         'save_draft', 'update_title', 'update_party_size', 'update_draft_guide', 'update_meetup', 'update_day_date', 'update_day_meetup', 'auto_regenerate',
         'reorder_stops', 'delete', 'clear_stops', 'add_stop', 'remove_stop', 'update_stop_stay', 'book_guide',
@@ -104,9 +158,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
         itin_reject_if_booked((int) ($_POST['itinerary_id'] ?? $_POST['id'] ?? 0));
     }
 
-    if (in_array($action, ['reserve_submit', 'reserve_cancel', 'reserve_replace'], true)) {
+    if (in_array($action, ['reserve_submit', 'reserve_cancel', 'reserve_replace', 'reserve_draft_clear', 'reserve_finalize'], true)) {
         $iid = (int) ($_POST['itinerary_id'] ?? 0);
         $back = APP_URL . '/tourist/itineraries.php' . ($iid > 0 ? '?id=' . $iid : '');
+        if ($action === 'reserve_draft_clear') {
+            $itemId = (int) ($_POST['item_id'] ?? 0);
+            if (itin_owned($iid, (int) $user['id']) && $itemId > 0) {
+                db()->prepare('UPDATE itinerary_items SET reservation_draft=NULL WHERE id=? AND itinerary_id=?')
+                    ->execute([$itemId, $iid]);
+            }
+            redirect($back);
+        }
+        if ($action === 'reserve_finalize') {
+            $result = reservation_commit_held_replacements((int) $user['id'], $iid);
+            flash($result['ok'] ? 'success' : 'error', $result['message']);
+            redirect($result['ok'] ? APP_URL . '/tourist/dashboard.php' : $back);
+        }
         if ($action === 'reserve_submit') {
             $result = reservation_submit(
                 (int) $user['id'],
@@ -122,7 +189,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
         } else {
             $result = reservation_replace_restaurant((int) $user['id'], (int) ($_POST['item_id'] ?? 0), (int) ($_POST['business_id'] ?? 0));
         }
-        flash($result['ok'] ? 'success' : 'error', $result['message']);
+        if ($action !== 'reserve_submit' && $action !== 'reserve_replace' && !$result['ok']) {
+            flash('error', $result['message']);
+        } elseif ($action !== 'reserve_submit' && $action !== 'reserve_replace' && $result['ok']) {
+            flash('success', $result['message']);
+        }
+        $queue = array_values(array_filter(array_map('intval', explode(',', (string) ($_POST['reserve_queue'] ?? '')))));
+        if ($action === 'reserve_replace' && !empty($result['ok'])) {
+            $replaced = (int) ($_POST['item_id'] ?? 0);
+            if ($replaced > 0) {
+                $queue[] = $replaced;
+            }
+        }
+        if ($queue) {
+            $next = (int) array_shift($queue);
+            $back .= (str_contains($back, '?') ? '&' : '?') . 'reserve=' . $next;
+            if ($queue) {
+                $back .= '&queue=' . implode(',', $queue);
+            }
+        }
         redirect($back);
     }
 
@@ -228,6 +313,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
                     ->execute([$iid, $user['id']]);
             }
         }
+        $draftTitle = trim((string) ($_POST['title'] ?? ''));
+        if ($draftTitle !== '' && !itinerary_is_placeholder_title($draftTitle)) {
+            db()->prepare('UPDATE itineraries SET title=? WHERE id=? AND user_id=?')
+                ->execute([$draftTitle, $iid, $user['id']]);
+        }
         $postedStart = normalize_tour_date($_POST['start_date'] ?? null);
         if ($postedStart !== null && $postedStart >= date('Y-m-d')) {
             $curStart = db()->prepare('SELECT start_date FROM itineraries WHERE id=? AND user_id=?');
@@ -244,8 +334,67 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
             echo json_encode(['ok' => true, 'id' => $iid], JSON_UNESCAPED_UNICODE);
             exit;
         }
-        flash('success', 'Tour saved as draft.');
-        redirect(APP_URL . '/tourist/itineraries.php?id=' . $iid);
+        flash('success', $packageMaker ? 'Draft saved.' : 'Tour saved as draft.');
+        redirect($packageMaker
+            ? APP_URL . '/business/package.php?id=' . (int) ($GLOBALS['CULTOUR_PACKAGE_ID'] ?? 0)
+            : APP_URL . '/tourist/itineraries.php?id=' . $iid);
+    }
+
+    if ($packageMaker && $action === 'save_as_new' && itin_owned((int) ($_POST['itinerary_id'] ?? 0), (int) $user['id'])) {
+        $iid = (int) $_POST['itinerary_id'];
+        require_once __DIR__ . '/../includes/payments.php';
+        $copy = itinerary_duplicate($iid);
+        $newId = (int) ($copy['id'] ?? 0);
+        if ($newId < 1) {
+            flash('error', 'Could not save a new itinerary.');
+        } else {
+            db()->prepare("UPDATE itineraries SET title=TRIM(CONCAT(title, ' copy')) WHERE id=?")->execute([$newId]);
+            flash('success', 'Saved as a new itinerary. This package stays linked to the original.');
+        }
+        redirect(APP_URL . '/business/package.php?id=' . (int) ($GLOBALS['CULTOUR_PACKAGE_ID'] ?? 0));
+    }
+
+    if ($packageMaker && $action === 'package_guide_qr') {
+        require_once __DIR__ . '/../includes/payments.php';
+        $amount = round(max(0, (float) ($_POST['amount'] ?? 0)), 2);
+        $guide = trim((string) ($_POST['guide_name'] ?? ''));
+        $label = 'CulTour GCash ' . format_money($amount) . ($guide !== '' ? ' ' . $guide : '');
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['ok' => true, 'qr' => payment_qr_data_uri($label)], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    if ($packageMaker && $action === 'save_package_limits' && itin_owned((int) ($_POST['itinerary_id'] ?? 0), (int) $user['id'])) {
+        $iid = (int) $_POST['itinerary_id'];
+        $minRaw = trim((string) ($_POST['package_min_pax'] ?? ''));
+        $maxRaw = trim((string) ($_POST['package_max_pax'] ?? ''));
+        $priceRaw = trim((string) ($_POST['package_price'] ?? ''));
+        $sets = [];
+        $params = [];
+        if ($minRaw !== '' && (int) $minRaw >= 1 && (int) $minRaw <= 50) {
+            $sets[] = 'package_min_pax=?';
+            $params[] = (int) $minRaw;
+        }
+        if ($maxRaw !== '' && (int) $maxRaw >= 1 && (int) $maxRaw <= 50) {
+            $sets[] = 'capacity=?';
+            $params[] = (int) $maxRaw;
+            db()->prepare('UPDATE itineraries SET party_size=? WHERE id=? AND user_id=?')
+                ->execute([(int) $maxRaw, $iid, (int) $user['id']]);
+        }
+        if ($priceRaw !== '' && round((float) $priceRaw, 2) > 0) {
+            $sets[] = 'price=?';
+            $params[] = round((float) $priceRaw, 2);
+        }
+        if ($sets) {
+            $params[] = (int) ($GLOBALS['CULTOUR_PACKAGE_ID'] ?? 0);
+            $params[] = (int) ($GLOBALS['CULTOUR_PACKAGE_BUSINESS_ID'] ?? 0);
+            db()->prepare(
+                'UPDATE business_services SET ' . implode(', ', $sets) . ' WHERE id=? AND business_id=?'
+            )->execute($params);
+        }
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['ok' => true], JSON_UNESCAPED_UNICODE);
+        exit;
     }
 
     if ($action === 'update_party_size' && itin_owned((int) ($_POST['itinerary_id'] ?? 0), (int) $user['id'])) {
@@ -254,12 +403,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
         $wantsJson = str_contains((string) ($_SERVER['HTTP_ACCEPT'] ?? ''), 'application/json')
             || strcasecmp((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? ''), 'XMLHttpRequest') === 0;
         if ($party < 1 || $party > 20) {
+            $partyMsg = $packageMaker ? 'Enter the participants.' : 'Enter the number of guests.';
             if ($wantsJson) {
                 header('Content-Type: application/json; charset=utf-8');
-                echo json_encode(['ok' => false, 'message' => 'Enter the number of guests.'], JSON_UNESCAPED_UNICODE);
+                echo json_encode(['ok' => false, 'message' => $partyMsg], JSON_UNESCAPED_UNICODE);
                 exit;
             }
-            flash('error', 'Enter the number of guests.');
+            flash('error', $partyMsg);
             redirect(APP_URL . '/tourist/itineraries.php?id=' . $iid);
         }
         db()->prepare('UPDATE itineraries SET party_size=? WHERE id=? AND user_id=?')
@@ -621,15 +771,39 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
             $extra = itinerary_schedule_json_extra($iid, $row, $meetup ? (format_time_12h($meetup) ?: $meetup) : '');
             return $extra;
         };
+        if ($packageMaker && !empty($_POST['package_date_tourist'])) {
+            $dayCount = max(1, min(itinerary_max_days(), (int) $postedDayCount));
+            db()->prepare(
+                'UPDATE itineraries SET meetup_time=?, start_date=NULL, end_date=NULL, template_day_count=? WHERE id=? AND user_id=?'
+            )->execute([$meetup, $dayCount, $iid, $user['id']]);
+            db()->prepare(
+                "UPDATE business_services SET package_date_mode='tourist', package_fixed_date=NULL, package_close_date=NULL WHERE id=? AND business_id=?"
+            )->execute([(int) ($GLOBALS['CULTOUR_PACKAGE_ID'] ?? 0), (int) ($GLOBALS['CULTOUR_PACKAGE_BUSINESS_ID'] ?? 0)]);
+            $respondMeetup(true, '', $jsonExtra());
+        }
         // Blank date is allowed for drafts — required only when booking a guide.
         // An empty post must not wipe a date already saved on the draft.
         if ($startDate === null) {
             $keepDates = db()->prepare('SELECT start_date FROM itineraries WHERE id=? AND user_id=?');
             $keepDates->execute([$iid, $user['id']]);
-            if (normalize_tour_date($keepDates->fetchColumn() ?: null) !== null) {
+            $keptStart = normalize_tour_date($keepDates->fetchColumn() ?: null);
+            if ($keptStart !== null) {
                 db()->prepare(
                     'UPDATE itineraries SET meetup_time=?, template_day_count=? WHERE id=? AND user_id=?'
                 )->execute([$meetup, $dayCount, $iid, $user['id']]);
+                if ($packageMaker) {
+                    $postedClose = normalize_tour_date($_POST['package_close_date'] ?? null);
+                    $latestClose = package_cutoff_date($keptStart);
+                    if ($postedClose !== null && $latestClose !== null && $postedClose > $latestClose) {
+                        $postedClose = $latestClose;
+                    }
+                    db()->prepare('UPDATE business_services SET package_close_date=? WHERE id=? AND business_id=?')
+                        ->execute([
+                            $postedClose,
+                            (int) ($GLOBALS['CULTOUR_PACKAGE_ID'] ?? 0),
+                            (int) ($GLOBALS['CULTOUR_PACKAGE_BUSINESS_ID'] ?? 0),
+                        ]);
+                }
                 $respondMeetup(true, '', $jsonExtra());
             }
             if (!empty($_POST['drop_later_stops'])) {
@@ -647,6 +821,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
                 // ignore
             }
             $respondMeetup(true, '', $jsonExtra());
+        }
+        if ($packageMaker && $startDate < package_tour_earliest_date()) {
+            $respondMeetup(false, 'The package tour date must be at least 2 days from today.');
         }
         if ($startDate < date('Y-m-d')) {
             $respondMeetup(false, 'Choose a tour date that is today or later.');
@@ -693,6 +870,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
         }
         $extra = $jsonExtra();
         $extra['reordered'] = $reordered;
+        if ($packageMaker && $startDate !== null && $startDate !== '') {
+            $closeDate = normalize_tour_date($_POST['package_close_date'] ?? null);
+            $latestClose = package_cutoff_date($startDate);
+            if ($closeDate !== null && $latestClose !== null && $closeDate > $latestClose) {
+                $respondMeetup(false, 'The package cut off must be at least 2 days before the tour date.');
+            }
+            db()->prepare(
+                "UPDATE business_services SET package_date_mode='fixed', package_fixed_date=?, package_close_date=? WHERE id=? AND business_id=?"
+            )->execute([$startDate, $closeDate, (int) ($GLOBALS['CULTOUR_PACKAGE_ID'] ?? 0), (int) ($GLOBALS['CULTOUR_PACKAGE_BUSINESS_ID'] ?? 0)]);
+        }
         $respondMeetup(true, '', $extra);
     }
 
@@ -748,6 +935,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
             || trim((string) ($_POST['stop_key'] ?? '')) === 'port';
         $clear = !empty($_POST['clear']) || !empty($_POST['reset']);
         $meetupTimeIn = trim((string) ($_POST['meetup_time'] ?? ''));
+        if (!$packageMaker && $meetupTimeIn !== '') {
+            $hourWindows = tourist_meetup_hour_windows();
+            $dayDates = itinerary_visit_dates_list($iid);
+            $dayYmd = $dayDates[$dayNum - 1] ?? null;
+            $dayTs = $dayYmd ? strtotime($dayYmd . ' 12:00:00') : false;
+            $win = ($dayTs !== false) ? ($hourWindows[(string) (int) date('w', $dayTs)] ?? null) : null;
+            $pickedMins = itin_time_to_minutes($meetupTimeIn);
+            if ($win && $pickedMins !== null) {
+                $openMins = itin_time_to_minutes($win['min']);
+                $cutMins = itin_time_to_minutes($win['max']);
+                if ($openMins !== null && $cutMins !== null && ($pickedMins < $openMins || $pickedMins > $cutMins)) {
+                    $msg = 'Meetup time must be between ' . format_time_12h($win['min']) . ' and '
+                        . format_time_12h($win['max']) . ', when a tour guide can be booked.';
+                    if ($wantsJson) {
+                        header('Content-Type: application/json; charset=utf-8');
+                        echo json_encode(['ok' => false, 'message' => $msg], JSON_UNESCAPED_UNICODE);
+                        exit;
+                    }
+                    flash('error', $msg);
+                    redirect(APP_URL . '/tourist/itineraries.php?id=' . $iid);
+                }
+            }
+        }
         $timeOnly = !empty($_POST['time_only']);
         $ref = null;
         if ($timeOnly) {
@@ -1072,6 +1282,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
             flash('error', $limitMsg);
             redirect(APP_URL . '/tourist/itineraries.php?id=' . $iid);
         }
+        $minMsg = itinerary_visit_min_message((string) ($place['name'] ?? ''), $place['min_visit_minutes'] ?? null, $visitMins);
+        if ($minMsg !== null) {
+            flash('error', $minMsg);
+            redirect(APP_URL . '/tourist/itineraries.php?id=' . $iid);
+        }
 
         $newTime = trim((string) ($_POST['start_time'] ?? ''));
         $newMins = itin_time_to_minutes($newTime);
@@ -1166,6 +1381,269 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
             flash($res['ok'] ? 'success' : 'error', $res['message']);
         }
         redirect(APP_URL . '/tourist/itineraries.php?id=' . $iid);
+    }
+
+    if ($packageMaker && $action === 'book_guide') {
+        if ((string) ($_POST['itinerary_save_mode'] ?? '') === 'new') {
+            require_once __DIR__ . '/../includes/payments.php';
+            $sourceId = (int) ($_POST['itinerary_id'] ?? 0);
+            if ($sourceId > 0 && itin_owned($sourceId, (int) $user['id'])) {
+                $copy = itinerary_duplicate($sourceId);
+                $newId = (int) ($copy['id'] ?? 0);
+                if ($newId > 0) {
+                    db()->prepare("UPDATE itineraries SET title=TRIM(CONCAT(title, ' copy')) WHERE id=?")->execute([$newId]);
+                }
+            }
+        }
+        $price = round(max(0, (float) ($_POST['package_price'] ?? 0)), 2);
+        if ($price <= 0) {
+            flash('error', 'Enter the price per person.');
+            redirect(APP_URL . '/business/package.php?id=' . (int) $GLOBALS['CULTOUR_PACKAGE_ID']);
+        }
+        $madeName = trim((string) ($_POST['title'] ?? ''));
+        if ($madeName === '') {
+            $nameSt = db()->prepare('SELECT title FROM itineraries WHERE id=? LIMIT 1');
+            $nameSt->execute([(int) ($_POST['itinerary_id'] ?? 0)]);
+            $madeName = trim((string) $nameSt->fetchColumn());
+        }
+        if ($madeName === '' || strcasecmp($madeName, 'Unnamed') === 0) {
+            $madeName = (string) ($GLOBALS['CULTOUR_PACKAGE_NAME'] ?? 'Package');
+        }
+        $modeSt = db()->prepare('SELECT package_date_mode, package_fixed_date FROM business_services WHERE id=? AND business_id=?');
+        $modeSt->execute([(int) $GLOBALS['CULTOUR_PACKAGE_ID'], (int) ($GLOBALS['CULTOUR_PACKAGE_BUSINESS_ID'] ?? 0)]);
+        $modeRow = $modeSt->fetch() ?: [];
+        $dateMode = (string) ($modeRow['package_date_mode'] ?? 'tourist') === 'fixed' ? 'fixed' : 'tourist';
+        $fixedDate = $dateMode === 'fixed' ? normalize_tour_date($modeRow['package_fixed_date'] ?? null) : null;
+        if ($dateMode !== 'fixed') {
+            $dateSt = db()->prepare('SELECT start_date FROM itineraries WHERE id=? LIMIT 1');
+            $dateSt->execute([(int) ($_POST['itinerary_id'] ?? 0)]);
+            $typedDate = normalize_tour_date($dateSt->fetchColumn() ?: null);
+            if ($typedDate !== null) {
+                $dateMode = 'fixed';
+                $fixedDate = $typedDate;
+            }
+        }
+        $guideId = (int) ($_POST['guide_id'] ?? 0);
+        $stayJson = json_encode([
+            'business_id' => (int) ($_POST['accommodation_business_id'] ?? 0),
+            'service_id' => (int) ($_POST['accommodation_service_id'] ?? 0),
+            'declined' => (int) ($_POST['accommodation_declined'] ?? 0) === 1 ? 1 : 0,
+        ], JSON_UNESCAPED_UNICODE);
+        $rideJson = json_encode([
+            'business_id' => (int) ($_POST['transportation_business_id'] ?? 0),
+            'service_id' => (int) ($_POST['transportation_service_id'] ?? 0),
+            'declined' => (int) ($_POST['transportation_declined'] ?? 0) === 1 ? 1 : 0,
+        ], JSON_UNESCAPED_UNICODE);
+        $itinId = (int) ($_POST['itinerary_id'] ?? 0);
+        if ($dateMode === 'fixed' && $fixedDate) {
+            db()->prepare('UPDATE itineraries SET start_date=? WHERE id=?')->execute([$fixedDate, $itinId]);
+        }
+        $span = db()->prepare('SELECT start_date, end_date, party_size FROM itineraries WHERE id=? LIMIT 1');
+        $span->execute([$itinId]);
+        $spanRow = $span->fetch() ?: [];
+        $packageDays = 1;
+        $startTs = strtotime((string) ($spanRow['start_date'] ?? ''));
+        $endTs = strtotime((string) ($spanRow['end_date'] ?? ''));
+        if ($startTs && $endTs && $endTs >= $startTs) {
+            $packageDays = (int) floor(($endTs - $startTs) / 86400) + 1;
+        }
+        $packageDays = max(1, $packageDays);
+        $minPax = (int) ($_POST['package_min_pax'] ?? 0);
+        $maxPax = (int) ($_POST['package_max_pax'] ?? 0);
+        if ($minPax < 1 || $maxPax < 1 || $minPax > $maxPax) {
+            flash('error', 'Enter the minimum and maximum participants.');
+            redirect(APP_URL . '/business/package.php?id=' . (int) $GLOBALS['CULTOUR_PACKAGE_ID']);
+        }
+        if ($dateMode === 'fixed' && !$fixedDate) {
+            flash('error', 'Set the package tour date.');
+            redirect(APP_URL . '/business/package.php?id=' . (int) $GLOBALS['CULTOUR_PACKAGE_ID']);
+        }
+        $postedClose = normalize_tour_date($_POST['package_close_date'] ?? null);
+        if ($dateMode === 'fixed' && $postedClose === null) {
+            flash('error', 'Set the package cut off.');
+            redirect(APP_URL . '/business/package.php?id=' . (int) $GLOBALS['CULTOUR_PACKAGE_ID']);
+        }
+        if ($dateMode === 'fixed' && $fixedDate < package_tour_earliest_date()) {
+            flash('error', 'The package tour date must be at least 2 days from today.');
+            redirect(APP_URL . '/business/package.php?id=' . (int) $GLOBALS['CULTOUR_PACKAGE_ID']);
+        }
+        $latestClose = $dateMode === 'fixed' ? package_cutoff_date($fixedDate) : null;
+        if ($dateMode === 'fixed' && $postedClose !== null && $latestClose !== null && $postedClose > $latestClose) {
+            flash('error', 'The package cut off must be at least 2 days before the tour date.');
+            redirect(APP_URL . '/business/package.php?id=' . (int) $GLOBALS['CULTOUR_PACKAGE_ID']);
+        }
+        $pax = $maxPax;
+        db()->prepare('UPDATE itineraries SET party_size=? WHERE id=?')->execute([$pax, $itinId]);
+        $inclusionTags = [];
+        foreach (preg_split('/,/', (string) ($_POST['package_inclusions'] ?? '')) ?: [] as $inclusionTag) {
+            $inclusionTag = trim($inclusionTag);
+            if ($inclusionTag === '' || mb_strlen($inclusionTag) > 40 || isset($inclusionTags[mb_strtolower($inclusionTag)])) {
+                continue;
+            }
+            $inclusionTags[mb_strtolower($inclusionTag)] = $inclusionTag;
+            if (count($inclusionTags) >= 8) {
+                break;
+            }
+        }
+        $inclusions = $inclusionTags ? implode(', ', $inclusionTags) : null;
+        $packageDescription = trim((string) ($_POST['package_description'] ?? ''));
+        if ($packageDescription === '') {
+            flash('error', 'Enter the package description.');
+            redirect(APP_URL . '/business/package.php?id=' . (int) $GLOBALS['CULTOUR_PACKAGE_ID']);
+        }
+        if (mb_strlen($packageDescription) > 120) {
+            $packageDescription = mb_substr($packageDescription, 0, 120);
+        }
+        if (!$inclusions) {
+            flash('error', 'Add at least one inclusion.');
+            redirect(APP_URL . '/business/package.php?id=' . (int) $GLOBALS['CULTOUR_PACKAGE_ID']);
+        }
+        $coverPath = null;
+        if (!empty($_FILES['package_cover']['name'])) {
+            $coverPath = upload_file($_FILES['package_cover'], 'businesses', ['jpg', 'jpeg', 'png', 'webp', 'gif']);
+            if (!$coverPath) {
+                flash('error', upload_last_error() ?: 'Cover photo upload failed. Use a JPG, PNG, or WebP image.');
+                redirect(APP_URL . '/business/package.php?id=' . (int) $GLOBALS['CULTOUR_PACKAGE_ID']);
+            }
+        } else {
+            $existingCover = db()->prepare('SELECT image_path FROM business_services WHERE id=? AND business_id=?');
+            $existingCover->execute([(int) $GLOBALS['CULTOUR_PACKAGE_ID'], (int) ($GLOBALS['CULTOUR_PACKAGE_BUSINESS_ID'] ?? 0)]);
+            if (trim((string) $existingCover->fetchColumn()) === '') {
+                flash('error', 'Add a cover photo.');
+                redirect(APP_URL . '/business/package.php?id=' . (int) $GLOBALS['CULTOUR_PACKAGE_ID']);
+            }
+        }
+        $coverSql = $coverPath !== null ? ', image_path=?' : '';
+        $coverParams = $coverPath !== null ? [$coverPath] : [];
+        $listNow = true;
+        db()->prepare(
+            'UPDATE business_services
+             SET name=?, description=?, price=?, package_made=?, is_active=?, package_awaiting=?, package_date_mode=?, package_fixed_date=?, package_close_date=?,
+                 package_guide_id=?, package_stay_json=?, package_ride_json=?, package_days=?, capacity=?, package_min_pax=?, package_inclusions=?'
+            . $coverSql . '
+             WHERE id=? AND business_id=?'
+        )->execute(array_merge([
+            $madeName,
+            $packageDescription !== '' ? $packageDescription : null,
+            $price,
+            $listNow ? 1 : 0,
+            $listNow ? 1 : 0,
+            $listNow ? 0 : 1,
+            $dateMode,
+            $fixedDate,
+            $dateMode === 'fixed' ? $postedClose : null,
+            $guideId > 0 ? $guideId : null,
+            $stayJson,
+            $rideJson,
+            $packageDays,
+            $pax,
+            $minPax,
+            $inclusions,
+        ], $coverParams, [
+            (int) $GLOBALS['CULTOUR_PACKAGE_ID'],
+            (int) ($GLOBALS['CULTOUR_PACKAGE_BUSINESS_ID'] ?? 0),
+        ]));
+        db()->prepare("UPDATE itineraries SET kept_as_draft=0, status='active' WHERE id=?")->execute([$itinId]);
+        package_stops_delete_for_service((int) $GLOBALS['CULTOUR_PACKAGE_ID']);
+        $stopRows = db()->prepare(
+            'SELECT destination_id, business_id, visit_minutes, visit_date, sort_order
+             FROM itinerary_items WHERE itinerary_id=? ORDER BY sort_order, id'
+        );
+        $stopRows->execute([$itinId]);
+        $insertStop = db()->prepare(
+            'INSERT INTO package_stops (service_id, day_number, sort_order, destination_id, business_id, visit_minutes)
+             VALUES (?,?,?,?,?,?)'
+        );
+        $anchor = $startTs ?: null;
+        $daySort = [];
+        foreach ($stopRows->fetchAll() ?: [] as $stopRow) {
+            $day = 1;
+            $visitTs = strtotime((string) ($stopRow['visit_date'] ?? ''));
+            if ($anchor && $visitTs && $visitTs >= $anchor) {
+                $day = (int) floor(($visitTs - $anchor) / 86400) + 1;
+            }
+            $daySort[$day] = ($daySort[$day] ?? 0);
+            $insertStop->execute([
+                (int) $GLOBALS['CULTOUR_PACKAGE_ID'],
+                $day,
+                $daySort[$day],
+                (int) ($stopRow['destination_id'] ?? 0) > 0 ? (int) $stopRow['destination_id'] : null,
+                (int) ($stopRow['business_id'] ?? 0) > 0 ? (int) $stopRow['business_id'] : null,
+                max(1, (int) ($stopRow['visit_minutes'] ?? 60)),
+            ]);
+            $daySort[$day]++;
+        }
+        if ($dateMode === 'fixed') {
+            $toldBusiness = [];
+            $notifyPlace = static function (int $businessId) use (&$toldBusiness, $madeName, $fixedDate): void {
+                if ($businessId < 1 || isset($toldBusiness[$businessId])) {
+                    return;
+                }
+                $owner = db()->prepare(
+                    'SELECT b.user_id, b.name, bt.name AS type_name
+                     FROM businesses b JOIN business_types bt ON bt.id=b.business_type_id
+                     WHERE b.id=? LIMIT 1'
+                );
+                $owner->execute([$businessId]);
+                $place = $owner->fetch();
+                if (!$place) {
+                    return;
+                }
+                $kind = revenue_bookable_kind((string) ($place['type_name'] ?? ''));
+                if (!in_array($kind, ['food', 'beach', 'wellness', 'accommodation', 'transportation'], true)) {
+                    return;
+                }
+                $toldBusiness[$businessId] = true;
+                notify_user(
+                    (int) $place['user_id'],
+                    'booking_request',
+                    'Inclusive package',
+                    'Accept ' . $madeName . ' for ' . (string) $place['name'] . ' on ' . format_date((string) $fixedDate) . ' before it is listed.',
+                    in_array($kind, ['food', 'beach', 'wellness'], true)
+                        ? APP_URL . '/business/reservations.php'
+                        : APP_URL . '/business/dashboard.php'
+                );
+            };
+            $stopBiz = db()->prepare('SELECT DISTINCT business_id FROM itinerary_items WHERE itinerary_id=? AND business_id IS NOT NULL');
+            $stopBiz->execute([$itinId]);
+            foreach ($stopBiz->fetchAll(PDO::FETCH_COLUMN) ?: [] as $stopBusinessId) {
+                $notifyPlace((int) $stopBusinessId);
+            }
+            if ((int) ($_POST['accommodation_declined'] ?? 0) !== 1) {
+                $notifyPlace((int) ($_POST['accommodation_business_id'] ?? 0));
+            }
+            if ((int) ($_POST['transportation_declined'] ?? 0) !== 1) {
+                $notifyPlace((int) ($_POST['transportation_business_id'] ?? 0));
+            }
+            if ($guideId > 0) {
+                $guideRow = db()->prepare(
+                    "SELECT g.user_id, g.guide_type, u.first_name, u.last_name
+                     FROM tour_guide_profiles g JOIN users u ON u.id=g.user_id WHERE g.id=? LIMIT 1"
+                );
+                $guideRow->execute([$guideId]);
+                $guideRow = $guideRow->fetch() ?: [];
+                $guideName = trim((string) ($guideRow['first_name'] ?? '') . ' ' . (string) ($guideRow['last_name'] ?? ''));
+                if ((int) ($guideRow['user_id'] ?? 0) > 0) {
+                    notify_user((int) $guideRow['user_id'], 'guide_assignment', 'Inclusive package', 'Accept ' . $madeName . ' on ' . format_date((string) $fixedDate) . ' before it is listed.', APP_URL . '/tourguide/bookings.php');
+                }
+                if ((string) ($guideRow['guide_type'] ?? '') !== 'in_house') {
+                    $admins = db()->query("SELECT id FROM users WHERE role_id=" . (int) ROLE_ADMIN . " AND status='active'")->fetchAll(PDO::FETCH_COLUMN) ?: [];
+                    foreach ($admins as $adminId) {
+                        notify_user((int) $adminId, 'guide_request', 'Tour guide request', $madeName . ' needs ' . ($guideName !== '' ? $guideName : 'a system tour guide') . ' on ' . format_date((string) $fixedDate) . '.', APP_URL . '/admin/guide-requests.php');
+                    }
+                }
+            }
+            package_clearance_replace((int) $GLOBALS['CULTOUR_PACKAGE_ID'], array_keys($toldBusiness), $guideId);
+            package_clearance_publish_if_ready((int) $GLOBALS['CULTOUR_PACKAGE_ID']);
+        } else {
+            package_clearance_ensure_schema();
+            db()->prepare('DELETE FROM package_clearances WHERE service_id=?')->execute([(int) $GLOBALS['CULTOUR_PACKAGE_ID']]);
+        }
+        flash('success', $dateMode === 'fixed'
+            ? 'Inclusive package saved. It is listed under Packages made and Tour packages.'
+            : 'Package saved. It is listed under Packages made and Tour packages. Places are not reserved until a tourist books it.');
+        unset($_SESSION['pkg_itin_base_' . $itinId]);
+        redirect(APP_URL . '/business/services.php');
     }
 
     if ($action === 'book_guide' && itin_owned((int) ($_POST['itinerary_id'] ?? 0), (int) $user['id'])) {
@@ -1263,7 +1741,50 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
             'tour_end_date' => $tourEnd,
             'start_time' => $check['time'],
             'party_size' => $check['party'],
-            'notes' => trim($_POST['notes'] ?? ''),
+            'notes' => (function () use ($packageMaker) {
+                $notes = trim((string) ($_POST['notes'] ?? ''));
+                if ($packageMaker) {
+                    return $notes;
+                }
+                $lines = [];
+                $adults = max(0, (int) ($_POST['guide_adults'] ?? 0));
+                $children = max(0, (int) ($_POST['guide_children'] ?? 0));
+                $infants = max(0, (int) ($_POST['guide_infants'] ?? 0));
+                if ($adults + $children + $infants > 0) {
+                    $lines[] = 'Adults: ' . $adults;
+                    $lines[] = 'Children: ' . $children;
+                    if ($infants > 0) {
+                        $lines[] = 'Infant/toddler: ' . $infants . ' (not counted as guests)';
+                    }
+                }
+                $needs = json_decode((string) ($_POST['guide_needs'] ?? ''), true);
+                if (is_array($needs)) {
+                    foreach ($needs as $need) {
+                        if (!is_array($need)) {
+                            continue;
+                        }
+                        $label = trim((string) ($need['label'] ?? ''));
+                        if ($label === '') {
+                            continue;
+                        }
+                        $line = $label;
+                        $count = (int) ($need['count'] ?? 0);
+                        if ($count > 0) {
+                            $line .= ' · ' . $count;
+                        }
+                        $detail = trim((string) ($need['detail'] ?? ''));
+                        if ($detail !== '') {
+                            $line .= ' · ' . mb_substr($detail, 0, 160);
+                        }
+                        $lines[] = $line;
+                    }
+                }
+                if (!$lines) {
+                    return $notes;
+                }
+                $extra = implode("\n", $lines);
+                return $notes === '' ? $extra : $notes . "\n" . $extra;
+            })(),
             'accommodation_business_id' => $stay['accommodation_business_id'],
             'accommodation_service_id' => $stay['accommodation_service_id'],
             'accommodation_declined' => (int) $stay['accommodation_declined'],
@@ -1323,7 +1844,7 @@ if ($viewId) {
 }
 
 // No tour selected → open (or create) an empty Unnamed draft (not listed until filled/renamed)
-if (!$view && !isset($_GET['book'])) {
+if (!$packageMaker && !$view && !isset($_GET['book'])) {
     $reuseId = itinerary_find_blank_draft_id((int) $user['id']);
     if ($reuseId > 0) {
         itinerary_prune_blank_drafts((int) $user['id'], $reuseId);
@@ -1349,7 +1870,7 @@ if (!$view && !isset($_GET['book'])) {
 }
 
 // Keep only one blank Unnamed draft around the current view
-if ($view && (int) ($view['is_suggested'] ?? 0) === 0) {
+if (!$packageMaker && $view && (int) ($view['is_suggested'] ?? 0) === 0) {
     itinerary_prune_blank_drafts((int) $user['id'], (int) $view['id']);
 }
 
@@ -1402,6 +1923,24 @@ foreach ($activeMine as $r) {
         $draftMine[] = $r;
     }
 }
+if ($packageMaker) {
+    $packageBizId = (int) ($GLOBALS['CULTOUR_PACKAGE_BUSINESS_ID'] ?? 0);
+    $packageDraftIds = [];
+    if ($packageBizId > 0) {
+        $packageDraftSt = db()->prepare(
+            'SELECT package_itinerary_id FROM business_services
+             WHERE business_id=? AND package_made=0 AND package_itinerary_id IS NOT NULL'
+        );
+        $packageDraftSt->execute([$packageBizId]);
+        foreach ($packageDraftSt->fetchAll(PDO::FETCH_COLUMN) ?: [] as $packageDraftId) {
+            $packageDraftIds[(int) $packageDraftId] = true;
+        }
+    }
+    $draftMine = array_values(array_filter(
+        $draftMine,
+        static fn (array $row): bool => isset($packageDraftIds[(int) ($row['id'] ?? 0)])
+    ));
+}
 $draftMax = itinerary_max_drafts('tourist');
 $draftCount = count($draftMine);
 $draftToggleLabel = $draftCount > 0
@@ -1428,7 +1967,8 @@ $showDrafts = (string) ($_GET['drafts'] ?? '') === '1';
 
 // Opening an unbooked tour → open it under View draft (booked tours stay on the main row)
 if (
-    !$showDrafts
+    !$packageMaker
+    && !$showDrafts
     && $view
     && (int) ($view['user_id'] ?? 0) === (int) $user['id']
     && !(int) ($view['is_suggested'] ?? 0)
@@ -1466,6 +2006,20 @@ if ($view && $ownsView) {
 $activeBooking = ($view && $ownsView) ? itinerary_active_booking((int) $view['id']) : null;
 $scheduleLocked = $activeBooking !== null;
 $canEdit = $ownsView && !$scheduleLocked;
+$holdProceed = false;
+if ($view && $ownsView && $scheduleLocked) {
+    $holdSt = db()->prepare(
+        "SELECT ii.id FROM itinerary_items ii
+         WHERE ii.itinerary_id=? AND ii.reservation_draft IS NOT NULL AND ii.reservation_draft<>''
+           AND EXISTS (
+             SELECT 1 FROM restaurant_reservations r
+             WHERE r.itinerary_item_id=ii.id AND r.status='rejected'
+           )
+         LIMIT 1"
+    );
+    $holdSt->execute([(int) $view['id']]);
+    $holdProceed = (bool) $holdSt->fetch();
+}
 // When booked, show the frozen booking span (not later itinerary edits)
 if ($scheduleLocked && $view) {
     [$lockStart, $lockEnd] = booking_effective_tour_span($activeBooking);
@@ -1815,6 +2369,7 @@ foreach ($businesses as $b) {
         'rating' => null,
         'defaultVisit' => (int) ($b['default_visit_minutes'] ?? 60),
         'visitLimit' => place_visit_limit($b['visit_duration_minutes'] ?? null),
+        'minVisit' => place_min_visit($b['min_visit_minutes'] ?? null),
         'hours' => $resolved,
         'hoursLabel' => $resolved ? format_hours_slot_12h($resolved[$itinDayKey] ?? 'Closed') : null,
         'url' => APP_URL . '/tourist/business.php?id=' . $bid,
@@ -1918,7 +2473,80 @@ $mapStops = array_values(array_filter(
 
 $bookGuides = [];
 $bookGuidesTotal = 0;
-if ($canEdit && $view) {
+$packageSystemGuides = [];
+if ($packageMaker && $canEdit && $view) {
+    require_once __DIR__ . '/../includes/inhouse_guides.php';
+    $packageBizId = (int) ($GLOBALS['CULTOUR_PACKAGE_BUSINESS_ID'] ?? 0);
+    foreach (inhouse_guides_for_business($packageBizId, true) as $houseGuide) {
+        if ((int) ($houseGuide['inhouse_active'] ?? 0) !== 1) {
+            continue;
+        }
+        if ((string) ($houseGuide['status'] ?? '') !== 'active') {
+            continue;
+        }
+        if ((string) ($houseGuide['approval_status'] ?? '') !== 'approved') {
+            continue;
+        }
+        $bookGuides[] = [
+            'id' => (int) $houseGuide['guide_id'],
+            'user_id' => (int) ($houseGuide['user_id'] ?? 0),
+            'name' => trim((string) ($houseGuide['first_name'] ?? '') . ' ' . (string) ($houseGuide['last_name'] ?? '')),
+            'phone' => trim((string) ($houseGuide['phone'] ?? '')) ?: '—',
+            'languages' => trim((string) ($houseGuide['languages'] ?? '')) ?: '—',
+            'rate' => format_money($houseGuide['hourly_rate'] ?? 0),
+            'rate_amount' => round((float) ($houseGuide['hourly_rate'] ?? 0), 2),
+            'license' => '—',
+            'rating' => 0,
+            'reviews' => 0,
+            'avatar' => !empty($houseGuide['avatar']) ? (APP_URL . '/uploads/' . $houseGuide['avatar']) : null,
+            'hint' => null,
+            'ok' => true,
+            'hint_ok' => true,
+            'full_day_ok' => true,
+            'busy_by_day' => [],
+            'name_only' => true,
+        ];
+    }
+    $packageInclusiveMaker = (string) ($GLOBALS['CULTOUR_PACKAGE_DATE_MODE'] ?? 'fixed') !== 'tourist';
+    if ($packageInclusiveMaker && $tourDateDisplay !== '') {
+        $busyGuideIds = array_fill_keys(guides_busy_ids_on($tourDateDisplay), true);
+        $bookGuides = array_values(array_filter($bookGuides, static function (array $guide) use ($busyGuideIds): bool {
+            return !isset($busyGuideIds[(int) $guide['id']]);
+        }));
+    }
+    $bookGuidesTotal = count($bookGuides);
+    if (!$packageInclusiveMaker && !$bookGuides) {
+        $meetupForAvail = normalize_time_input($meetupDisplay)
+            ?? normalize_time_input((string) ($view['meetup_time'] ?? ''));
+        $bookGuides = tourist_book_guides_list(
+            $tourDateDisplay !== '' ? $tourDateDisplay : null,
+            $meetupForAvail,
+            $tourDateDisplay !== '' ? $tourDateDisplay : null,
+            $viewId > 0 ? $viewId : null,
+            null,
+            (int) $user['id']
+        );
+        $bookGuidesTotal = count($bookGuides);
+    }
+    if ($packageInclusiveMaker && !$bookGuides) {
+        $meetupForAvail = normalize_time_input($meetupDisplay)
+            ?? normalize_time_input((string) ($view['meetup_time'] ?? ''));
+        $packageSystemGuides = tourist_book_guides_list(
+            $tourDateDisplay !== '' ? $tourDateDisplay : null,
+            $meetupForAvail,
+            $tourDateDisplay !== '' ? $tourDateDisplay : null,
+            $viewId > 0 ? $viewId : null,
+            null,
+            (int) $user['id']
+        );
+        if ($tourDateDisplay !== '') {
+            $busyGuideIds = array_fill_keys(guides_busy_ids_on($tourDateDisplay), true);
+            $packageSystemGuides = array_values(array_filter($packageSystemGuides, static function (array $guide) use ($busyGuideIds): bool {
+                return !isset($busyGuideIds[(int) ($guide['id'] ?? 0)]);
+            }));
+        }
+    }
+} elseif ($canEdit && $view) {
     $meetupForAvail = normalize_time_input($meetupDisplay)
         ?? normalize_time_input((string) ($view['meetup_time'] ?? ''));
     // Use full multi-day span so day 2+ hours/blocks are checked (not only the start date)
@@ -1974,15 +2602,23 @@ $promptBookDate = $canEdit && $view && (isset($_GET['book']) || isset($_GET['rev
 $hasItinContent = $canEdit && $view && (
     count($stops) > 0
     || !empty($view['start_date'])
+    || (int) ($view['party_size'] ?? 0) >= 1
     || !itinerary_is_placeholder_title($view['title'] ?? null)
 );
 $keptAsDraft = $canEdit && $view && !empty($view['kept_as_draft']);
 
-$bodyClass = trim(($bodyClass ?? '') . ' tourist-app');
+$bodyClass = trim(($bodyClass ?? '') . ($packageMaker ? ' business-app package-maker itin-page' : ' tourist-app'));
 require __DIR__ . '/../includes/header.php';
 ?>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-<?php require __DIR__ . '/../includes/tourist_shell_start.php'; ?>
+<?php
+if ($packageMaker) {
+    $businessHidePagehead = true;
+    require __DIR__ . '/../includes/business_shell_start.php';
+} else {
+    require __DIR__ . '/../includes/tourist_shell_start.php';
+}
+?>
 
       <?php if ($m = flash('success')): ?><div class="alert alert-success" data-autohide="1"><?= e($m) ?></div><?php endif; ?>
       <?php if ($m = flash('warning')): ?><div class="alert alert-warning"><?= e($m) ?></div><?php endif; ?>
@@ -1992,10 +2628,10 @@ require __DIR__ . '/../includes/header.php';
       <div class="itin-pagehead" data-itin-tutorial-user="<?= (int) ($user['id'] ?? 0) ?>">
         <div class="itin-pagehead__titleblock">
           <div class="itin-pagehead__title-row">
-            <h1 class="itin-pagehead__title">My Itineraries</h1>
+            <h1 class="itin-pagehead__title"><?= $packageMaker ? 'Package maker' : 'My Itineraries' ?></h1>
             <button type="button" class="itin-tutorial-replay" data-itin-tutorial-replay aria-label="Replay itinerary tutorial">How to use</button>
               </div>
-          <p class="itin-pagehead__sub">CulTour · Ormoc City</p>
+          <p class="itin-pagehead__sub"><?= $packageMaker ? e((string) ($GLOBALS['CULTOUR_PACKAGE_NAME'] ?? 'Tour and travel')) : 'CulTour · Ormoc City' ?></p>
               </div>
         <div class="itin-suggest-tabs" data-itin-chips>
           <form method="post" class="d-inline" data-itin-new-tour><?= csrf_field() ?>
@@ -2004,25 +2640,50 @@ require __DIR__ . '/../includes/header.php';
             <input type="hidden" name="meetup_time" value="">
             <button type="submit" class="quick-chip">+ New tour</button>
             </form>
-          <?php foreach ($mainMine as $r): ?>
-            <?php
-              $chipTitle = trim((string) ($r['title'] ?? '')) !== '' ? (string) $r['title'] : 'Unnamed';
-            ?>
-            <a class="quick-chip <?= $view && (int) $view['id'] === (int) $r['id'] ? 'is-active fw-semibold' : '' ?>"
-               href="?id=<?= (int) $r['id'] ?>">
-              <?= e($chipTitle) ?>
-              <span class="itin-draft-badge itin-booked-badge">Booked</span>
-            </a>
-                  <?php endforeach; ?>
-          <?php if ($suggested): ?>
-            <span class="itin-suggest-group" data-itin-tour="suggested">
-            <span class="small text-muted align-self-center">Suggested:</span>
-            <?php foreach ($suggested as $r): ?>
-              <a class="quick-chip <?= $view && (int) $view['id'] === (int) $r['id'] ? 'is-active fw-semibold' : '' ?>"
-                 href="?id=<?= (int) $r['id'] ?>"><?= e($r['title']) ?></a>
-            <?php endforeach; ?>
-            </span>
-          <?php endif; ?>
+          <form method="post" class="d-inline" id="itinSaveDraftForm"><?= csrf_field() ?>
+            <input type="hidden" name="action" value="save_draft">
+            <input type="hidden" name="itinerary_id" value="<?= (int) ($view['id'] ?? 0) ?>">
+            <input type="hidden" name="title" value="">
+            <input type="hidden" name="start_date" value="">
+            <input type="hidden" name="party_size" value="">
+            <button type="submit" class="quick-chip quick-chip--hollow<?= !empty($hasItinContent) && empty($scheduleLocked) ? ' is-ready' : '' ?>" id="itinSaveDraftBtn" data-locked="<?= !empty($scheduleLocked) ? '1' : '0' ?>"<?= !empty($hasItinContent) && empty($scheduleLocked) ? '' : ' disabled' ?>>Save draft</button>
+          </form>
+          <script>
+          (function () {
+            var form = document.getElementById('itinSaveDraftForm');
+            var btn = document.getElementById('itinSaveDraftBtn');
+            if (!form || !btn) return;
+            function textOf(id) {
+              var el = document.getElementById(id);
+              return el ? String(el.value || '').trim() : '';
+            }
+            function hasInput() {
+              if (btn.getAttribute('data-locked') === '1') return false;
+              if (!form.querySelector('[name="itinerary_id"]').value || form.querySelector('[name="itinerary_id"]').value === '0') return false;
+              var title = textOf('itinTourTitle').toLowerCase();
+              var named = title !== '' && title !== 'unnamed' && title !== 'untitled package';
+              var guests = parseInt(textOf('itinPartySize'), 10);
+              return named || textOf('itinStartDate') !== '' || (guests >= 1) || document.querySelector('[data-itin-stop]');
+            }
+            function sync() {
+              var on = hasInput();
+              btn.disabled = !on;
+              btn.classList.toggle('is-ready', on);
+            }
+            document.addEventListener('input', sync);
+            document.addEventListener('change', sync);
+            form.addEventListener('submit', function (e) {
+              if (btn.disabled) {
+                e.preventDefault();
+                return;
+              }
+              form.querySelector('[name="title"]').value = textOf('itinTourTitle');
+              form.querySelector('[name="start_date"]').value = textOf('itinStartDate');
+              form.querySelector('[name="party_size"]').value = textOf('itinPartySize');
+            });
+            sync();
+          })();
+          </script>
           </div>
               </div>
 
@@ -2031,7 +2692,7 @@ require __DIR__ . '/../includes/header.php';
           <div class="glass p-3 p-md-4 h-100 itin-builder__card">
             <?php if (!$view): ?>
               <h3 class="panel-title mb-2">Your tours</h3>
-              <p class="text-muted mb-2">Click <strong>+ New tour</strong> to start planning. Booked tours show in the bar above.</p>
+              <p class="text-muted mb-2">Click <strong>+ New tour</strong> to start planning.</p>
               <?php if (!empty($draftsAtLimit)): ?>
                 <div class="alert alert-warning py-2 small"><?= e(itinerary_draft_limit_message()) ?></div>
               <?php endif; ?>
@@ -2057,11 +2718,16 @@ require __DIR__ . '/../includes/header.php';
                     <form method="post" class="itin-rename" id="itinRenameForm" data-itin-rename data-itin-tour="title"><?= csrf_field() ?>
                       <input type="hidden" name="action" value="update_title">
                       <input type="hidden" name="itinerary_id" value="<?= (int) $view['id'] ?>">
-                      <label class="itin-field-label itin-field-label--title" for="itinTourTitle">Tour name</label>
+                      <label class="itin-field-label itin-field-label--title" for="itinTourTitle"><?= $packageMaker ? 'Package name' : 'Tour name' ?></label>
+                      <?php
+                        $titleShown = (string) ($view['title'] ?? '');
+                        $titleBlank = itinerary_is_placeholder_title($titleShown)
+                            || ($packageMaker && strcasecmp(trim($titleShown), 'Untitled package') === 0);
+                      ?>
                       <input type="text" class="form-control form-control-sm itin-rename__input" id="itinTourTitle" name="title"
-                        value="<?= itinerary_is_placeholder_title($view['title'] ?? null) ? '' : e((string) $view['title']) ?>"
-                        maxlength="120" aria-label="Tour name" placeholder="Unnamed">
-                      <div class="itin-date-feedback" data-itin-title-feedback hidden>Name this itinerary before booking.</div>
+                        value="<?= $titleBlank ? '' : e($titleShown) ?>"
+                        maxlength="120" aria-label="<?= $packageMaker ? 'Package name' : 'Tour name' ?>" placeholder="<?= $packageMaker ? '' : 'Unnamed' ?>">
+                      <div class="itin-date-feedback" data-itin-title-feedback hidden><?= $packageMaker ? 'Name this package before saving.' : 'Name this itinerary before booking.' ?></div>
                 </form>
                   <?php else: ?>
                     <h3 class="panel-title mb-0 itin-tour-head__name"><?= e($view['title']) ?></h3>
@@ -2102,7 +2768,24 @@ require __DIR__ . '/../includes/header.php';
         </div>
                     <?php if ($canEdit || $ownsView): ?>
                       <div class="itin-guest-field" data-itin-tour="guests">
-                        <label class="itin-field-label" for="itinPartySize">Number of guests</label>
+                        <label class="itin-field-label" for="itinPartySize"><?= $packageMaker ? 'Participants' : 'Number of guests' ?></label>
+                        <?php if ($packageMaker): ?>
+                        <div class="itin-guest-field__pair">
+                          <input type="number" class="form-control form-control-sm itin-guest-field__input"
+                                 id="packageMinPax" name="package_min_pax" form="guideBookForm" min="1" max="50"
+                                 inputmode="numeric" placeholder="min" aria-label="Minimum participants"
+                                 value="<?= (int) ($GLOBALS['CULTOUR_PACKAGE_MIN_PAX'] ?? 0) >= 1 ? (int) $GLOBALS['CULTOUR_PACKAGE_MIN_PAX'] : '' ?>"
+                                 <?= $canEdit ? '' : 'readonly' ?>>
+                          <input type="number" class="form-control form-control-sm itin-guest-field__input"
+                                 id="itinPartySize" name="package_max_pax" form="guideBookForm" min="1" max="50"
+                                 inputmode="numeric" placeholder="max" aria-label="Maximum participants"
+                                 value="<?php
+                                   $guestSaved = $view ? (int) ($view['party_size'] ?? 0) : 0;
+                                   echo $guestSaved >= 1 ? (int) $guestSaved : '';
+                                 ?>"
+                                 <?= $canEdit ? '' : 'readonly' ?>>
+                        </div>
+                        <?php else: ?>
                         <input type="number" class="form-control form-control-sm itin-guest-field__input"
                                id="itinPartySize" name="itin_party_size" min="1" max="20"
                                inputmode="numeric"
@@ -2117,7 +2800,8 @@ require __DIR__ . '/../includes/header.php';
                                  echo $guestSaved >= 1 ? (int) $guestSaved : '';
                                ?>"
                                <?= $canEdit ? '' : 'readonly' ?>>
-                        <div class="itin-date-feedback" data-itin-guest-feedback hidden>Enter the number of guests.</div>
+                        <?php endif; ?>
+                        <div class="itin-date-feedback<?= $packageMaker ? ' itin-field-note' : '' ?>" data-itin-guest-feedback hidden><?= $packageMaker ? 'Enter the participants.' : 'Enter the number of guests.' ?></div>
                 </div>
                     <?php endif; ?>
               </div>
@@ -2213,7 +2897,7 @@ require __DIR__ . '/../includes/header.php';
                   </div>
                 </div>
               </div>
-              <?php if (($itinDesc = itinerary_display_description($view['description'] ?? null)) !== ''): ?>
+              <?php if (!$packageMaker && ($itinDesc = itinerary_display_description($view['description'] ?? null)) !== ''): ?>
                 <p class="small text-muted mb-2"><?= e($itinDesc) ?></p>
               <?php endif; ?>
               <?php if ((int) ($view['is_suggested'] ?? 0)): ?>
@@ -2247,17 +2931,30 @@ require __DIR__ . '/../includes/header.php';
                   <form method="post" data-itin-date-fields id="itinEditScheduleForm"
                         data-itin-avail-date="<?= e($tourDateDisplay) ?>"
                         data-itin-avail-meetup="<?= e($meetupDisplay) ?>"
-                        data-itin-today="<?= e(app_today()) ?>"
+                        data-itin-today="<?= e(booking_earliest_date()) ?>"
                         data-itin-now-mins="<?= (int) app_now_mins() ?>"
                         novalidate><?= csrf_field() ?>
                     <input type="hidden" name="action" value="update_meetup" id="itinEditAction">
                     <input type="hidden" name="itinerary_id" value="<?= (int) $view['id'] ?>">
                     <div class="row g-2">
+                      <?php if ($packageMaker): ?>
+                      <?php $packageTouristPicks = (string) ($GLOBALS['CULTOUR_PACKAGE_DATE_MODE'] ?? 'fixed') === 'tourist'; ?>
+                      <?php
+                        $packageCloseShown = trim((string) ($GLOBALS['CULTOUR_PACKAGE_CLOSE_DATE'] ?? ''));
+                        $packageCloseMax = $packageTouristPicks ? '' : (string) (package_cutoff_date($tourDateDisplay ?? null) ?? '');
+                      ?>
                       <div class="col-12">
-                        <label class="form-label small mb-0">Tour start date</label>
+                        <div class="form-check mb-0">
+                          <input class="form-check-input" type="checkbox" name="package_date_tourist" value="1" id="packageDateTourist" <?= $packageTouristPicks ? 'checked' : '' ?>>
+                          <label class="form-check-label small" for="packageDateTourist">Tourist chooses the date when booking</label>
+                        </div>
+                      </div>
+                      <?php endif; ?>
+                      <div class="col-12">
+                        <label class="form-label small mb-0"><?= $packageMaker ? 'Package tour date' : 'Tour start date' ?></label>
                         <div class="itin-schedule-start-row">
                           <div class="itin-schedule-start-row__date" data-itin-tour="start-date">
-                            <input type="date" class="form-control form-control-sm<?= $bookingDateConflict !== '' ? ' is-invalid' : '' ?>" name="start_date" id="itinStartDate" min="<?= e(app_today()) ?>" value="<?= e($tourDateDisplay) ?>" title="Optional for drafts & auto-generate — required to book">
+                            <input type="date" class="form-control form-control-sm<?= $bookingDateConflict !== '' ? ' is-invalid' : '' ?>" name="start_date" id="itinStartDate" min="<?= e($packageMaker ? package_tour_earliest_date() : booking_earliest_date()) ?>" value="<?= e($tourDateDisplay) ?>" title="Optional for drafts & auto-generate — required to book">
                           </div>
                           <div class="itin-multiday-row" data-itin-tour="multiday">
                             <div class="form-check mb-0">
@@ -2281,6 +2978,22 @@ require __DIR__ . '/../includes/header.php';
                           </div>
                         </div>
                       </div>
+                      <?php if ($packageMaker): ?>
+                      <div class="col-6">
+                        <label class="form-label small mb-0" for="packageCloseDate">Package cut off</label>
+                        <input type="date" class="form-control form-control-sm" id="packageCloseDate" name="package_close_date" form="guideBookForm" min="<?= e(app_today()) ?>"<?= $packageCloseMax !== '' ? ' max="' . e($packageCloseMax) . '"' : '' ?> value="<?= e($packageCloseShown) ?>"<?= $packageTouristPicks ? ' disabled' : '' ?>>
+                        <div class="itin-date-feedback itin-field-note" data-package-close-feedback hidden>Set the package cut off.</div>
+                      </div>
+                      <div class="col-6">
+                        <label class="form-label small mb-0" for="packagePriceField">Price per person</label>
+                        <?php $packagePriceShown = (float) ($GLOBALS['CULTOUR_PACKAGE_PRICE'] ?? 0); ?>
+                        <div class="input-group input-group-sm">
+                          <span class="input-group-text peso-mark">₱</span>
+                          <input class="form-control" id="packagePriceField" name="package_price" form="guideBookForm" type="number" min="0" step="0.01" required value="<?= $packagePriceShown > 0 ? e(number_format($packagePriceShown, 2, '.', '')) : '' ?>">
+                        </div>
+                        <div class="itin-date-feedback itin-field-note" data-package-price-feedback hidden>Enter the price per person.</div>
+                      </div>
+                      <?php endif; ?>
                       <div class="col-12">
                         <div class="itin-date-feedback" data-itin-date-feedback<?= $bookingDateConflict === '' ? ' hidden' : '' ?>><?= e($bookingDateConflict !== '' ? $bookingDateConflict : 'Set a tour date before booking a guide.') ?></div>
                       </div>
@@ -2506,7 +3219,7 @@ require __DIR__ . '/../includes/header.php';
                             <label class="itin-day__date-pick" title="Change date">
                               <i class="bi bi-calendar3" aria-hidden="true"></i>
                               <input type="date" data-itin-day-date-input data-day="<?= (int) $g['day'] ?>"
-                                     min="<?= e(app_today()) ?>" value="<?= e($dayYmd) ?>" aria-label="Date for Day <?= (int) $g['day'] ?>">
+                                     min="<?= e(booking_earliest_date()) ?>" value="<?= e($dayYmd) ?>" aria-label="Date for Day <?= (int) $g['day'] ?>">
                             </label>
                           <?php endif; ?>
                         </span>
@@ -2547,34 +3260,20 @@ require __DIR__ . '/../includes/header.php';
                         <div class="itin-date-feedback" data-itin-day-meetup-place-feedback hidden>Meetup place not set</div>
                         <?php
                           $dayMeetupMins = $dayMeetup['meetup_mins'] ?? null;
-                          $dayClock = '';
-                          $dayAmPm = 'AM';
+                          $dayTimeValue = '';
                           if ($dayMeetupMins !== null) {
-                              $h24 = intdiv((int) $dayMeetupMins, 60);
-                              $mm = ((int) $dayMeetupMins) % 60;
-                              $dayAmPm = $h24 >= 12 ? 'PM' : 'AM';
-                              $h12 = $h24 % 12;
-                              if ($h12 === 0) {
-                                  $h12 = 12;
-                              }
-                              $dayClock = sprintf('%02d:%02d', $h12, $mm);
+                              $dayTimeValue = sprintf('%02d:%02d', intdiv((int) $dayMeetupMins, 60), ((int) $dayMeetupMins) % 60);
                           }
                         ?>
                         <?php if ($canEdit && !$scheduleLocked): ?>
                           <div class="itin-meetup-time-row">
                             <span class="itin-meetup-time-row__label">Meetup time ·</span>
                             <div class="itin-meetup-time" data-itin-day-meetup-time="<?= (int) $g['day'] ?>">
-                            <input type="text" class="form-control form-control-sm itin-meetup-time__clock"
+                            <input type="time" class="form-control form-control-sm itin-meetup-time__clock"
                                    data-itin-day-meetup-clock data-day="<?= (int) $g['day'] ?>"
-                                   inputmode="numeric" autocomplete="off" placeholder="--:--" maxlength="5"
+                                   step="900"
                                    aria-label="Day <?= (int) $g['day'] ?> meetup time"
-                                   value="<?= e($dayClock) ?>">
-                            <select class="form-select form-select-sm itin-meetup-time__ampm"
-                                    data-itin-day-meetup-ampm data-day="<?= (int) $g['day'] ?>"
-                                    aria-label="AM or PM">
-                              <option value="AM"<?= $dayAmPm === 'AM' ? ' selected' : '' ?>>AM</option>
-                              <option value="PM"<?= $dayAmPm === 'PM' ? ' selected' : '' ?>>PM</option>
-                            </select>
+                                   value="<?= e($dayTimeValue) ?>">
                             </div>
                           </div>
                           <div class="itin-date-feedback" data-itin-day-meetup-feedback hidden>Meetup time not set</div>
@@ -2608,14 +3307,29 @@ require __DIR__ . '/../includes/header.php';
                           $stopCover = trim((string) ($it['cover_url'] ?? ''));
                           $stopLimitKey = !empty($it['business_id']) ? 'b' . (int) $it['business_id'] : 'd' . (int) ($it['destination_id'] ?? 0);
                           $stopLimit = $placeVisitLimits[$stopLimitKey] ?? null;
+                          $stopMin = $placeVisitMins[$stopLimitKey] ?? null;
+                          $stopRejected = false;
+                          $stopNeedsReserve = false;
+                          if ($stopKind === 'business' && itinerary_booking_is_finalized((int) $view['id'])) {
+                              $stopReservation = reservation_latest_for_item((int) $it['id']);
+                              $stopRejected = $stopReservation && (string) ($stopReservation['status'] ?? '') === 'rejected';
+                              $replaced = db()->prepare(
+                                  "SELECT id FROM restaurant_reservations WHERE itinerary_item_id=? AND status='rejected' LIMIT 1"
+                              );
+                              $replaced->execute([(int) $it['id']]);
+                              $currentStatus = (string) ($stopReservation['status'] ?? '');
+                              $stopNeedsReserve = (bool) $replaced->fetch()
+                                  && !in_array($currentStatus, ['pending', 'confirmed', 'completed', 'no_show'], true);
+                          }
                         ?>
-                        <div class="itin-item<?= $canEdit ? ' itin-item--draggable' : '' ?>"
+                        <div class="itin-item<?= $canEdit ? ' itin-item--draggable' : '' ?><?= $stopNeedsReserve ? ' itin-item--needs-reserve' : '' ?>"
                              data-id="<?= (int) $it['id'] ?>"
                              data-itin-stop
                              data-lat="<?= e((string) $stopLat) ?>"
                              data-lng="<?= e((string) $stopLng) ?>"
                              data-visit="<?= (int) $visit ?>"
                              data-visit-limit="<?= $stopLimit !== null ? (int) $stopLimit : '' ?>"
+                             data-visit-min="<?= $stopMin !== null ? (int) $stopMin : '' ?>"
                              data-place-name="<?= e((string) ($it['stop_name'] ?? $it['destination_name'] ?? '')) ?>"
                              data-place-key="<?= e($stopPlaceKey) ?>"
                              data-kind="<?= e($stopKind) ?>">
@@ -2624,17 +3338,22 @@ require __DIR__ . '/../includes/header.php';
                               <span class="itin-item__thumb<?= $stopCover !== '' ? ' has-image' : '' ?>"<?= $stopCover !== '' ? ' style="background-image:url(\'' . e($stopCover) . '\')"' : '' ?> aria-hidden="true"></span>
                               <div class="itin-item__info">
                               <div class="itin-item__actions">
+                                <?php if (!$stopRejected): ?>
                                 <button type="button" class="btn btn-sm btn-outline-secondary" data-itin-stop-view data-place-key="<?= e($stopPlaceKey) ?>">View</button>
                             <?php if ($canEdit): ?>
                                 <button type="button" class="btn btn-sm btn-outline-secondary" data-itin-edit-time>Edit</button>
-                                <form method="post" data-itin-confirm="remove" class="d-inline"><?= csrf_field() ?>
-                  <input type="hidden" name="action" value="remove_stop">
-                                  <input type="hidden" name="itinerary_id" value="<?= (int) $view['id'] ?>">
-                                  <input type="hidden" name="item_id" value="<?= (int) $it['id'] ?>">
-                                  <button type="submit" class="btn btn-sm btn-outline-danger">Remove</button>
-                </form>
                             <?php endif; ?>
+                                <?php endif; ?>
+                                <?php reservation_render_stop_panel($it, $view, (bool) $canEdit, 'button'); ?>
                               </div>
+                            <?php if ($canEdit && !$scheduleLocked): ?>
+                              <form method="post" data-itin-confirm="remove" class="itin-item__remove"><?= csrf_field() ?>
+                                <input type="hidden" name="action" value="remove_stop">
+                                <input type="hidden" name="itinerary_id" value="<?= (int) $view['id'] ?>">
+                                <input type="hidden" name="item_id" value="<?= (int) $it['id'] ?>">
+                                <button type="submit" aria-label="Remove stop" title="Remove stop"><i class="bi bi-x-lg" aria-hidden="true"></i></button>
+                              </form>
+                            <?php endif; ?>
                               <div class="small text-muted">
                                 <?php if ($canEdit): ?><i class="bi bi-grip-vertical itin-item__handle"></i><?php endif; ?>
                                 Stop <span data-itin-stop-num><?= $idx + 1 ?></span>
@@ -2642,9 +3361,12 @@ require __DIR__ . '/../includes/header.php';
                               </div>
                               <div><?= e($it['stop_name'] ?? $it['destination_name'] ?? 'Unknown place') ?></div>
                               <div class="small text-muted"><?= e($it['location'] ?? '') ?></div>
-                              <?php reservation_render_stop_panel($it, $view, (bool) $canEdit); ?>
+                              <?php reservation_render_stop_panel($it, $view, (bool) $canEdit, 'modal'); ?>
                               <div class="small itin-stop-times" data-itin-stop-times>
-                                <span data-itin-arrive-leave<?= ($dayMeetupMins === null) ? ' hidden' : '' ?>>Estimated time of arrival <span data-itin-arrive><?= e($arrive) ?></span> · Leave <span data-itin-leave><?= e($leave) ?></span></span>
+                                <span class="itin-stop-times__when" data-itin-arrive-leave<?= ($dayMeetupMins === null) ? ' hidden' : '' ?>>
+                                  <span>ETA · <span data-itin-arrive><?= e($arrive) ?></span></span>
+                                  <span>Leave · <span data-itin-leave><?= e($leave) ?></span></span>
+                                </span>
                                 <span class="itin-stop-times__stay">Stay <span data-itin-stay><?php
                                 $stayH = intdiv($visit, 60);
                                 $stayM = $visit % 60;
@@ -2679,7 +3401,17 @@ require __DIR__ . '/../includes/header.php';
                                 <button type="button" class="btn btn-sm btn-outline-secondary itin-edit-time__btn" data-itin-edit-time-cancel>Cancel</button>
                               </div>
                               <div class="form-text text-danger d-none" data-itin-visit-limit-warn></div>
-                              <div class="form-text"><?= $stopLimit !== null ? 'Visit duration: up to ' . e(format_visit_duration_label((int) $stopLimit)) . '. ' : '' ?>Leave time updates; later stops this day re-adjust.</div>
+                              <div class="form-text"><?php
+                                $stayNotes = [];
+                                if ($stopMin !== null) {
+                                    $stayNotes[] = 'Minimum visit: ' . format_visit_duration_label((int) $stopMin) . '.';
+                                }
+                                if ($stopLimit !== null) {
+                                    $stayNotes[] = 'Visit duration: up to ' . format_visit_duration_label((int) $stopLimit) . '.';
+                                }
+                                $stayNotes[] = 'Leave time updates; later stops this day re-adjust.';
+                                echo e(implode(' ', $stayNotes));
+                              ?></div>
                             </form>
                           <?php endif; ?>
                         </div>
@@ -2706,14 +3438,63 @@ require __DIR__ . '/../includes/header.php';
             </div>
             <div id="itinRouteMap" class="ct-map ct-map--tall itin-builder__map"></div>
           </div>
-          <?php if ($canEdit): ?>
+          <?php if ($canEdit || $holdProceed): ?>
           <div class="itin-proceed-dock" data-itin-proceed-dock></div>
           <?php endif; ?>
         </div>
       </div>
 
-<?php require __DIR__ . '/../includes/tourist_shell_end.php'; ?>
+<?php
+if ($packageMaker) {
+    require __DIR__ . '/../includes/business_shell_end.php';
+} else {
+    require __DIR__ . '/../includes/tourist_shell_end.php';
+}
+?>
 
+<?php if ($holdProceed): ?>
+<div class="itin-schedule-book" id="itinHoldProceedWrap">
+  <form method="post">
+    <?= csrf_field() ?>
+    <input type="hidden" name="action" value="reserve_finalize">
+    <input type="hidden" name="itinerary_id" value="<?= (int) $view['id'] ?>">
+    <button type="submit" class="btn btn-ct itin-tour-head__book" id="itinHoldProceed">Proceed</button>
+  </form>
+</div>
+<script>
+(function () {
+  var wrap = document.getElementById('itinHoldProceedWrap');
+  var btn = document.getElementById('itinHoldProceed');
+  var dock = document.querySelector('[data-itin-proceed-dock]');
+  var mapEl = document.getElementById('itinRouteMap');
+  if (!wrap || !btn || !dock || !mapEl) return;
+  function floatBottom() {
+    return window.innerWidth < 992 ? 16 + 76 : 18;
+  }
+  function place() {
+    var mapRight = mapEl.getBoundingClientRect().right;
+    var dockTop = dock.getBoundingClientRect().top;
+    var btnH = btn.offsetHeight || 44;
+    var bottom = floatBottom();
+    var floatTop = window.innerHeight - bottom - btnH;
+    wrap.style.position = 'fixed';
+    wrap.style.zIndex = '1040';
+    wrap.style.right = Math.max(8, window.innerWidth - mapRight) + 'px';
+    wrap.style.left = 'auto';
+    if (dockTop <= floatTop) {
+      wrap.style.top = Math.max(8, dockTop) + 'px';
+      wrap.style.bottom = 'auto';
+    } else {
+      wrap.style.top = 'auto';
+      wrap.style.bottom = bottom + 'px';
+    }
+  }
+  window.addEventListener('scroll', place, { passive: true });
+  window.addEventListener('resize', place);
+  place();
+})();
+</script>
+<?php endif; ?>
 <?php if ($canEdit): ?>
 <div class="itin-schedule-book">
   <button type="button" class="btn btn-ct itin-tour-head__book" id="btnOpenGuideBook" data-itin-tour="book"
@@ -2777,34 +3558,83 @@ require __DIR__ . '/../includes/header.php';
     <div class="modal-content itin-book-review-card">
       <div class="modal-header border-0 pb-0">
         <div>
-          <h2 class="modal-title h5 mb-0" id="itinBookReviewLabel">Booking summary</h2>
-          <div class="small text-muted">Review the booking before you continue</div>
+          <div class="itin-book-review-heading">
+            <h2 class="modal-title h5 mb-0" id="itinBookReviewLabel"><?= $packageMaker ? 'Package summary' : 'Booking summary' ?></h2>
+            <?php if (!$packageMaker && $view): ?>
+            <a class="itin-book-review-view" href="<?= APP_URL ?>/itinerary-share.php?id=<?= (int) $view['id'] ?>" target="_blank" rel="noopener">View itinerary</a>
+            <?php endif; ?>
+          </div>
+          <div class="small text-muted"><?= $packageMaker ? 'Check the package. Cancel to keep editing, or show it under Packages made.' : 'Review the booking before you continue' ?></div>
         </div>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
       <div class="modal-body pt-2">
         <dl class="itin-book-review-list mb-0">
+          <?php if (!$packageMaker): ?>
           <div><dt>Tour guide</dt><dd data-itin-review="guide">Not chosen</dd></div>
-          <div><dt>Tour</dt><dd data-itin-review="title"><?= e($view['title'] !== '' ? $view['title'] : 'Unnamed') ?></dd></div>
+          <?php endif; ?>
+          <div><dt><?= $packageMaker ? 'Package' : 'Tour name' ?></dt><dd data-itin-review="title"><?= e($view['title'] !== '' ? $view['title'] : 'Unnamed') ?></dd></div>
           <div><dt>Date</dt><dd data-itin-review="date"><?= $hasTourDate ? e(format_date($tourDateDisplay)) : 'Not set' ?></dd></div>
           <div><dt>Days</dt><dd data-itin-review="days"><?= (int) $dayCountDisplay ?> day<?= (int) $dayCountDisplay === 1 ? '' : 's' ?></dd></div>
           <div><dt>Meetup</dt><dd data-itin-review="meetup"><?= e($meetupLabel) ?> · Ormoc City Port</dd></div>
-          <div><dt>Guests</dt><dd data-itin-review="guests">—</dd></div>
+          <div><dt><?= $packageMaker ? 'Participants' : 'Guests' ?></dt><dd data-itin-review="guests">—</dd></div>
+          <?php if (!$packageMaker): ?>
+          <div><dt>Special requirements</dt><dd data-itin-review="needs">None</dd></div>
+          <?php endif; ?>
+          <?php if ($packageMaker): ?>
+          <div><dt>Package cut off</dt><dd data-itin-review="close">Not set</dd></div>
+          <div><dt>Price per person</dt><dd data-itin-review="price">—</dd></div>
+          <?php else: ?>
           <div><dt>Stay</dt><dd data-itin-review="stay">Not chosen</dd></div>
           <div><dt>Ride</dt><dd data-itin-review="ride">Not chosen</dd></div>
-          <div><dt>Stops</dt><dd data-itin-review="stops"><?= count($stops) ?> stop<?= count($stops) === 1 ? '' : 's' ?></dd></div>
-          <?php $reviewReservations = reservation_itinerary_map((int) $view['id']); ?>
-          <?php if ($reviewReservations): ?>
-          <div><dt>Reservations</dt><dd>
-            <?php foreach ($reviewReservations as $reviewReservation): ?>
-              <?php foreach (reservation_summary_lines($reviewReservation) as $reviewLine): ?>
-                <div><?= e($reviewLine) ?></div>
-              <?php endforeach; ?>
-            <?php endforeach; ?>
-          </dd></div>
           <?php endif; ?>
+          <div><dt>Stops</dt><dd data-itin-review="stops"><?= count($stops) ?> stop<?= count($stops) === 1 ? '' : 's' ?></dd></div>
         </dl>
-        <div class="guide-book-bill" data-guide-bill data-ride-spans="<?= (int) ($rideDays ?? $dayCountDisplay) ?>">
+        <?php $reviewReservations = $packageMaker ? [] : reservation_itinerary_map((int) $view['id']); ?>
+        <?php if ($reviewReservations): ?>
+        <div class="itin-book-reserves">
+          <?php foreach ($reviewReservations as $reviewReservation): ?>
+            <?php
+              $reviewCopy = is_array($reviewReservation['copy'] ?? null) ? $reviewReservation['copy'] : reservation_place_copy((string) ($reviewReservation['kind'] ?? 'food'));
+              $reviewMode = ($reviewReservation['order_mode'] ?? '') === 'advance_order'
+                  ? (string) ($reviewCopy['ahead'] ?? 'Booked ahead')
+                  : (string) ($reviewCopy['at_place_short'] ?? 'Choose on arrival');
+              $reviewStatus = trim((string) ($reviewReservation['status'] ?? ''));
+              $reviewCode = trim((string) ($reviewReservation['code'] ?? ''));
+              $reviewItems = [];
+              foreach ($reviewReservation['lines'] ?? [] as $reviewLine) {
+                  if (!is_array($reviewLine)) {
+                      continue;
+                  }
+                  $reviewItems[] = (int) ($reviewLine['qty'] ?? 0) . ' × ' . (string) ($reviewLine['item_name'] ?? '');
+              }
+            ?>
+            <article class="itin-book-reserve">
+              <?php
+                $reviewDay = 0;
+                if (!empty($isMultidayTour)) {
+                    $reviewVisit = (string) ($reviewReservation['visit_date'] ?? $reviewReservation['stop_visit_date'] ?? '');
+                    $reviewDay = $reviewVisit !== '' && !empty($tourDateDisplay)
+                        ? itinerary_day_number((string) $tourDateDisplay, $reviewVisit)
+                        : 1;
+                }
+              ?>
+              <div class="itin-book-reserve__label">Reservation<?= $reviewDay > 0 ? ' · Day ' . (int) $reviewDay : '' ?></div>
+              <strong><?= e((string) ($reviewReservation['business_name'] ?? '')) ?></strong>
+              <div><?= e($reviewMode) ?></div>
+              <?php if ($reviewCode !== '' || $reviewStatus !== ''): ?>
+                <div class="itin-book-reserve__meta"><?= e(trim($reviewCode . ($reviewStatus !== '' ? ' · ' . ucfirst(str_replace('_', ' ', $reviewStatus)) : ''))) ?></div>
+              <?php endif; ?>
+              <?php if ($reviewItems): ?>
+                <div><?= e(implode(', ', $reviewItems)) ?></div>
+                <div class="itin-book-reserve__total"><?= e((string) ($reviewCopy['total'] ?? 'Total')) ?> <?= e(format_money((float) ($reviewReservation['food_total'] ?? 0))) ?></div>
+              <?php endif; ?>
+              <div class="itin-book-reserve__note">Paid at the place. Not included in the CulTour booking total.</div>
+            </article>
+          <?php endforeach; ?>
+        </div>
+        <?php endif; ?>
+        <div class="guide-book-bill<?= $packageMaker ? ' d-none' : '' ?>" data-guide-bill data-ride-spans="<?= (int) ($rideDays ?? $dayCountDisplay) ?>">
           <ul class="guide-book-bill__rows">
             <li><span>Guests</span><strong data-bill-guests>—</strong></li>
             <li><span>Guide</span><strong data-bill-guide>—</strong></li>
@@ -2814,8 +3644,15 @@ require __DIR__ . '/../includes/header.php';
             <li class="is-math" data-bill-ride-math hidden></li>
             <li class="is-total"><span>Total</span><strong data-bill-total>—</strong></li>
           </ul>
+          <?php if (!$packageMaker): ?>
+          <label class="itin-book-review-footer__note" for="guideBookNotes">
+            <span>Note for the guide</span>
+            <textarea class="form-control form-control-sm" id="guideBookNotes" name="notes" form="guideBookForm" rows="3" maxlength="1000" placeholder="Anything the guide should know"></textarea>
+          </label>
+          <?php endif; ?>
           <p class="guide-book-bill__warn" data-bill-warn hidden></p>
         </div>
+        <?php if (!$packageMaker): ?>
         <div class="itin-book-access">
           <div class="itin-book-access__title">Accessibility needs</div>
           <p class="itin-book-access__hint">Does this party include a tourist with a disability who needs extra assistance?</p>
@@ -2837,20 +3674,183 @@ require __DIR__ . '/../includes/header.php';
             <div class="itin-book-access__cert-hint">A guest with a high-risk condition needs a doctor’s fitness-to-travel certificate (PDF or photo, up to 8 MB) so the guide knows they are safe to join the tour.</div>
           </div>
         </div>
+        <?php endif; ?>
+        <?php if ($packageMaker): ?>
+        <?php
+          $packageCoverPath = trim((string) ($GLOBALS['CULTOUR_PACKAGE_IMAGE'] ?? ''));
+          $packageCoverUrl = $packageCoverPath !== '' ? APP_URL . '/uploads/' . ltrim($packageCoverPath, '/') : '';
+          $packageInclusionList = array_values(array_filter(array_map('trim', explode(',', (string) ($GLOBALS['CULTOUR_PACKAGE_INCLUSIONS'] ?? '')))));
+        ?>
+        <div class="package-summary-extra">
+          <label class="form-label" for="packageCoverInput">Cover photo</label>
+          <input class="form-control form-control-sm" id="packageCoverInput" name="package_cover" form="guideBookForm" type="file" accept=".jpg,.jpeg,.png,.webp,.gif,image/*">
+          <img class="package-summary-extra__preview" id="packageCoverPreview" alt=""<?= $packageCoverUrl === '' ? ' hidden' : '' ?> src="<?= e($packageCoverUrl) ?>">
+          <div class="itin-date-feedback itin-field-note" data-package-cover-feedback hidden>Add a cover photo.</div>
+          <label class="form-label mt-3" for="packageDescriptionField">Package description</label>
+          <textarea class="form-control form-control-sm" id="packageDescriptionField" name="package_description" form="guideBookForm" rows="3" maxlength="120" placeholder="Describe this package"><?= e((string) ($GLOBALS['CULTOUR_PACKAGE_DESCRIPTION'] ?? '')) ?></textarea>
+          <div class="small text-muted" id="packageDescriptionCount">0 / 120</div>
+          <div class="itin-date-feedback itin-field-note" data-package-description-feedback hidden>Enter the package description.</div>
+          <label class="form-label mt-3" for="packageInclusionEntry">Inclusions</label>
+          <div class="tag-input" id="packageInclusionTags">
+            <?php foreach ($packageInclusionList as $packageInclusion): ?>
+              <span class="tag-input__chip"><?= e($packageInclusion) ?><button type="button" class="tag-input__remove" aria-label="Remove <?= e($packageInclusion) ?>">×</button></span>
+            <?php endforeach; ?>
+            <input class="tag-input__entry" id="packageInclusionEntry" type="text" maxlength="40" placeholder="Type an inclusion and press Enter">
+          </div>
+          <input type="hidden" name="package_inclusions" id="packageInclusionsField" form="guideBookForm" value="<?= e(implode(', ', $packageInclusionList)) ?>">
+          <div class="small text-muted" id="packageInclusionCount">0 / 8</div>
+          <div class="itin-date-feedback itin-field-note" data-package-inclusion-feedback hidden>Add at least one inclusion.</div>
+        </div>
+        <script>
+        (function () {
+          var box = document.getElementById('packageInclusionTags');
+          var entry = document.getElementById('packageInclusionEntry');
+          var hidden = document.getElementById('packageInclusionsField');
+          var descField = document.getElementById('packageDescriptionField');
+          var descCount = document.getElementById('packageDescriptionCount');
+          if (descField && descCount) {
+            function paintDescCount() {
+              descCount.textContent = String(descField.value.length) + ' / 120';
+            }
+            descField.addEventListener('input', paintDescCount);
+            paintDescCount();
+          }
+          var cover = document.getElementById('packageCoverInput');
+          var preview = document.getElementById('packageCoverPreview');
+          if (!box || !entry || !hidden) return;
+          function tags() {
+            return Array.prototype.map.call(box.querySelectorAll('.tag-input__chip'), function (chip) {
+              return chip.firstChild && chip.firstChild.nodeType === 3 ? chip.firstChild.textContent.trim() : '';
+            }).filter(Boolean);
+          }
+          function sync() {
+            var count = tags().length;
+            hidden.value = tags().join(', ');
+            var full = count >= 8;
+            entry.readOnly = full;
+            if (full) entry.value = '';
+            entry.placeholder = full ? '' : (count ? '' : 'Type an inclusion and press Enter');
+            var countEl = document.getElementById('packageInclusionCount');
+            if (countEl) countEl.textContent = count + ' / 8';
+          }
+          function add(text) {
+            text = String(text || '').replace(/,/g, '').trim();
+            if (!text || text.length > 40 || tags().length >= 8) return;
+            var lower = text.toLowerCase();
+            if (tags().some(function (tag) { return tag.toLowerCase() === lower; })) return;
+            var chip = document.createElement('span');
+            chip.className = 'tag-input__chip';
+            chip.appendChild(document.createTextNode(text));
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'tag-input__remove';
+            btn.setAttribute('aria-label', 'Remove ' + text);
+            btn.textContent = '×';
+            chip.appendChild(btn);
+            box.insertBefore(chip, entry);
+            sync();
+          }
+          box.addEventListener('click', function (e) {
+            var btn = e.target.closest('.tag-input__remove');
+            if (!btn || !btn.parentElement) return;
+            btn.parentElement.remove();
+            sync();
+          });
+          entry.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' || e.key === ',') {
+              e.preventDefault();
+              add(entry.value);
+              entry.value = '';
+            } else if (e.key === 'Backspace' && entry.value === '') {
+              var chips = box.querySelectorAll('.tag-input__chip');
+              if (chips.length) chips[chips.length - 1].remove();
+              sync();
+            }
+          });
+          sync();
+          if (cover && preview) {
+            cover.addEventListener('change', function () {
+              var file = cover.files && cover.files[0];
+              if (!file) return;
+              preview.src = URL.createObjectURL(file);
+              preview.hidden = false;
+            });
+          }
+        })();
+        </script>
+        <?php endif; ?>
       </div>
       <div class="modal-footer border-0 pt-0 itin-book-review-footer">
-        <div class="itin-book-review-footer__actions">
+        <div class="itin-book-review-footer__actions<?= $packageMaker ? ' itin-book-review-footer__actions--row' : '' ?>">
+          <?php if ($packageMaker): ?>
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-ct" id="itinBookProceed">Save</button>
+          <?php else: ?>
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
           <button type="button" class="btn btn-ct" id="itinBookProceed">Proceed to book</button>
-          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Back</button>
+          <?php endif; ?>
         </div>
-        <label class="itin-book-review-footer__note" for="guideBookNotes">
-          <span>Note for the guide</span>
-          <textarea class="form-control form-control-sm" id="guideBookNotes" name="notes" form="guideBookForm" rows="3" maxlength="1000" placeholder="Anything the guide should know"></textarea>
-        </label>
       </div>
     </div>
   </div>
 </div>
+<?php if ($packageMaker): ?>
+<div class="modal fade" id="itinSaveChoiceModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header border-0">
+        <h2 class="modal-title h5 mb-0">Save this itinerary</h2>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body pt-0">
+        Save these changes on the itinerary this package already uses, or keep that link and store a separate copy.
+      </div>
+      <div class="modal-footer border-0 pt-0">
+        <button type="button" class="btn btn-outline-secondary" id="itinSaveNew">Save as new itinerary</button>
+        <button type="button" class="btn btn-ct" id="itinSaveExisting">Save itinerary</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="modal fade" id="packageGuidePayModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header border-0">
+        <h2 class="modal-title h5 mb-0">Pay the tour guide</h2>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body pt-0">
+        <div class="gcash-pay">
+          <div class="gcash-pay__card">
+            <div class="gcash-pay__brand">
+              <div>
+                <div class="small opacity-75">CulTour checkout</div>
+                <strong>GCash</strong>
+              </div>
+              <i class="bi bi-wallet2 fs-3"></i>
+            </div>
+            <div class="gcash-pay__body">
+              <div class="small text-muted">Amount to pay</div>
+              <div class="gcash-pay__amount" data-package-pay-amount></div>
+              <div class="gcash-pay__qr-wrap">
+                <img data-package-pay-qr alt="Scan to pay" width="220" height="220">
+              </div>
+              <dl class="gcash-pay__meta row mb-0">
+                <dt class="col-5">Tour guide</dt>
+                <dd class="col-7" data-package-pay-guide></dd>
+              </dl>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer border-0 pt-0">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-ct" id="packageGuidePayConfirm">Pay with GCash</button>
+      </div>
+    </div>
+  </div>
+</div>
+<?php endif; ?>
 
 <?php
   ensure_place_schedule_schema();
@@ -2904,13 +3904,7 @@ require __DIR__ . '/../includes/header.php';
       $savedTrnSvc = 0;
   }
   $accFocusId = 0;
-  if (!$savedAccDeclined) {
-      $accFocusId = $savedAccId > 0 ? $savedAccId : (int) ($stayHotels[0]['id'] ?? 0);
-  }
   $trnFocusId = 0;
-  if (!$savedTrnDeclined) {
-      $trnFocusId = $savedTrnId > 0 ? $savedTrnId : (int) ($stayRides[0]['id'] ?? 0);
-  }
   [$stayStockStart, $stayStockEnd] = booking_resolve_tour_span((int) $view['id'], (string) ($view['start_date'] ?? date('Y-m-d')));
   $stayBlurb = static function (?string $text): string {
       $text = trim((string) $text);
@@ -3055,9 +4049,21 @@ require __DIR__ . '/../includes/header.php';
   <div class="modal-dialog modal-dialog-centered modal-xl">
     <div class="modal-content itin-book-review-card">
       <div class="modal-header border-0 pb-0">
-        <div>
-          <button type="button" class="stay-step-back" data-bs-dismiss="modal">Back</button>
-          <h2 class="modal-title h5 mb-0" id="stayRideModalLabel">Where will you stay?</h2>
+        <div class="stay-ride-head">
+          <button type="button" class="stay-step-back" id="stayPickBack">Back to itinerary</button>
+          <div class="stay-ride-title-row">
+            <h2 class="modal-title h5 mb-0" id="stayRideModalLabel">Where will you stay?</h2>
+            <label class="pick-radio">
+              <input type="<?= $packageMaker ? 'checkbox' : 'radio' ?>" name="stayRideAcc" value="0" data-service-id="" data-review-label="Not needed"<?= $savedAccDeclined ? ' checked' : '' ?>>
+              <span>I don’t need accommodation</span>
+            </label>
+            <?php if ($stayHotels): ?>
+            <label class="pick-search">
+              <i class="bi bi-search" aria-hidden="true"></i>
+              <input type="search" data-pick-search data-pick-search-for="stayRideAcc" placeholder="Search a place" aria-label="Search a place" autocomplete="off">
+            </label>
+            <?php endif; ?>
+          </div>
         </div>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
@@ -3065,16 +4071,8 @@ require __DIR__ . '/../includes/header.php';
         <?php if (count($stayDayChips) > 1): ?>
         <script type="application/json" id="itinTourDays"><?= json_encode($stayDayChips, JSON_UNESCAPED_UNICODE) ?></script>
         <?php endif; ?>
-        <div class="pick-board" data-pick-board data-pick-group="stayRideAcc">
-          <label class="pick-radio">
-            <input type="radio" name="stayRideAcc" value="0" data-service-id="" data-review-label="Not needed"<?= $savedAccDeclined ? ' checked' : '' ?>>
-            <span>I don’t need accommodation</span>
-          </label>
+        <div class="pick-board is-browsing" data-pick-board data-pick-group="stayRideAcc">
           <?php if ($stayHotels): ?>
-          <label class="pick-search">
-            <i class="bi bi-search" aria-hidden="true"></i>
-            <input type="search" data-pick-search placeholder="Search a place" aria-label="Search a place" autocomplete="off">
-          </label>
           <div class="pick-focus pick-focus--stay" data-pick-focus>
             <p class="pick-search__empty" data-pick-empty hidden>No places match that search.</p>
             <div class="pick-focus__stage">
@@ -3095,6 +4093,8 @@ require __DIR__ . '/../includes/header.php';
           </div>
           <?php if (!$stayHotels): ?>
             <p class="stay-ride-empty">No approved hotels or resorts yet. You can continue without accommodation.</p>
+          <?php else: ?>
+            <p class="pick-search__empty" data-pick-grid-empty hidden>No places match that search.</p>
           <?php endif; ?>
           <div class="stay-build">
           <div class="pick-shelf" data-pick-shelf<?= $accFocusId < 1 ? ' hidden' : '' ?>>
@@ -3298,22 +4298,24 @@ require __DIR__ . '/../includes/header.php';
   <div class="modal-dialog modal-dialog-centered modal-xl">
     <div class="modal-content itin-book-review-card">
       <div class="modal-header border-0 pb-0">
-        <div>
-          <button type="button" class="stay-step-back" id="ridePickBack">Back</button>
-          <h2 class="modal-title h5 mb-0" id="ridePickModalLabel">How will you get around?</h2>
+        <div class="stay-ride-head">
+          <button type="button" class="stay-step-back" id="ridePickBack">Back to accommodation</button>
+          <div class="stay-ride-title-row">
+            <h2 class="modal-title h5 mb-0" id="ridePickModalLabel">How will you get around?</h2>
+            <label class="pick-radio">
+              <input type="<?= $packageMaker ? 'checkbox' : 'radio' ?>" name="stayRideTrn" value="0" data-service-id="" data-review-label="Not needed"<?= $savedTrnDeclined ? ' checked' : '' ?>>
+              <span>I don’t need transportation</span>
+            </label>
+            <label class="pick-search">
+              <i class="bi bi-search" aria-hidden="true"></i>
+              <input type="search" data-pick-search data-pick-search-for="stayRideTrn" placeholder="Search a place" aria-label="Search a place" autocomplete="off">
+            </label>
+          </div>
         </div>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
       <div class="modal-body pt-3">
-        <div class="pick-board" data-pick-board data-pick-group="stayRideTrn">
-          <label class="pick-radio">
-            <input type="radio" name="stayRideTrn" value="0" data-service-id="" data-review-label="Not needed"<?= $savedTrnDeclined ? ' checked' : '' ?>>
-            <span>I don’t need transportation</span>
-          </label>
-          <label class="pick-search">
-            <i class="bi bi-search" aria-hidden="true"></i>
-            <input type="search" data-pick-search placeholder="Search a place" aria-label="Search a place" autocomplete="off">
-          </label>
+        <div class="pick-board is-browsing" data-pick-board data-pick-group="stayRideTrn">
           <?php if ($stayRides): ?>
           <div class="pick-focus pick-focus--stay" data-pick-focus>
             <p class="pick-search__empty" data-pick-empty hidden>No places match that search.</p>
@@ -3335,6 +4337,8 @@ require __DIR__ . '/../includes/header.php';
           </div>
           <?php if (!$stayRides): ?>
             <p class="stay-ride-empty">No approved transportation listings yet. You can continue without a ride.</p>
+          <?php else: ?>
+            <p class="pick-search__empty" data-pick-grid-empty hidden>No places match that search.</p>
           <?php endif; ?>
           <div class="stay-build">
           <div class="pick-shelf" data-pick-shelf<?= $trnFocusId < 1 ? ' hidden' : '' ?>>
@@ -3462,7 +4466,7 @@ require __DIR__ . '/../includes/header.php';
           <small data-ride-view-count>Nothing added yet</small>
           <button type="button" class="stay-view__open" data-ride-open>View</button>
         </div>
-        <button type="button" class="btn btn-ct" id="ridePickContinue"<?= ($savedTrnDeclined || $savedTrnId > 0 || $rideSavedLines) ? '' : ' disabled' ?>>Continue to tour guide</button>
+        <button type="button" class="btn btn-ct" id="ridePickContinue" data-house-free="<?= (int) ($bookGuidesTotal ?? 0) ?>"<?= ($savedTrnDeclined || $savedTrnId > 0 || $rideSavedLines) ? '' : ' disabled' ?>><?= $packageMaker ? 'Continue to in-house guide' : 'Continue to tour guide' ?></button>
       </div>
       <div class="stay-warn" data-ride-warn hidden>
         <button type="button" class="stay-pop__scrim" data-ride-warn-close aria-label="Close"></button>
@@ -3477,49 +4481,81 @@ require __DIR__ . '/../includes/header.php';
   </div>
 </div>
 
+<?php if ($packageMaker): ?>
+<div class="modal fade" id="packageNoGuideModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 class="modal-title h5">No in-house tour guide</h2>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">No in-house tour guide is available on the tour date.</div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-ct" id="packageNoGuideRequest"<?= empty($packageSystemGuides) ? ' disabled' : '' ?>>Request tour guide</button>
+      </div>
+    </div>
+  </div>
+</div>
+<?php endif; ?>
+
 <div class="modal fade guide-book-modal" id="guideBookModal" tabindex="-1" aria-labelledby="guideBookModalLabel" aria-hidden="true">
   <div class="modal-dialog modal-dialog-centered modal-xl">
     <div class="modal-content guide-book-modal__panel">
       <div class="modal-header border-0 pb-0">
-        <div>
-          <button type="button" class="stay-step-back" id="guideBookBack">Back</button>
-          <h2 class="modal-title h5 mb-0" id="guideBookModalLabel">Book a tour guide</h2>
-          <div class="small text-muted guide-book-modal__meta">
-            <span>For <?= e($view['title'] !== '' ? $view['title'] : 'Unnamed') ?></span>
-            <span data-itin-guide-date-label><?= e($guideModalDateLabel) ?></span>
-            <span data-itin-guide-meetup-label>Meetup <?= e($meetupLabel) ?></span>
+        <div class="guide-book-modal__head">
+          <button type="button" class="stay-step-back" id="guideBookBack">Back to transportation</button>
+          <div class="guide-book-modal__title-row">
+            <h2 class="modal-title h5 mb-0" id="guideBookModalLabel"><?= $packageMaker ? 'In-house tour guide' : 'Book a tour guide' ?></h2>
+            <?php if ($bookGuides || !empty($packageSystemGuides)): ?>
+            <label class="pick-search guide-pick__search">
+              <i class="bi bi-search" aria-hidden="true"></i>
+              <input type="search" id="guidePickSearch" placeholder="Search a guide" aria-label="Search a guide" autocomplete="off">
+            </label>
+            <?php endif; ?>
           </div>
         </div>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close">        </button>
       </div>
       <div class="modal-body pt-1">
-        <?php if (!$bookGuides): ?>
+        <?php if (!$bookGuides && empty($packageSystemGuides)): ?>
           <div class="text-muted p-4 text-center">
             <?php if ($bookGuidesTotal < 1): ?>
-              No approved guides with a complete profile yet.
+              <?= $packageMaker ? 'No active in-house guides yet.' : 'No approved guides with a complete profile yet.' ?>
             <?php else: ?>
               No tour guides to show right now. Try again in a moment.
             <?php endif; ?>
           </div>
           <?php else: ?>
-          <p class="guide-book-showing">Available guides</p>
-          <div class="guide-focus" id="guideFocusCarousel" aria-roledescription="carousel">
-            <button type="button" class="guide-focus__arrow guide-focus__arrow--prev" aria-label="Previous guide"><i class="bi bi-chevron-left"></i></button>
-            <div class="guide-focus__stage">
-              <article class="guide-focus__card guide-focus__card--side" data-slot="left"></article>
-              <article class="guide-focus__card guide-focus__card--center is-active" data-slot="center"></article>
-              <article class="guide-focus__card guide-focus__card--side" data-slot="right"></article>
-            </div>
-            <button type="button" class="guide-focus__arrow guide-focus__arrow--next" aria-label="Next guide"><i class="bi bi-chevron-right"></i></button>
+          <div class="guide-pick" id="guideFocusCarousel">
+            <div class="guide-pick-grid" id="guidePickGrid"></div>
           </div>
           <div class="guide-book-empty d-none" data-guide-empty>No available guides for this meetup time.</div>
           <?php endif; ?>
           <script type="application/json" id="itinOfferQuotes"><?= json_encode($offerQuotes ?? [], JSON_UNESCAPED_UNICODE) ?></script>
-          <form method="post" class="guide-book-form" id="guideBookForm" enctype="multipart/form-data"<?= !$bookGuides ? ' hidden' : '' ?>><?= csrf_field() ?>
+          <form method="post" class="guide-book-form" id="guideBookForm" enctype="multipart/form-data"<?= !$bookGuides && empty($packageSystemGuides) ? ' hidden' : '' ?>><?= csrf_field() ?>
             <input type="hidden" name="action" value="book_guide">
+            <input type="hidden" name="itinerary_save_mode" id="itinSaveMode" value="existing">
+            <input type="hidden" id="packageAlreadyMade" value="<?= (int) ($GLOBALS['CULTOUR_PACKAGE_MADE'] ?? 0) ?>">
+            <input type="hidden" id="itinBaseline" value="<?php
+              $itinBaseline = '';
+              if ($packageMaker && !empty($view['id'])) {
+                  $itinBaseKey = 'pkg_itin_base_' . (int) $view['id'];
+                  if (empty($_SESSION[$itinBaseKey])) {
+                      $_SESSION[$itinBaseKey] = itinerary_content_hash((int) $view['id']);
+                  }
+                  $itinBaseline = (string) $_SESSION[$itinBaseKey];
+              }
+              echo e($itinBaseline);
+            ?>">
             <input type="hidden" name="itinerary_id" value="<?= (int) $view['id'] ?>">
             <input type="hidden" name="guide_id" id="guideBookGuideId" value="">
             <input type="hidden" name="party_size" id="guideBookPartySize" value="<?= (int) ($view['party_size'] ?? 0) >= 1 ? (int) $view['party_size'] : '' ?>">
+            <input type="hidden" name="guide_adults" id="guideAdultsField" value="">
+            <input type="hidden" name="guide_children" id="guideChildrenField" value="">
+            <input type="hidden" name="guide_infants" id="guideInfantsField" value="">
+            <input type="hidden" name="guide_special" id="guideSpecialField" value="">
+            <input type="hidden" name="guide_needs" id="guideNeedsField" value="">
             <input type="hidden" name="accommodation_business_id" id="stayAccId" value="">
             <input type="hidden" name="accommodation_service_id" id="stayAccService" value="">
             <input type="hidden" name="accommodation_declined" id="stayAccDeclined" value="0">
@@ -3531,9 +4567,356 @@ require __DIR__ . '/../includes/header.php';
             <button type="submit" class="d-none" id="guideBookSubmit" disabled>Pick this tour guide</button>
           </form>
         </div>
+        <?php if ($bookGuides || !empty($packageSystemGuides)): ?>
+        <div class="modal-footer stay-footer border-0 pt-0" id="guidePickDock">
+          <div class="stay-view stay-view--bar">
+            <span class="stay-view__kicker">Your guide</span>
+            <strong data-guide-view-name></strong>
+            <small data-guide-view-rate>Select a guide</small>
+          </div>
+          <button type="button" class="btn btn-ct" id="guidePickConfirm" disabled>Pick this tour guide</button>
+        </div>
+        <?php endif; ?>
+    </div>
+  </div>
+</div>
+<?php if (!$packageMaker): ?>
+<div class="modal fade" id="guideGuestModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header border-0">
+        <h2 class="modal-title h5 mb-0" id="guideGuestLabel">Guests joining</h2>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body pt-0">
+        <p class="mb-2" id="guideInfantQuestion">1. Is your group traveling with an infant/toddler (3 months to 3 years old)?</p>
+        <p class="small text-muted mb-2">Infants and toddlers are not counted as guests.</p>
+        <div class="pkg-choice mb-3">
+          <label><input type="radio" name="guideInfantChoice" value="yes"> Yes</label>
+          <label><input type="radio" name="guideInfantChoice" value="no"> No</label>
+        </div>
+        <div class="row g-2 mb-3">
+          <div class="col" id="guideAdultsCol">
+            <label class="form-label" for="guideAdults">Adults</label>
+            <input type="number" min="0" class="form-control" id="guideAdults" inputmode="numeric">
+          </div>
+          <div class="col" id="guideChildrenCol">
+            <label class="form-label" for="guideChildren">Children</label>
+            <input type="number" min="0" class="form-control" id="guideChildren" inputmode="numeric">
+          </div>
+          <div class="col d-none" id="guideInfantsCol">
+            <label class="form-label" for="guideInfants">Infant/toddler</label>
+            <input type="number" min="1" class="form-control" id="guideInfants" inputmode="numeric">
+          </div>
+        </div>
+        <p class="mb-2" id="guideSpecialQuestion">2. Does anyone in your group have special requirements?</p>
+        <div class="pkg-choice">
+          <label><input type="radio" name="guideSpecialChoice" value="yes"> Yes</label>
+          <label><input type="radio" name="guideSpecialChoice" value="no"> No</label>
+        </div>
+        <p class="small text-danger mt-2 mb-0" id="guideGuestError" hidden></p>
+      </div>
+      <div class="modal-footer border-0 pt-0">
+        <button type="button" class="btn btn-ct w-100" id="guideGuestProceed">Proceed</button>
       </div>
     </div>
   </div>
+</div>
+<div class="modal fade" id="guideNeedsModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header border-0">
+        <h2 class="modal-title h5 mb-0">Special requirements</h2>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body pt-0">
+        <?php
+        $guideNeedGroups = [
+            'Accessibility & Assistance Needs' => [
+                ['Wheelchair assistance', false],
+                ['Difficulty walking or standing for long periods', false],
+                ['Visual impairment assistance', false],
+                ['Hearing impairment assistance', false],
+                ['Senior citizen assistance', false],
+                ['Pregnant tourist', false],
+                ['Assistance with stairs or uneven terrain', false],
+                ['Other accessibility requirements', true],
+            ],
+            'Dietary Requirements & Food Preferences' => [
+                ['No pork', false],
+                ['No beef', false],
+                ['Vegetarian', false],
+                ['Vegan', false],
+                ['Seafood allergy', false],
+                ['Peanut allergy', false],
+                ['Dairy-free', false],
+                ['Gluten-free', false],
+                ['Other food allergies or dietary restrictions', true],
+            ],
+            'Medical & Health Considerations' => [
+                ['Motion sickness', false],
+                ['Easily fatigued', false],
+                ['Requires regular medication breaks', false],
+                ['Requires frequent restroom access', false],
+                ['Other health-related travel considerations', true],
+            ],
+        ];
+        foreach ($guideNeedGroups as $groupTitle => $groupItems):
+        ?>
+          <h3 class="h6 mt-3 mb-2"><?= e($groupTitle) ?></h3>
+          <?php foreach ($groupItems as $item): ?>
+            <div class="pkg-need">
+              <label>
+                <input type="checkbox" data-need-check value="<?= e($item[0]) ?>"<?= $item[1] ? ' data-need-other="1"' : '' ?>>
+                <span><?= e($item[0]) ?></span>
+              </label>
+              <input type="number" min="1" class="form-control form-control-sm pkg-need__count" placeholder="How many" hidden>
+              <?php if ($item[1]): ?>
+                <input type="text" class="form-control form-control-sm pkg-need__detail" maxlength="160" placeholder="What is it?" hidden>
+              <?php endif; ?>
+            </div>
+          <?php endforeach; ?>
+        <?php endforeach; ?>
+        <h3 class="h6 mt-3 mb-2">Other special requests</h3>
+        <textarea class="form-control" id="guideOtherRequest" rows="3" maxlength="300" placeholder="Write any other request"></textarea>
+        <p class="small text-danger mt-2 mb-0" id="guideNeedsError" hidden></p>
+      </div>
+      <div class="modal-footer border-0 pt-0">
+        <button type="button" class="btn btn-ct w-100" id="guideNeedsProceed">Proceed</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+(function () {
+  var guestModal = document.getElementById('guideGuestModal');
+  var needsModal = document.getElementById('guideNeedsModal');
+  if (!guestModal || !needsModal) return;
+  var adults = document.getElementById('guideAdults');
+  var children = document.getElementById('guideChildren');
+  var infants = document.getElementById('guideInfants');
+  var guestError = document.getElementById('guideGuestError');
+  var needsError = document.getElementById('guideNeedsError');
+
+  function partyCount() {
+    var el = document.getElementById('itinPartySize') || document.getElementById('guideBookPartySize');
+    var n = parseInt(el && el.value ? el.value : '1', 10);
+    return n >= 1 ? n : 1;
+  }
+  function onePerson() { return partyCount() === 1; }
+  function infantYes() {
+    var picked = guestModal.querySelector('input[name="guideInfantChoice"]:checked');
+    return !!(picked && picked.value === 'yes');
+  }
+  function specialYes() {
+    var picked = guestModal.querySelector('input[name="guideSpecialChoice"]:checked');
+    return picked ? picked.value : '';
+  }
+  function showError(msg) {
+    if (!guestError) return;
+    guestError.hidden = !msg;
+    guestError.textContent = msg || '';
+  }
+  function syncInfant() {
+    var col = document.getElementById('guideInfantsCol');
+    var on = infantYes();
+    if (col) col.classList.toggle('d-none', !on);
+    if (!on && infants) infants.value = '';
+  }
+  function fillRemainder(from) {
+    if (onePerson()) return;
+    var total = partyCount();
+    var source = from === 'children' ? children : adults;
+    var other = from === 'children' ? adults : children;
+    var n = parseInt(source.value || '0', 10);
+    if (!isFinite(n) || n < 0) n = 0;
+    if (n > total) n = total;
+    source.value = String(n);
+    other.value = String(total - n);
+  }
+  guestModal.addEventListener('change', function (e) {
+    if (e.target && e.target.name === 'guideInfantChoice') syncInfant();
+    showError('');
+  });
+  if (adults) adults.addEventListener('input', function () { fillRemainder('adults'); });
+  if (children) children.addEventListener('input', function () { fillRemainder('children'); });
+  needsModal.addEventListener('change', function (e) {
+    var box = e.target.closest && e.target.closest('[data-need-check]');
+    if (!box) return;
+    var row = box.closest('.pkg-need');
+    if (!row) return;
+    row.querySelectorAll('.pkg-need__count, .pkg-need__detail').forEach(function (field) {
+      var hideCount = field.classList.contains('pkg-need__count') && onePerson();
+      field.hidden = !box.checked || hideCount;
+      if (!box.checked) field.value = '';
+    });
+    if (needsError) needsError.hidden = true;
+  });
+
+  function guestOk() {
+    var total = partyCount();
+    if (specialYes() === '') {
+      showError('Choose Yes or No.');
+      return false;
+    }
+    if (!infantYes() && !guestModal.querySelector('input[name="guideInfantChoice"]:checked')) {
+      showError('Choose Yes or No.');
+      return false;
+    }
+    if (onePerson()) {
+      adults.value = '1';
+      children.value = '0';
+    } else if (adults.value === '' || children.value === '') {
+      showError('Enter the number of adults and children.');
+      return false;
+    }
+    var a = parseInt(adults.value || '0', 10) || 0;
+    var c = parseInt(children.value || '0', 10) || 0;
+    var i = infantYes() ? (parseInt(infants.value || '0', 10) || 0) : 0;
+    if (infantYes() && i < 1) {
+      showError('Enter how many infants or toddlers.');
+      return false;
+    }
+    if (!onePerson() && a + c !== total) {
+      showError('Adults and children must add up to ' + total + '. Infants and toddlers are not counted.');
+      return false;
+    }
+    showError('');
+    return true;
+  }
+  function saveFields(needs) {
+    document.getElementById('guideAdultsField').value = adults.value || '0';
+    document.getElementById('guideChildrenField').value = children.value || '0';
+    document.getElementById('guideInfantsField').value = infantYes() ? (infants.value || '0') : '0';
+    document.getElementById('guideSpecialField').value = specialYes() === 'yes' ? 'yes' : 'no';
+    document.getElementById('guideNeedsField').value = JSON.stringify(needs || []);
+    var guestsDd = document.querySelector('[data-itin-review="guests"]');
+    if (guestsDd) {
+      var text = (adults.value || '0') + ' adults, ' + (children.value || '0') + ' children';
+      if (infantYes() && infants.value) text += ', ' + infants.value + ' infant/toddler (not counted)';
+      guestsDd.textContent = text;
+    }
+    var needsDd = document.querySelector('[data-itin-review="needs"]');
+    if (needsDd) {
+      needsDd.textContent = (needs && needs.length)
+        ? needs.map(function (item) {
+            return item.label + (item.count ? ' · ' + item.count : '') + (item.detail ? ' · ' + item.detail : '');
+          }).join('; ')
+        : 'None';
+    }
+  }
+  function continueReview(needs) {
+    saveFields(needs);
+    var reviewEl = document.getElementById('itinBookReviewModal');
+    function showReview() {
+      if (typeof syncBookingDetailsPreview === 'function') syncBookingDetailsPreview();
+      saveFields(needs);
+      if (typeof window.itinRenderBill === 'function') window.itinRenderBill();
+      var access = reviewEl ? reviewEl.querySelector('.itin-book-access') : null;
+      var special = document.getElementById('guideSpecialField');
+      if (access) access.hidden = !!(special && (special.value === 'yes' || special.value === 'no'));
+      if (!reviewEl || !window.bootstrap) return;
+      document.body.appendChild(reviewEl);
+      reviewEl.style.zIndex = '2000';
+      bootstrap.Modal.getOrCreateInstance(reviewEl).show();
+    }
+    var open = [guestModal, needsModal].filter(function (el) { return el.classList.contains('show'); });
+    if (!open.length || !window.bootstrap) {
+      showReview();
+      return;
+    }
+    var left = open.length;
+    open.forEach(function (el) {
+      el.addEventListener('hidden.bs.modal', function once() {
+        el.removeEventListener('hidden.bs.modal', once);
+        left -= 1;
+        if (left === 0) showReview();
+      });
+      bootstrap.Modal.getOrCreateInstance(el).hide();
+    });
+  }
+  window.openGuideGuestModal = function () {
+    var total = partyCount();
+    var solo = total === 1;
+    var label = document.getElementById('guideGuestLabel');
+    if (label) label.textContent = solo ? '1 person traveling' : (total + ' guests joining');
+    var iq = document.getElementById('guideInfantQuestion');
+    if (iq) iq.textContent = solo
+      ? 'Are you traveling with an infant/toddler (3 months to 3 years old)?'
+      : '1. Is your group traveling with an infant/toddler (3 months to 3 years old)?';
+    var sq = document.getElementById('guideSpecialQuestion');
+    if (sq) sq.textContent = solo
+      ? 'Do you have any special requirements?'
+      : '2. Does anyone in your group have special requirements?';
+    document.getElementById('guideAdultsCol').classList.toggle('d-none', solo);
+    document.getElementById('guideChildrenCol').classList.toggle('d-none', solo);
+    if (solo) { adults.value = '1'; children.value = '0'; }
+    guestModal.querySelectorAll('input[type="radio"]').forEach(function (r) { r.checked = false; });
+    syncInfant();
+    showError('');
+    if (window.bootstrap) bootstrap.Modal.getOrCreateInstance(guestModal).show();
+  };
+  document.getElementById('guideGuestProceed').addEventListener('click', function () {
+    if (!guestOk()) return;
+    if (specialYes() === 'yes') {
+      if (needsError) needsError.hidden = true;
+      var other = document.getElementById('guideOtherRequest');
+      if (other) other.value = '';
+      needsModal.querySelectorAll('[data-need-check]').forEach(function (box) {
+        box.checked = false;
+        var row = box.closest('.pkg-need');
+        if (!row) return;
+        row.querySelectorAll('.pkg-need__count, .pkg-need__detail').forEach(function (field) {
+          field.hidden = true;
+          field.value = '';
+          field.classList.remove('is-invalid');
+        });
+      });
+      bootstrap.Modal.getOrCreateInstance(needsModal).show();
+      return;
+    }
+    continueReview([]);
+  });
+  document.getElementById('guideNeedsProceed').addEventListener('click', function () {
+    var total = partyCount();
+    var needs = [];
+    var firstBad = null;
+    needsModal.querySelectorAll('[data-need-check]').forEach(function (box) {
+      if (!box.checked) return;
+      var row = box.closest('.pkg-need');
+      var countEl = row ? row.querySelector('.pkg-need__count') : null;
+      var detailEl = row ? row.querySelector('.pkg-need__detail') : null;
+      var count = onePerson() ? 1 : (countEl ? parseInt(countEl.value || '', 10) : 0);
+      var bad = null;
+      if (!onePerson() && (!count || count < 1 || count > total)) bad = countEl;
+      var detail = detailEl ? detailEl.value.trim() : '';
+      if (!bad && box.getAttribute('data-need-other') === '1' && detail === '') bad = detailEl;
+      if (bad) {
+        bad.classList.add('is-invalid');
+        if (!firstBad) firstBad = bad;
+        return;
+      }
+      needs.push({ label: box.value, count: count, detail: detail });
+    });
+    var other = document.getElementById('guideOtherRequest');
+    var otherText = other ? other.value.trim() : '';
+    if (otherText) needs.push({ label: 'Other special requests', count: 1, detail: otherText });
+    if (firstBad) {
+      firstBad.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      return;
+    }
+    if (!needs.length) {
+      if (needsError) {
+        needsError.hidden = false;
+        needsError.textContent = 'Check at least one requirement, or write an other request.';
+      }
+      return;
+    }
+    continueReview(needs);
+  });
+})();
+</script>
+<?php endif; ?>
 <?php endif; ?>
 
 <?php if ($canEdit && $view): ?>
@@ -3636,13 +5019,7 @@ require __DIR__ . '/../includes/header.php';
         <div class="itin-leave-card__field">
           <label class="form-label small mb-1">Meetup time</label>
           <div class="itin-meetup-time">
-            <input type="text" class="form-control itin-meetup-time__clock" id="itinMeetupDropClock"
-                   inputmode="numeric" autocomplete="off" placeholder="--:--" maxlength="5"
-                   aria-label="Meetup time">
-            <select class="form-select itin-meetup-time__ampm" id="itinMeetupDropAmPm" aria-label="AM or PM">
-              <option value="AM">AM</option>
-              <option value="PM">PM</option>
-            </select>
+            <input type="time" class="form-control itin-meetup-time__clock" id="itinMeetupDropClock" aria-label="Meetup time">
           </div>
         </div>
       </div>
@@ -4187,7 +5564,11 @@ CulTourMap.renderItineraryRouteMap('itinRouteMap', <?= json_encode($mapStops, JS
       || action === 'auto_generate'
       || action === 'book_guide'
       || action === 'save_draft'
-      || action === 'clone';
+      || action === 'clone'
+      || action === 'reserve_submit'
+      || action === 'reserve_cancel'
+      || action === 'reserve_replace'
+      || action === 'reserve_draft_clear';
   }
 
   document.addEventListener('submit', function (e) {
@@ -4566,6 +5947,216 @@ CulTourMap.renderItineraryRouteMap('itinRouteMap', <?= json_encode($mapStops, JS
     return String(hNum).padStart(2, '0') + ':' + minStr;
   }
 
+  function time24ToDisplay(value) {
+    var m = String(value || '').trim().match(/^(\d{1,2}):(\d{2})/);
+    if (!m) return '';
+    var h = parseInt(m[1], 10);
+    var min = parseInt(m[2], 10);
+    if (!isFinite(h) || !isFinite(min) || h < 0 || h > 23 || min < 0 || min > 59) return '';
+    var ampm = h >= 12 ? 'PM' : 'AM';
+    var h12 = h % 12;
+    if (h12 === 0) h12 = 12;
+    return h12 + ':' + String(min).padStart(2, '0') + ' ' + ampm;
+  }
+
+  function displayToTime24(display) {
+    var m = String(display || '').trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+    if (!m) return '';
+    var h = parseInt(m[1], 10);
+    var min = parseInt(m[2], 10);
+    if (h === 12) h = 0;
+    if (m[3].toUpperCase() === 'PM') h += 12;
+    if (h < 0 || h > 23 || min < 0 || min > 59) return '';
+    return String(h).padStart(2, '0') + ':' + String(min).padStart(2, '0');
+  }
+  window.itinDisplayToTime24 = displayToTime24;
+  window.itinGuideHourWindows = <?= json_encode($packageMaker ? null : tourist_meetup_hour_windows()) ?>;
+
+  function meetupWindowForDay(day) {
+    var windows = window.itinGuideHourWindows;
+    if (!windows) return null;
+    var dateEl = document.querySelector('[data-itin-day-section="' + String(day) + '"] [data-itin-day-date-input]');
+    var ymd = dateEl ? String(dateEl.value || '').trim() : '';
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
+    var dow = new Date(ymd + 'T12:00:00').getDay();
+    return windows[String(dow)] || null;
+  }
+
+  function applyMeetupHourWindow(clockEl) {
+    if (!clockEl) return;
+    var day = clockEl.getAttribute('data-day') || '1';
+    var win = meetupWindowForDay(day);
+    if (!win) {
+      clockEl.removeAttribute('min');
+      clockEl.removeAttribute('max');
+      return;
+    }
+    clockEl.min = win.min;
+    clockEl.max = win.max;
+    var value = String(clockEl.value || '');
+    if (!value || (value >= win.min && value <= win.max)) {
+      clockEl.classList.remove('is-invalid');
+      return;
+    }
+    if (value && (value < win.min || value > win.max)) {
+      clockEl.classList.add('is-invalid');
+      var card = clockEl.closest('[data-itin-day-meetup]');
+      var fb = card && card.querySelector('[data-itin-day-meetup-feedback]');
+      if (fb) {
+        fb.hidden = false;
+        fb.textContent = 'Pick a time between ' + win.min + ' and ' + win.max + '.';
+      }
+    }
+  }
+
+  function applyAllMeetupHourWindows() {
+    document.querySelectorAll('[data-itin-day-meetup-clock]').forEach(applyMeetupHourWindow);
+  }
+  window.itinApplyMeetupHourWindow = applyMeetupHourWindow;
+  applyAllMeetupHourWindows();
+
+  (function () {
+    document.querySelectorAll('input[type="time"].itin-meetup-time__clock').forEach(function (clock) {
+      clock.classList.add('itin-meetup-time__clock--custom');
+      clock.readOnly = false;
+    });
+    var pop = document.createElement('div');
+    pop.className = 'itin-time-pop';
+    pop.hidden = true;
+    document.body.appendChild(pop);
+    var openClock = null;
+
+    function clockMins(value) {
+      var m = String(value || '').match(/^(\d{1,2}):(\d{2})$/);
+      if (!m) return null;
+      return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+    }
+
+    function hourLabel(h) {
+      var ampm = h >= 12 ? 'PM' : 'AM';
+      var h12 = h % 12;
+      if (h12 === 0) h12 = 12;
+      return h12 + ' ' + ampm;
+    }
+
+    function closePop() {
+      pop.hidden = true;
+      openClock = null;
+    }
+
+    function paintHours(clock) {
+      var win = meetupWindowForDay(clock.getAttribute('data-day') || '1');
+      var minM = win ? clockMins(win.min) : 0;
+      var maxM = win ? clockMins(win.max) : (23 * 60 + 59);
+      pop.replaceChildren();
+      var title = document.createElement('p');
+      title.className = 'itin-time-pop__title';
+      title.textContent = 'Choose a time';
+      pop.appendChild(title);
+      var grid = document.createElement('div');
+      grid.className = 'itin-time-pop__grid';
+      for (var h = 0; h < 24; h++) {
+        var start = h * 60;
+        var blocked = win && (start + 59 < minM || start > maxM);
+        var current = clockMins(clock.value);
+        var selected = current !== null && Math.floor(current / 60) === h;
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'itin-time-pop__hour' + (blocked ? ' is-blocked' : '') + (selected ? ' is-selected' : '');
+        btn.textContent = hourLabel(h);
+        btn.disabled = !!blocked;
+        if (blocked) btn.title = 'Not available';
+        btn.setAttribute('data-hour', String(h));
+        grid.appendChild(btn);
+      }
+      pop.appendChild(grid);
+      placePop(clock);
+    }
+
+    function paintMinutes(clock, hour) {
+      var win = meetupWindowForDay(clock.getAttribute('data-day') || '1');
+      var minM = win ? clockMins(win.min) : 0;
+      var maxM = win ? clockMins(win.max) : (23 * 60 + 59);
+      pop.replaceChildren();
+      var title = document.createElement('p');
+      title.className = 'itin-time-pop__title';
+      title.textContent = hourLabel(hour);
+      pop.appendChild(title);
+      var back = document.createElement('button');
+      back.type = 'button';
+      back.className = 'itin-time-pop__min';
+      back.textContent = 'Back';
+      back.addEventListener('click', function () { paintHours(clock); });
+      pop.appendChild(back);
+      var grid = document.createElement('div');
+      grid.className = 'itin-time-pop__grid';
+      [0, 15, 30, 45].forEach(function (min) {
+        var total = hour * 60 + min;
+        var blocked = win && (total < minM || total > maxM);
+        var current = clockMins(clock.value);
+        var selected = current !== null && current === total;
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'itin-time-pop__min' + (blocked ? ' is-blocked' : '') + (selected ? ' is-selected' : '');
+        btn.textContent = String(min).padStart(2, '0');
+        btn.disabled = blocked;
+        if (!blocked) {
+          btn.addEventListener('click', function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            var hhmm = String(hour).padStart(2, '0') + ':' + String(min).padStart(2, '0');
+            clock.removeAttribute('min');
+            clock.removeAttribute('max');
+            clock.value = hhmm;
+            clock.blur();
+            clock.dispatchEvent(new Event('input', { bubbles: true }));
+            clock.dispatchEvent(new Event('change', { bubbles: true }));
+            closePop();
+          });
+        }
+        grid.appendChild(btn);
+      });
+      pop.appendChild(grid);
+      placePop(clock);
+    }
+
+    function placePop(clock) {
+      if (!clock) return;
+      var rect = clock.getBoundingClientRect();
+      var height = pop.offsetHeight || 160;
+      var width = pop.offsetWidth || 220;
+      var top = rect.bottom + 6;
+      if (top + height > window.innerHeight - 8) top = Math.max(8, rect.top - height - 6);
+      pop.style.top = top + 'px';
+      pop.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8)) + 'px';
+    }
+
+    pop.addEventListener('click', function (e) {
+      var hourBtn = e.target.closest('[data-hour]');
+      if (!hourBtn || !openClock || hourBtn.disabled) return;
+      paintMinutes(openClock, parseInt(hourBtn.getAttribute('data-hour'), 10));
+    });
+
+    function openPop(clock) {
+      openClock = clock;
+      pop.hidden = false;
+      paintHours(clock);
+    }
+
+    document.addEventListener('mousedown', function (e) {
+      var clock = e.target.closest && e.target.closest('input[type="time"].itin-meetup-time__clock--custom');
+      if (clock) {
+        e.preventDefault();
+        openPop(clock);
+        return;
+      }
+      if (!pop.hidden && !pop.contains(e.target)) closePop();
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') closePop();
+    });
+  })();
+
   function dayMeetupClock(day) {
     var card = document.querySelector('[data-itin-day-meetup="' + String(day) + '"]');
     return card ? card.querySelector('[data-itin-day-meetup-clock]') : null;
@@ -4578,18 +6169,8 @@ CulTourMap.renderItineraryRouteMap('itinRouteMap', <?= json_encode($mapStops, JS
 
   function composeDayMeetupValue(day) {
     var clockEl = dayMeetupClock(day);
-    var ampmEl = dayMeetupAmPm(day);
-    if (!clockEl || !ampmEl) return '';
-    var clock = String(clockEl.value || '').trim();
-    if (!clock) return '';
-    var m = clock.match(/^(\d{1,2})(?::(\d{1,2}))?$/);
-    if (!m) return '';
-    var h = parseInt(m[1], 10);
-    var min = m[2] !== undefined ? parseInt(m[2], 10) : NaN;
-    if (h === 0) h = 12;
-    if (h < 1 || h > 12) return '';
-    if (isNaN(min) || min < 0 || min > 59) return '';
-    return h + ':' + String(min).padStart(2, '0') + ' ' + (ampmEl.value || 'AM');
+    if (!clockEl) return '';
+    return time24ToDisplay(clockEl.value);
   }
 
   function composeMeetupValue() {
@@ -4600,22 +6181,17 @@ CulTourMap.renderItineraryRouteMap('itinRouteMap', <?= json_encode($mapStops, JS
 
   function paintDayMeetupClock(day, display) {
     var clockEl = dayMeetupClock(day);
-    var ampmEl = dayMeetupAmPm(day);
     var labelEl = document.querySelector('[data-itin-day-meetup="' + String(day) + '"] [data-itin-meetup-card-label]');
     var v = String(display || '').trim();
-    var m = v.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
-    if (!m) {
+    var time24 = displayToTime24(v);
+    if (!time24) {
       if (clockEl) clockEl.value = '';
-      if (ampmEl) ampmEl.value = 'AM';
       if (labelEl) labelEl.textContent = 'Meetup time not set';
       if (window.itinSyncMeetupTimeFeedback) window.itinSyncMeetupTimeFeedback();
       return;
     }
-    var h = parseInt(m[1], 10);
-    if (h === 0) h = 12;
-    if (clockEl) clockEl.value = String(h).padStart(2, '0') + ':' + m[2];
-    if (ampmEl) ampmEl.value = m[3].toUpperCase();
-    if (labelEl) labelEl.textContent = 'Meetup time · ' + h + ':' + m[2] + ' ' + m[3].toUpperCase();
+    if (clockEl) clockEl.value = time24;
+    if (labelEl) labelEl.textContent = 'Meetup time · ' + time24ToDisplay(time24);
     if (window.itinSyncMeetupTimeFeedback) window.itinSyncMeetupTimeFeedback();
   }
   window.itinPaintDayMeetupClock = paintDayMeetupClock;
@@ -4946,10 +6522,6 @@ CulTourMap.renderItineraryRouteMap('itinRouteMap', <?= json_encode($mapStops, JS
             clockEl.setAttribute('data-day', String(nextDay));
             clockEl.setAttribute('aria-label', 'Day ' + nextDay + ' meetup time');
           }
-          if (ampmEl) {
-            ampmEl.value = 'AM';
-            ampmEl.setAttribute('data-day', String(nextDay));
-          }
         }
         var meetupFb = meetupCard.querySelector('[data-itin-day-meetup-feedback]');
         if (!meetupFb) {
@@ -5005,10 +6577,7 @@ CulTourMap.renderItineraryRouteMap('itinRouteMap', <?= json_encode($mapStops, JS
             '<div class="itin-meetup-time-row">' +
               '<span class="itin-meetup-time-row__label">Meetup time ·</span>' +
               '<div class="itin-meetup-time" data-itin-day-meetup-time="' + nextDay + '">' +
-                '<input type="text" class="form-control form-control-sm itin-meetup-time__clock" data-itin-day-meetup-clock data-day="' + nextDay + '" inputmode="numeric" autocomplete="off" placeholder="--:--" maxlength="5" aria-label="Day ' + nextDay + ' meetup time" value="">' +
-                '<select class="form-select form-select-sm itin-meetup-time__ampm" data-itin-day-meetup-ampm data-day="' + nextDay + '" aria-label="AM or PM">' +
-                  '<option value="AM" selected>AM</option><option value="PM">PM</option>' +
-                '</select>' +
+                '<input type="time" class="form-control form-control-sm itin-meetup-time__clock itin-meetup-time__clock--custom" data-itin-day-meetup-clock data-day="' + nextDay + '" aria-label="Day ' + nextDay + ' meetup time" value="">' +
               '</div>' +
             '</div>' +
             '<div class="itin-date-feedback" data-itin-day-meetup-feedback hidden>Meetup time not set</div>' +
@@ -5082,7 +6651,15 @@ CulTourMap.renderItineraryRouteMap('itinRouteMap', <?= json_encode($mapStops, JS
   }
 
   function tourDateMin() {
-    return String(form.getAttribute('data-itin-today') || '').trim();
+    var min = String(form.getAttribute('data-itin-today') || '').trim();
+    if (!document.body.classList.contains('package-maker') || !min) return min;
+    var parts = min.split('-');
+    if (parts.length !== 3) return min;
+    var dt = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+    dt.setDate(dt.getDate() + 1);
+    var month = String(dt.getMonth() + 1).padStart(2, '0');
+    var day = String(dt.getDate()).padStart(2, '0');
+    return dt.getFullYear() + '-' + month + '-' + day;
   }
 
   function isPastTourDate(ymd) {
@@ -5091,7 +6668,9 @@ CulTourMap.renderItineraryRouteMap('itinRouteMap', <?= json_encode($mapStops, JS
   }
 
   function flagPastTourDates() {
-    var msg = 'Tour date cannot be in the past. Choose today or a future date.';
+    var msg = document.body.classList.contains('package-maker')
+      ? 'The package tour date must be at least 2 days from today.'
+      : 'Tours cannot be booked for today. Choose tomorrow or a later date.';
     var past = false;
     if (dateEl && isPastTourDate(dateEl.value)) {
       past = true;
@@ -5272,6 +6851,8 @@ CulTourMap.renderItineraryRouteMap('itinRouteMap', <?= json_encode($mapStops, JS
       var body = new FormData(form);
       body.set('action', 'update_meetup');
       if (dateEl) body.set('start_date', String(dateEl.value || '').trim());
+      var closePick = document.getElementById('packageCloseDate');
+      if (closePick && !closePick.disabled) body.set('package_close_date', String(closePick.value || '').trim());
       if (multiEl) {
         if (multiEl.checked) body.set('is_multiday', '1');
         else body.delete('is_multiday');
@@ -5337,7 +6918,7 @@ CulTourMap.renderItineraryRouteMap('itinRouteMap', <?= json_encode($mapStops, JS
     var availDate = String(form.getAttribute('data-itin-avail-date') || '').trim();
     var availMeetup = String(form.getAttribute('data-itin-avail-meetup') || '').trim();
     var needMeetup = reopen === 'review';
-    if (!curDate) {
+    if (!curDate && !(touristDate && touristDate.checked)) {
       showDateError('Set a tour date before booking a guide.');
       if (dateEl) dateEl.focus();
       return Promise.resolve({ ok: false, reason: 'need-date' });
@@ -5577,13 +7158,70 @@ CulTourMap.renderItineraryRouteMap('itinRouteMap', <?= json_encode($mapStops, JS
     dateEl.addEventListener('change', function () {
       if (isPastTourDate(dateEl.value)) {
         dateEl.value = dateEl.getAttribute('data-prev-date') || '';
-        showDateError('Tour date cannot be in the past. Choose today or a future date.');
+        showDateError(document.body.classList.contains('package-maker')
+          ? 'The package tour date must be at least 2 days from today.'
+          : 'Tours cannot be booked for today. Choose tomorrow or a later date.');
         return;
       }
       syncAddDayPicker();
+      if (typeof syncPackageDateChoice === 'function') syncPackageDateChoice();
       saveSchedule({});
     });
     dateEl.addEventListener('input', syncAddDayPicker);
+  }
+  var touristDate = document.getElementById('packageDateTourist');
+  if (touristDate && dateEl) {
+    function cutoffBeforeTour(ymd) {
+      var parts = String(ymd || '').split('-');
+      if (parts.length !== 3) return '';
+      var dt = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+      if (isNaN(dt.getTime())) return '';
+      dt.setDate(dt.getDate() - 2);
+      var month = String(dt.getMonth() + 1).padStart(2, '0');
+      var day = String(dt.getDate()).padStart(2, '0');
+      return dt.getFullYear() + '-' + month + '-' + day;
+    }
+    function syncPackageDateChoice() {
+      var closeEl = document.getElementById('packageCloseDate');
+      dateEl.disabled = touristDate.checked;
+      if (closeEl) {
+        var latest = touristDate.checked ? '' : cutoffBeforeTour(dateEl.value);
+        closeEl.disabled = touristDate.checked;
+        if (latest) closeEl.max = latest;
+        else closeEl.removeAttribute('max');
+        var todayParts = String(form.getAttribute('data-itin-today') || '').split('-');
+        if (todayParts.length === 3) {
+          var todayDt = new Date(Number(todayParts[0]), Number(todayParts[1]) - 1, Number(todayParts[2]));
+          todayDt.setDate(todayDt.getDate() - 1);
+          var tMonth = String(todayDt.getMonth() + 1).padStart(2, '0');
+          var tDay = String(todayDt.getDate()).padStart(2, '0');
+          closeEl.min = todayDt.getFullYear() + '-' + tMonth + '-' + tDay;
+        }
+        if (touristDate.checked) closeEl.value = '';
+      }
+      if (touristDate.checked) clearDateError();
+    }
+    touristDate.addEventListener('change', function () {
+      syncPackageDateChoice();
+      if (touristDate.checked) {
+        ['stayRideModal', 'ridePickModal', 'guideBookModal', 'packageNoGuideModal'].forEach(function (id) {
+          var el = document.getElementById(id);
+          if (el && window.bootstrap) {
+            var inst = bootstrap.Modal.getInstance(el);
+            if (inst) inst.hide();
+          }
+        });
+      }
+      saveSchedule({});
+    });
+    dateEl.addEventListener('change', syncPackageDateChoice);
+    syncPackageDateChoice();
+  }
+  var packageCloseDate = document.getElementById('packageCloseDate');
+  if (packageCloseDate) {
+    packageCloseDate.addEventListener('change', function () {
+      saveSchedule({});
+    });
   }
   if (multiEl) {
     multiEl.addEventListener('change', function () {
@@ -5728,20 +7366,6 @@ CulTourMap.renderItineraryRouteMap('itinRouteMap', <?= json_encode($mapStops, JS
 
   function finishDayMeetupClock(clockEl) {
     var day = parseInt(clockEl.getAttribute('data-day') || '1', 10) || 1;
-    var formatted = formatMeetupClock(clockEl.value);
-    var m = String(formatted || '').match(/^(\d{1,2})(?::(\d{1,2}))?$/);
-    if (m) {
-      var h = parseInt(m[1], 10);
-      var min = m[2] !== undefined ? parseInt(m[2], 10) : 0;
-      if (h === 0) h = 12;
-      if (h >= 1 && h <= 12 && min >= 0 && min <= 59) {
-        clockEl.value = String(h).padStart(2, '0') + ':' + String(min).padStart(2, '0');
-      } else {
-        clockEl.value = formatted;
-      }
-    } else {
-      clockEl.value = formatted;
-    }
     if (day === 1) {
       syncMeetupHidden();
       paintMeetupCard();
@@ -5749,49 +7373,26 @@ CulTourMap.renderItineraryRouteMap('itinRouteMap', <?= json_encode($mapStops, JS
     return window.itinSaveDayMeetupTime(day, composeDayMeetupValue(day));
   }
 
-  document.addEventListener('input', function (e) {
+  document.addEventListener('change', function (e) {
     var clockEl = e.target.closest && e.target.closest('[data-itin-day-meetup-clock]');
     if (!clockEl) return;
-    var formatted = formatMeetupClock(clockEl.value);
-    if (formatted !== clockEl.value) clockEl.value = formatted;
     var day = parseInt(clockEl.getAttribute('data-day') || '1', 10) || 1;
     if (day === 1) {
       syncMeetupHidden();
       paintMeetupCard();
     }
     refreshPastMeetupWarning();
-    clearTimeout(timer);
-    timer = setTimeout(function () {
-      window.itinSaveDayMeetupTime(day, composeDayMeetupValue(day));
-    }, 400);
-  });
-  document.addEventListener('blur', function (e) {
-    var clockEl = e.target.closest && e.target.closest('[data-itin-day-meetup-clock]');
-    if (!clockEl) return;
-    finishDayMeetupClock(clockEl);
-  }, true);
-  document.addEventListener('keydown', function (e) {
-    if (e.key !== 'Enter') return;
-    var clockEl = e.target.closest && e.target.closest('[data-itin-day-meetup-clock]');
-    if (!clockEl) return;
-    e.preventDefault();
-    finishDayMeetupClock(clockEl);
+    applyMeetupHourWindow(clockEl);
+    if (clockEl.classList.contains('is-invalid')) return;
+    window.itinSaveDayMeetupTime(day, composeDayMeetupValue(day));
   });
   document.addEventListener('change', function (e) {
-    var ampmEl = e.target.closest && e.target.closest('[data-itin-day-meetup-ampm]');
-    if (!ampmEl) return;
-    var day = parseInt(ampmEl.getAttribute('data-day') || '1', 10) || 1;
-    var composed = composeDayMeetupValue(day);
-    if (!composed) {
-      // Hours not entered yet — keep AM/PM as chosen; don't save or reset.
-      return;
-    }
-    if (day === 1) {
-      syncMeetupHidden();
-      paintMeetupCard();
-    }
-    refreshPastMeetupWarning();
-    window.itinSaveDayMeetupTime(day, composed);
+    var dateEl = e.target.closest && e.target.closest('[data-itin-day-date-input]');
+    if (!dateEl) return;
+    var section = dateEl.closest('[data-itin-day-section]');
+    var day = section ? section.getAttribute('data-itin-day-section') : '';
+    var clockEl = day ? document.querySelector('[data-itin-day-meetup="' + day + '"] [data-itin-day-meetup-clock]') : null;
+    if (clockEl) applyMeetupHourWindow(clockEl);
   });
   syncMeetupHidden();
   paintMeetupCard();
@@ -5866,33 +7467,6 @@ CulTourMap.renderItineraryRouteMap('itinRouteMap', <?= json_encode($mapStops, JS
       lastSaved = data.title || title;
       var isPlaceholder = !lastSaved || String(lastSaved).toLowerCase() === 'unnamed';
       input.value = isPlaceholder ? '' : lastSaved;
-      var tabs = document.querySelector('.itin-suggest-tabs');
-      var href = '?id=' + itinId;
-      var chip = null;
-      document.querySelectorAll('.itin-suggest-tabs a.quick-chip').forEach(function (a) {
-        if (itinId && a.getAttribute('href') && a.getAttribute('href').indexOf('id=' + itinId) !== -1) {
-          chip = a;
-        }
-      });
-      if (isPlaceholder) {
-        if (chip) chip.remove();
-        return;
-      }
-      if (chip) {
-        chip.textContent = lastSaved;
-        chip.classList.add('is-active', 'fw-semibold');
-      } else if (tabs) {
-        chip = document.createElement('a');
-        chip.className = 'quick-chip is-active fw-semibold';
-        chip.href = href;
-        chip.textContent = lastSaved;
-        var createForm = tabs.querySelector('form');
-        if (createForm && createForm.nextSibling) {
-          tabs.insertBefore(chip, createForm.nextSibling);
-        } else {
-          tabs.appendChild(chip);
-        }
-      }
     }).catch(function () {});
   }
 
@@ -6191,8 +7765,9 @@ CulTourMap.bindItineraryStopTiming(document.getElementById('itinAddStopForm'), {
     if (p.subtitle) bits.push(p.subtitle);
     if (p.rating != null && p.rating > 0) bits.push('★ ' + p.rating);
     if (p.fee) bits.push(p.fee);
+    if (p.minVisit && window.itinVisitHm) bits.push('At least ' + window.itinVisitHm.label(p.minVisit));
     if (p.visitLimit && window.itinVisitHm) bits.push('Visit up to ' + window.itinVisitHm.label(p.visitLimit));
-    else if (p.defaultVisit) bits.push('~' + p.defaultVisit + ' min');
+    else if (!p.minVisit && p.defaultVisit) bits.push('~' + p.defaultVisit + ' min');
     if (p.onTour) bits.push('On this tour');
     return bits.join(' · ');
   }
@@ -6393,22 +7968,14 @@ CulTourMap.bindItineraryStopTiming(document.getElementById('itinAddStopForm'), {
     var modalEl = document.getElementById('itinMeetupDropModal');
     var placeEl = modalEl ? modalEl.querySelector('[data-itin-meetup-drop-place]') : null;
     var clockEl = document.getElementById('itinMeetupDropClock');
-    var ampmEl = document.getElementById('itinMeetupDropAmPm');
     var place = places[key] || {};
     if (placeEl) {
       placeEl.textContent = 'What time will you meet at ' + (place.name || 'this place') + '?';
     }
     var cur = '';
     var dayClock = document.querySelector('[data-itin-day-meetup="' + String(day) + '"] [data-itin-day-meetup-clock]');
-    var dayAmPm = document.querySelector('[data-itin-day-meetup="' + String(day) + '"] [data-itin-day-meetup-ampm]');
-    if (dayClock && dayAmPm) {
-      var clockVal = String(dayClock.value || '').trim();
-      var cm = clockVal.match(/^(\d{1,2}):(\d{2})$/);
-      if (cm) {
-        var ch = parseInt(cm[1], 10);
-        if (ch === 0) ch = 12;
-        cur = ch + ':' + cm[2] + ' ' + (dayAmPm.value || 'AM');
-      }
+    if (dayClock && /^\d{2}:\d{2}$/.test(String(dayClock.value || '').trim())) {
+      cur = String(dayClock.value).trim();
     }
     if (!cur) {
       var dayCard = document.querySelector('[data-itin-day-meetup="' + String(day) + '"] [data-itin-meetup-card-label]');
@@ -6421,24 +7988,34 @@ CulTourMap.bindItineraryStopTiming(document.getElementById('itinAddStopForm'), {
       var existing = document.querySelector('#itinEditScheduleForm [name="meetup_time"]');
       cur = existing ? String(existing.value || '').trim() : '';
     }
-    var parsed = cur.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+    var time24 = /^\d{2}:\d{2}$/.test(cur) ? cur : (window.itinDisplayToTime24 ? window.itinDisplayToTime24(cur) : '');
     if (clockEl) {
       clockEl.classList.remove('is-invalid');
-      if (parsed) {
-        var ph = parseInt(parsed[1], 10);
-        if (ph === 0) ph = 12;
-        clockEl.value = String(ph).padStart(2, '0') + ':' + parsed[2];
+      clockEl.value = time24;
+      var win = window.itinGuideHourWindows && window.itinApplyMeetupHourWindow
+        ? (function () {
+            var dateEl = document.querySelector('[data-itin-day-section="' + String(day) + '"] [data-itin-day-date-input]');
+            var ymd = dateEl ? String(dateEl.value || '').trim() : '';
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
+            return window.itinGuideHourWindows[String(new Date(ymd + 'T12:00:00').getDay())] || null;
+          })()
+        : null;
+      if (win) {
+        clockEl.min = win.min;
+        clockEl.max = win.max;
       } else {
-        clockEl.value = '';
+        clockEl.removeAttribute('min');
+        clockEl.removeAttribute('max');
       }
     }
-    if (ampmEl) ampmEl.value = parsed ? parsed[3].toUpperCase() : 'AM';
     if (!modalEl) {
       saveDayMeetup(day, key, 'place');
       return;
     }
     modalEl._dropKey = key;
     modalEl._dropDay = day || '1';
+    var dropClock = document.getElementById('itinMeetupDropClock');
+    if (dropClock) dropClock.setAttribute('data-day', String(day || '1'));
     setMeetupPickMode(null);
     setOpen(false);
     if (window.bootstrap && bootstrap.Modal) {
@@ -6498,14 +8075,17 @@ CulTourMap.bindItineraryStopTiming(document.getElementById('itinAddStopForm'), {
     var hintEl = modalEl ? modalEl.querySelector('[data-itin-visit-limit-hint]') : null;
     var warnEl = modalEl ? modalEl.querySelector('[data-itin-visit-limit-warn]') : null;
     if (window.itinVisitHm) {
-      window.itinVisitHm.showWarn(hintEl, place.visitLimit
-        ? 'Visit duration: up to ' + window.itinVisitHm.label(place.visitLimit) + '.'
-        : '');
+      var hints = [];
+      if (place.minVisit) hints.push('Minimum visit: ' + window.itinVisitHm.label(place.minVisit) + '.');
+      if (place.visitLimit) hints.push('Visit duration: up to ' + window.itinVisitHm.label(place.visitLimit) + '.');
+      window.itinVisitHm.showWarn(hintEl, hints.join(' '));
       window.itinVisitHm.showWarn(warnEl, '');
     }
     modalEl._dropKey = key;
     modalEl._dropName = place.name || '';
     modalEl._dropLimit = place.visitLimit || null;
+    modalEl._dropMin = place.minVisit || null;
+    modalEl._dropPrefill = place.minVisit || null;
     modalEl._dropDay = day || '1';
     if (modalEl && window.bootstrap && bootstrap.Modal) {
       bootstrap.Modal.getOrCreateInstance(modalEl).show();
@@ -6812,6 +8392,12 @@ window.itinVisitHm = {
     var label = window.itinVisitHm.label(cap);
     return (name || 'This place') + ' has a visit duration of ' + label + ' only. Set the stay to ' + label + ' or less.';
   },
+  minMessage: function (name, min, mins) {
+    var floor = parseInt(min, 10);
+    if (!Number.isFinite(floor) || floor <= 0 || !Number.isFinite(mins) || mins >= floor) return '';
+    var label = window.itinVisitHm.label(floor);
+    return (name || 'This place') + ' needs a minimum visit of ' + label + '. Set the stay to ' + label + ' or more.';
+  },
   showWarn: function (warnEl, msg) {
     if (!warnEl) return;
     warnEl.textContent = msg || '';
@@ -6838,31 +8424,44 @@ window.itinVisitHm = {
   if (clockEl && window.itinVisitHm) window.itinVisitHm.bind(clockEl);
 
   var limitWarnEl = modalEl.querySelector('[data-itin-visit-limit-warn]');
+
+  function dropStayMessage() {
+    if (!window.itinVisitHm || !clockEl) return 'Enter how long you will stay.';
+    var raw = String(clockEl.value || '').trim();
+    if (raw === '') return '';
+    var n = window.itinVisitHm.total(clockEl);
+    if (!Number.isFinite(n)) return 'Enter the visit time as hours and minutes, like 01:00.';
+    var minMsg = window.itinVisitHm.minMessage(modalEl._dropName, modalEl._dropMin, n);
+    if (minMsg) return minMsg;
+    var limitMsg = window.itinVisitHm.limitMessage(modalEl._dropName, modalEl._dropLimit, n);
+    if (limitMsg) return limitMsg;
+    if (!window.itinVisitHm.ok(n)) return 'Visit time must be at least 15 minutes.';
+    return '';
+  }
+
+  function refreshDropStay() {
+    if (!window.itinVisitHm) return;
+    var msg = dropStayMessage();
+    var n = clockEl ? window.itinVisitHm.total(clockEl) : NaN;
+    var blocked = msg !== '' || !window.itinVisitHm.ok(n);
+    window.itinVisitHm.showWarn(limitWarnEl, msg);
+    if (clockEl) clockEl.classList.toggle('is-invalid', msg !== '');
+    if (okBtn) okBtn.disabled = blocked;
+  }
+
   if (clockEl) {
-    clockEl.addEventListener('input', function () {
-      if (window.itinVisitHm) window.itinVisitHm.showWarn(limitWarnEl, '');
-    });
+    clockEl.addEventListener('input', refreshDropStay);
+    clockEl.addEventListener('blur', refreshDropStay);
   }
 
   function submitDrop() {
     if (clockEl && window.itinVisitHm) clockEl.value = window.itinVisitHm.pad(clockEl.value);
-    var n = window.itinVisitHm ? window.itinVisitHm.total(clockEl) : NaN;
-    if (!window.itinVisitHm || !window.itinVisitHm.ok(n)) {
-      if (clockEl) {
-        clockEl.classList.add('is-invalid');
-        clockEl.focus();
-      }
+    refreshDropStay();
+    if (okBtn && okBtn.disabled) {
+      if (clockEl) clockEl.focus();
       return;
     }
-    var limitMsg = window.itinVisitHm.limitMessage(modalEl._dropName, modalEl._dropLimit, n);
-    if (limitMsg) {
-      window.itinVisitHm.showWarn(limitWarnEl, limitMsg);
-      if (clockEl) {
-        clockEl.classList.add('is-invalid');
-        clockEl.focus();
-      }
-      return;
-    }
+    var n = window.itinVisitHm.total(clockEl);
     var form = document.getElementById('itinAddStopForm');
     var visitEl = form && form.querySelector('[name="visit_minutes"]');
     var dayEl = document.getElementById('itinAddDayNumber');
@@ -6893,9 +8492,11 @@ window.itinVisitHm = {
   }
   modalEl.addEventListener('shown.bs.modal', function () {
     if (clockEl) {
-      clockEl.value = '';
+      var pre = modalEl._dropPrefill;
+      clockEl.value = (pre && window.itinVisitHm) ? window.itinVisitHm.fromMinutes(pre) : '';
       clockEl.classList.remove('is-invalid');
       if (window.itinVisitHm) window.itinVisitHm.paintUnit(clockEl);
+      if (typeof refreshDropStay === 'function') refreshDropStay();
       clockEl.focus();
     }
   });
@@ -6904,25 +8505,22 @@ window.itinVisitHm = {
   var modalEl = document.getElementById('itinMeetupDropModal');
   if (!modalEl) return;
   var clockEl = document.getElementById('itinMeetupDropClock');
-  var ampmEl = document.getElementById('itinMeetupDropAmPm');
   var okBtn = modalEl.querySelector('[data-itin-meetup-drop-ok]');
 
   function composeMeetupDrop() {
     var clock = clockEl ? String(clockEl.value || '').trim() : '';
-    var ampm = ampmEl ? String(ampmEl.value || 'AM') : 'AM';
-    var m = clock.match(/^(\d{1,2}):(\d{1,2})$/);
+    var m = clock.match(/^(\d{1,2}):(\d{2})$/);
     if (!m) return '';
     var h = parseInt(m[1], 10);
     var min = parseInt(m[2], 10);
-    if (h === 0) h = 12;
-    if (h < 1 || h > 12 || !Number.isFinite(min) || min < 0 || min > 59) return '';
-    return h + ':' + String(min).padStart(2, '0') + ' ' + ampm;
+    if (h < 0 || h > 23 || !Number.isFinite(min) || min < 0 || min > 59) return '';
+    var ampm = h >= 12 ? 'PM' : 'AM';
+    var h12 = h % 12;
+    if (h12 === 0) h12 = 12;
+    return h12 + ':' + String(min).padStart(2, '0') + ' ' + ampm;
   }
 
   function submitMeetupDrop() {
-    if (clockEl && window.itinFormatMeetupClock) {
-      clockEl.value = window.itinFormatMeetupClock(clockEl.value);
-    }
     var timeDisplay = composeMeetupDrop();
     if (!timeDisplay) {
       if (clockEl) {
@@ -7010,11 +8608,15 @@ window.itinVisitHm = {
       return;
     }
     var stop = form.closest('[data-itin-stop]');
+    var minMsg = stop
+      ? window.itinVisitHm.minMessage(stop.getAttribute('data-place-name'), stop.getAttribute('data-visit-min'), total)
+      : '';
     var limitMsg = stop
       ? window.itinVisitHm.limitMessage(stop.getAttribute('data-place-name'), stop.getAttribute('data-visit-limit'), total)
       : '';
-    window.itinVisitHm.showWarn(form.querySelector('[data-itin-visit-limit-warn]'), limitMsg);
-    if (limitMsg) {
+    var stayMsg = minMsg || limitMsg;
+    window.itinVisitHm.showWarn(form.querySelector('[data-itin-visit-limit-warn]'), stayMsg);
+    if (stayMsg) {
       e.preventDefault();
       if (clock) {
         clock.classList.add('is-invalid');
@@ -7024,7 +8626,23 @@ window.itinVisitHm = {
   });
   document.addEventListener('input', function (e) {
     var form = e.target.closest && e.target.closest('[data-itin-edit-time-form]');
-    if (form && window.itinVisitHm) window.itinVisitHm.showWarn(form.querySelector('[data-itin-visit-limit-warn]'), '');
+    if (!form || !window.itinVisitHm) return;
+    var clock = form.querySelector('[data-itin-visit-clock]');
+    var stop = form.closest('[data-itin-stop]');
+    var total = clock ? window.itinVisitHm.total(clock) : NaN;
+    var typed = clock && String(clock.value || '').trim() !== '';
+    var minMsg = typed && stop
+      ? window.itinVisitHm.minMessage(stop.getAttribute('data-place-name'), stop.getAttribute('data-visit-min'), total)
+      : '';
+    var limitMsg = typed && stop
+      ? window.itinVisitHm.limitMessage(stop.getAttribute('data-place-name'), stop.getAttribute('data-visit-limit'), total)
+      : '';
+    var msg = minMsg || limitMsg;
+    if (!msg && typed && !window.itinVisitHm.ok(total)) msg = 'Visit time must be at least 15 minutes.';
+    window.itinVisitHm.showWarn(form.querySelector('[data-itin-visit-limit-warn]'), msg);
+    if (clock) clock.classList.toggle('is-invalid', msg !== '');
+    var saveBtn = form.querySelector('button[type="submit"]');
+    if (saveBtn) saveBtn.disabled = msg !== '' || !window.itinVisitHm.ok(total);
   });
 })();
 (function () {
@@ -7106,15 +8724,17 @@ window.itinVisitHm = {
       var placesAll = (window.CulTourItin && window.CulTourItin.places) || {};
       var picked = placesAll[String(stopSelect.value)] || {};
       var mins = parseInt(visitInput && visitInput.value, 10);
+      var minMsg = window.itinVisitHm.minMessage(picked.name, picked.minVisit, mins);
       var limitMsg = window.itinVisitHm.limitMessage(picked.name, picked.visitLimit, mins);
-      if (limitMsg) {
+      var stayMsg = minMsg || limitMsg;
+      if (stayMsg) {
         e.preventDefault();
         e.stopPropagation();
         var warnEl = addLimitWarnEl();
-        window.itinVisitHm.showWarn(warnEl, limitMsg);
+        window.itinVisitHm.showWarn(warnEl, stayMsg);
         if (!warnEl || (visitClock && visitClock.offsetParent === null)) {
-          if (window.CulTourItinConfirm) window.CulTourItinConfirm.open('adjacent', null, { title: 'Visit duration limit', text: limitMsg });
-          else alert(limitMsg);
+          if (window.CulTourItinConfirm) window.CulTourItinConfirm.open('adjacent', null, { title: 'Visit time', text: stayMsg });
+          else alert(stayMsg);
         }
         if (visitClock) visitClock.classList.add('is-invalid');
         return;
@@ -7247,15 +8867,12 @@ window.itinVisitHm = {
   function dayMeetupMinsFromClock(dayNum) {
     var wrap = document.querySelector('[data-itin-day-meetup="' + String(dayNum) + '"]');
     var clock = wrap && wrap.querySelector('[data-itin-day-meetup-clock]');
-    var ampm = wrap && wrap.querySelector('[data-itin-day-meetup-ampm]');
     if (!clock || !String(clock.value || '').trim()) return null;
     var m = String(clock.value).match(/^(\d{1,2}):(\d{2})$/);
     if (!m) return null;
     var h = parseInt(m[1], 10);
     var min = parseInt(m[2], 10);
-    if (!isFinite(h) || !isFinite(min) || min < 0 || min > 59) return null;
-    if (h === 12) h = 0;
-    if (ampm && String(ampm.value || 'AM').toUpperCase() === 'PM') h += 12;
+    if (!isFinite(h) || !isFinite(min) || h < 0 || h > 23 || min < 0 || min > 59) return null;
     return h * 60 + min;
   }
 
@@ -7609,12 +9226,13 @@ window.itinVisitHm = {
   function currentDayMeetupMins(day) {
     var card = document.querySelector('[data-itin-day-meetup="' + day + '"]');
     var clock = card && card.querySelector('[data-itin-day-meetup-clock]');
-    var ampm = card && card.querySelector('[data-itin-day-meetup-ampm]');
-    if (clock && ampm) {
+    if (clock) {
       var clockVal = String(clock.value || '').trim();
       var cm = clockVal.match(/^(\d{1,2}):(\d{2})$/);
       if (cm) {
-        return displayToMins(parseInt(cm[1], 10) + ':' + cm[2] + ' ' + (ampm.value || 'AM'));
+        var h24 = parseInt(cm[1], 10);
+        var mins = parseInt(cm[2], 10);
+        if (h24 >= 0 && h24 <= 23 && mins >= 0 && mins <= 59) return h24 * 60 + mins;
       }
     }
     var timeEl = card && card.querySelector('[data-itin-meetup-card-label]');
@@ -7869,13 +9487,23 @@ window.itinVisitHm = {
     }
     if (guestsDd && partyEl) {
       var n = parseInt(String(partyEl.value || '').trim(), 10);
-      guestsDd.textContent = n && n >= 1 ? String(n) : '—';
+      var minEl = document.getElementById('packageMinPax');
+      var minN = minEl ? parseInt(String(minEl.value || '').trim(), 10) : 0;
+      if (document.body.classList.contains('package-maker')) {
+        guestsDd.textContent = (minN >= 1 ? String(minN) : '—') + ' – ' + (n >= 1 ? String(n) : '—');
+      } else {
+        guestsDd.textContent = n && n >= 1 ? String(n) : '—';
+      }
     }
     if (dateDd && dateEl) {
       var raw = String(dateEl.value || '').trim();
-      if (!raw) {
+      if (document.body.classList.contains('package-maker') && packageTouristPicksDate()) {
+        dateDd.textContent = 'Tourist chooses the date';
+        raw = '';
+      }
+      if (!raw && dateDd.textContent !== 'Tourist chooses the date') {
         dateDd.textContent = 'Not set';
-      } else {
+      } else if (raw) {
         try {
           var d = new Date(raw + 'T12:00:00');
           dateDd.textContent = isNaN(d.getTime())
@@ -7889,17 +9517,18 @@ window.itinVisitHm = {
     if (meetupDd) {
       var meetupHidden = document.querySelector('#itinEditScheduleForm [name="meetup_time"]');
       var meetupClockEl = document.querySelector('[data-itin-day-meetup="1"] [data-itin-day-meetup-clock]');
-      var meetupAmPmEl = document.querySelector('[data-itin-day-meetup="1"] [data-itin-day-meetup-ampm]');
       var mt = '';
-      if (meetupClockEl && meetupAmPmEl) {
+      if (meetupClockEl) {
         var clock = String(meetupClockEl.value || '').trim();
         var m = clock.match(/^(\d{1,2}):(\d{2})$/);
         if (m) {
           var h = parseInt(m[1], 10);
           var min = parseInt(m[2], 10);
-          if (h === 0) h = 12;
-          if (h >= 1 && h <= 12 && min >= 0 && min <= 59) {
-            mt = h + ':' + String(min).padStart(2, '0') + ' ' + (meetupAmPmEl.value || 'AM');
+          if (h >= 0 && h <= 23 && min >= 0 && min <= 59) {
+            var ampm = h >= 12 ? 'PM' : 'AM';
+            var h12 = h % 12;
+            if (h12 === 0) h12 = 12;
+            mt = h12 + ':' + String(min).padStart(2, '0') + ' ' + ampm;
           }
         }
       } else if (meetupHidden) {
@@ -7937,6 +9566,32 @@ window.itinVisitHm = {
       }
       dd.textContent = stayRideReviewText(key === 'stay' ? 'stayRideAcc' : 'stayRideTrn');
     });
+    var closeDd = document.querySelector('[data-itin-review="close"]');
+    var priceDd = document.querySelector('[data-itin-review="price"]');
+    if (closeDd) {
+      var closeEl = document.getElementById('packageCloseDate');
+      var closeRaw = closeEl && !closeEl.disabled ? String(closeEl.value || '').trim() : '';
+      if (!closeRaw) {
+        closeDd.textContent = 'Not set';
+      } else {
+        try {
+          var closeDate = new Date(closeRaw + 'T12:00:00');
+          closeDd.textContent = isNaN(closeDate.getTime())
+            ? closeRaw
+            : closeDate.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+        } catch (closeErr) {
+          closeDd.textContent = closeRaw;
+        }
+      }
+    }
+    if (priceDd) {
+      var priceEl = document.getElementById('packagePriceField');
+      var priceRaw = priceEl ? String(priceEl.value || '').trim() : '';
+      var priceNum = parseFloat(priceRaw);
+      priceDd.textContent = priceRaw !== '' && !isNaN(priceNum)
+        ? '₱' + priceNum.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+        : '—';
+    }
     var stopsDd = document.querySelector('[data-itin-review="stops"]');
     if (stopsDd) {
       var nStops = routeStopCount();
@@ -7988,6 +9643,8 @@ window.itinVisitHm = {
     var message = '';
     tourDays().forEach(function (chip) {
       if (message) return;
+      if (!isRide && stayDaySkipped(chip.day)) return;
+      if (isRide && rideDaySkipped(chip.day)) return;
       var mine = lines.filter(function (line) { return lineDay(line) === chip.day; });
       if (!mine.length) {
         if (!hasUndated) message = 'Day ' + chip.day + ' still needs a ' + (isRide ? 'vehicle.' : 'room.');
@@ -8011,7 +9668,7 @@ window.itinVisitHm = {
     }
     if (groupName === 'stayRideTrn') {
       if (document.querySelector('input[name="stayRideTrn"][value="0"]:checked')) return true;
-      if ((window.itinRideLines || []).length) return true;
+      if ((window.itinRideLines || []).length || (window.itinRideSkipDays || []).length) return true;
     }
     return !!document.querySelector('input[name="' + groupName + '"]:checked');
   }
@@ -8037,11 +9694,15 @@ window.itinVisitHm = {
       if (stayServiceEl) stayServiceEl.value = '';
       if (stayDeclinedEl) stayDeclinedEl.value = '1';
       if (stayLinesEl) stayLinesEl.value = '[]';
-    } else if (stayLines.length) {
-      if (stayIdEl) stayIdEl.value = String(stayLines[0].business_id || '');
-      if (stayServiceEl) stayServiceEl.value = String(stayLines[0].service_id || '');
+    } else if (stayLines.length || (window.itinStaySkipDays || []).length) {
+      var stayPayload = stayLines.slice();
+      (window.itinStaySkipDays || []).forEach(function (day) {
+        stayPayload.push({ day: day, skip: 1 });
+      });
+      if (stayIdEl) stayIdEl.value = stayLines.length ? String(stayLines[0].business_id || '') : '';
+      if (stayServiceEl) stayServiceEl.value = stayLines.length ? String(stayLines[0].service_id || '') : '';
       if (stayDeclinedEl) stayDeclinedEl.value = '0';
-      if (stayLinesEl) stayLinesEl.value = JSON.stringify(stayLines);
+      if (stayLinesEl) stayLinesEl.value = JSON.stringify(stayPayload);
     } else {
       writeStaySide(
         document.querySelector('input[name="stayRideAcc"]:checked'),
@@ -8062,11 +9723,15 @@ window.itinVisitHm = {
       if (rideServiceEl) rideServiceEl.value = '';
       if (rideDeclinedEl) rideDeclinedEl.value = '1';
       if (rideLinesEl) rideLinesEl.value = '[]';
-    } else if (rideLines.length) {
-      if (rideIdEl) rideIdEl.value = String(rideLines[0].business_id || '');
-      if (rideServiceEl) rideServiceEl.value = String(rideLines[0].service_id || '');
+    } else if (rideLines.length || (window.itinRideSkipDays || []).length) {
+      var ridePayload = rideLines.slice();
+      (window.itinRideSkipDays || []).forEach(function (day) {
+        ridePayload.push({ day: day, skip: 1 });
+      });
+      if (rideIdEl) rideIdEl.value = rideLines.length ? String(rideLines[0].business_id || '') : '';
+      if (rideServiceEl) rideServiceEl.value = rideLines.length ? String(rideLines[0].service_id || '') : '';
       if (rideDeclinedEl) rideDeclinedEl.value = '0';
-      if (rideLinesEl) rideLinesEl.value = JSON.stringify(rideLines);
+      if (rideLinesEl) rideLinesEl.value = JSON.stringify(ridePayload);
     } else {
       writeStaySide(
         document.querySelector('input[name="stayRideTrn"]:checked'),
@@ -8116,7 +9781,26 @@ window.itinVisitHm = {
     setStayPop('closed');
     renderStayTray();
   }
+  function resetRideSelection() {
+    window.itinRideLines = [];
+    window.itinRideQuote = null;
+    rideActiveDay = 1;
+    document.querySelectorAll('input[name="stayRideTrn"]').forEach(function (input) {
+      input.checked = false;
+    });
+    var rideIdEl = document.getElementById('stayTrnId');
+    var rideServiceEl = document.getElementById('stayTrnService');
+    var rideDeclinedEl = document.getElementById('stayTrnDeclined');
+    var rideLinesEl = document.getElementById('stayTrnLines');
+    if (rideIdEl) rideIdEl.value = '';
+    if (rideServiceEl) rideServiceEl.value = '';
+    if (rideDeclinedEl) rideDeclinedEl.value = '0';
+    if (rideLinesEl) rideLinesEl.value = '[]';
+    setRidePop('closed');
+    renderRideTray();
+  }
   function openStayRideModal() {
+    if (document.body.classList.contains('package-maker') && packageTouristPicksDate()) return;
     openNamedModal('stayRideModal');
   }
   function openRidePickModal() {
@@ -8154,6 +9838,12 @@ window.itinVisitHm = {
   }
   document.querySelectorAll('input[name="stayRideAcc"], input[name="stayRideTrn"]').forEach(function (input) {
     input.addEventListener('change', function () {
+      if (input.type === 'checkbox' && String(input.value) === '0' && input.checked) {
+        if (input.name === 'stayRideAcc') resetStaySelection();
+        else resetRideSelection();
+        input.checked = true;
+        syncStayRideFields();
+      }
       if (input.name === 'stayRideAcc') renderStayTray();
       else renderRideTray();
     });
@@ -8182,7 +9872,7 @@ window.itinVisitHm = {
       var shelf = board.querySelector('[data-pick-shelf]');
       if (shelf) shelf.hidden = !any;
     }
-    var search = board.querySelector('[data-pick-search]');
+    var search = document.querySelector('[data-pick-search-for="' + group + '"]');
     function cardText(card) {
       var name = card.querySelector('.pick-spot__name');
       var place = card.querySelector('.pick-spot__place');
@@ -8192,6 +9882,13 @@ window.itinVisitHm = {
       var q = search ? String(search.value || '').trim().toLowerCase() : '';
       if (!q) return cards.slice();
       return cards.filter(function (card) { return cardText(card).indexOf(q) !== -1; });
+    }
+    function setBrowsing(on) {
+      board.classList.toggle('is-browsing', !!on);
+      var back = document.getElementById(group === 'stayRideAcc' ? 'stayPickBack' : 'ridePickBack');
+      if (!back) return;
+      if (on) back.textContent = group === 'stayRideAcc' ? 'Back to itinerary' : 'Back to accommodation';
+      else back.textContent = 'Back to selection';
     }
     function paint() {
       if (!focus || !cards.length) return;
@@ -8254,6 +9951,7 @@ window.itinVisitHm = {
       } else {
         syncStayRideFields();
       }
+      if (String(id) !== '0') setBrowsing(false);
       show(id);
     }
     cards.forEach(function (card) {
@@ -8273,6 +9971,13 @@ window.itinVisitHm = {
     }
     if (search) {
       search.addEventListener('input', function () {
+        if (board.classList.contains('is-browsing')) {
+          var loop = visibleCards();
+          cards.forEach(function (card) { card.hidden = loop.indexOf(card) < 0; });
+          var empty = board.querySelector('[data-pick-grid-empty]');
+          if (empty) empty.hidden = loop.length > 0;
+          return;
+        }
         var loop = visibleCards();
         if (loop.length && loop.indexOf(cards[idx]) < 0) {
           idx = cards.indexOf(loop[0]);
@@ -8293,6 +9998,7 @@ window.itinVisitHm = {
           });
           paint();
         }
+        if (value === '0') setBrowsing(true);
         show(value);
       });
     });
@@ -8302,10 +10008,16 @@ window.itinVisitHm = {
       return cards[idx] ? String(cards[idx].getAttribute('data-pick-card') || '0') : '0';
     }
     paint();
-    show(currentPlaceId());
+    show('0');
+    if (group === 'stayRideAcc') {
+      window.stayShowPlaces = function () { setBrowsing(true); show('0'); };
+    } else {
+      window.rideShowPlaces = function () { setBrowsing(true); show('0'); };
+    }
     var modal = board.closest('.modal');
     if (modal) {
       modal.addEventListener('shown.bs.modal', function () {
+        if (board.classList.contains('is-browsing')) return;
         show(currentPlaceId());
       });
     }
@@ -8314,8 +10026,30 @@ window.itinVisitHm = {
     var node = document.getElementById('itinStaySaved');
     var saved = [];
     try { saved = JSON.parse((node && node.textContent) || '[]'); } catch (err) { saved = []; }
-    window.itinStayLines = Array.isArray(saved) ? saved : [];
+    saved = Array.isArray(saved) ? saved : [];
+    window.itinStaySkipDays = [];
+    window.itinStayLines = [];
+    saved.forEach(function (line) {
+      if (line && line.skip) {
+        var skippedDay = parseInt(line.day, 10) || 0;
+        if (skippedDay > 0) window.itinStaySkipDays.push(skippedDay);
+        return;
+      }
+      window.itinStayLines.push(line);
+    });
   })();
+  var stayPickBack = document.getElementById('stayPickBack');
+  if (stayPickBack) {
+    stayPickBack.addEventListener('click', function () {
+      var board = document.querySelector('[data-pick-group="stayRideAcc"]');
+      if (board && !board.classList.contains('is-browsing') && window.stayShowPlaces) {
+        window.stayShowPlaces();
+        return;
+      }
+      var modal = document.getElementById('stayRideModal');
+      if (modal && window.bootstrap) window.bootstrap.Modal.getOrCreateInstance(modal).hide();
+    });
+  }
   var stayModalEl = document.getElementById('stayRideModal');
   if (stayModalEl && !stayModalEl.dataset.stayBound) {
     stayModalEl.dataset.stayBound = '1';
@@ -8349,6 +10083,7 @@ window.itinVisitHm = {
         setStayPop('open');
       } else if (minStay || doneStay) {
         e.preventDefault();
+        if (doneStay) commitStayBar();
         setStayPop('closed');
       } else if (amenityClose) {
         e.preventDefault();
@@ -8390,8 +10125,7 @@ window.itinVisitHm = {
       } else if (another) {
         e.preventDefault();
         setStayPop('closed');
-        var next = stayModalEl.querySelector('[data-pick-group="stayRideAcc"] .pick-focus__arrow--next');
-        if (next) next.click();
+        if (window.stayShowPlaces) window.stayShowPlaces();
       }
     });
   }
@@ -8434,13 +10168,23 @@ window.itinVisitHm = {
   rideActiveDay = 1;
   try {
     renderStayTray();
+    commitStayBar();
   } catch (err) {}
   stayDraftReady = true;
   (function () {
     var node = document.getElementById('itinRideSaved');
     var saved = [];
     try { saved = JSON.parse((node && node.textContent) || '[]'); } catch (err) { saved = []; }
-    window.itinRideLines = Array.isArray(saved) ? saved : [];
+    window.itinRideSkipDays = [];
+    window.itinRideLines = [];
+    (Array.isArray(saved) ? saved : []).forEach(function (line) {
+      if (line && line.skip) {
+        var skippedDay = parseInt(line.day, 10) || 0;
+        if (skippedDay > 0) window.itinRideSkipDays.push(skippedDay);
+        return;
+      }
+      window.itinRideLines.push(line);
+    });
   })();
   var rideModalEl = document.getElementById('ridePickModal');
   if (rideModalEl && !rideModalEl.dataset.rideBound) {
@@ -8449,7 +10193,6 @@ window.itinVisitHm = {
       var target = e.target && e.target.nodeType === 1 ? e.target : (e.target && e.target.parentElement);
       if (!target || !target.closest) return;
       var add = target.closest('[data-ride-add]');
-      var card = target.closest('[data-ride-room]');
       var amenities = target.closest('[data-stay-amenities]');
       var amenityClose = target.closest('[data-stay-amenity-close]');
       var step = target.closest('[data-stay-step]');
@@ -8507,12 +10250,6 @@ window.itinVisitHm = {
         e.stopPropagation();
         if (add.disabled) return;
         addRideVehicle(add.getAttribute('data-ride-add'));
-      } else if (card && !target.closest('[data-stay-step], [data-stay-remove], [data-ride-another], [data-ride-add-unit], [data-stay-amenities], [data-stay-amenity-pop]')) {
-        var addBtn = card.querySelector('[data-ride-add]');
-        if (addBtn && !addBtn.disabled) {
-          e.preventDefault();
-          addRideVehicle(addBtn.getAttribute('data-ride-add'));
-        }
       } else if (step && !step.disabled) {
         e.preventDefault();
         stepRideLine(step.getAttribute('data-stay-id'), step.getAttribute('data-stay-step'), Number(step.getAttribute('data-dir')) || 0, step.getAttribute('data-stay-index'), step.getAttribute('data-stay-day'));
@@ -8528,8 +10265,7 @@ window.itinVisitHm = {
       } else if (another) {
         e.preventDefault();
         setRidePop('closed');
-        var next = rideModalEl.querySelector('[data-pick-group="stayRideTrn"] .pick-focus__arrow--next');
-        if (next) next.click();
+        if (window.rideShowPlaces) window.rideShowPlaces();
       }
     });
   }
@@ -8594,6 +10330,11 @@ window.itinVisitHm = {
   var rideBack = document.getElementById('ridePickBack');
   if (rideBack) {
     rideBack.addEventListener('click', function () {
+      var board = document.querySelector('[data-pick-group="stayRideTrn"]');
+      if (board && !board.classList.contains('is-browsing') && window.rideShowPlaces) {
+        window.rideShowPlaces();
+        return;
+      }
       hideThen('ridePickModal', openStayRideModal);
     });
   }
@@ -8628,6 +10369,14 @@ window.itinVisitHm = {
           return;
         }
         if (stayError) stayError.hidden = true;
+        var houseFree = parseInt(rideContinue.getAttribute('data-house-free') || '0', 10);
+        if (document.body.classList.contains('package-maker') && !packageTouristPicksDate() && houseFree < 1) {
+          hideThen('ridePickModal', function () {
+            var notice = document.getElementById('packageNoGuideModal');
+            if (notice && window.bootstrap) bootstrap.Modal.getOrCreateInstance(notice).show();
+          });
+          return;
+        }
         hideThen('ridePickModal', openGuideBookModal);
       });
     });
@@ -8649,9 +10398,13 @@ window.itinVisitHm = {
       bootstrap.Modal.getOrCreateInstance(reviewEl).show();
     }
   }
+  function packageTouristPicksDate() {
+    var box = document.getElementById('packageDateTourist');
+    return !!(box && box.checked);
+  }
   function syncBookBtnForDate() {
     if (!bookBtn) return;
-    var hasDate = !!(dateEl && String(dateEl.value || '').trim());
+    var hasDate = !!(dateEl && String(dateEl.value || '').trim()) || packageTouristPicksDate();
     var blocked = dateErrorVisible();
     bookBtn.removeAttribute('data-bs-toggle');
     bookBtn.removeAttribute('data-bs-target');
@@ -8988,7 +10741,7 @@ window.itinVisitHm = {
       label: short,
       amount: sumAmount,
       amount_label: formatPeso(sumAmount),
-      detail: details.join(' '),
+      detail: details.join('\n'),
       review: reviews.join(', '),
       lines: out,
       holds: holds,
@@ -9094,7 +10847,61 @@ window.itinVisitHm = {
       if (stayIsMulti()) {
         empty.textContent = noun === 'vehicle'
           ? 'No vehicle on day ' + activeDay + ' yet. This day is separate from the other days.'
-          : 'No room on day ' + activeDay + ' yet. This day is one night, separate from the other days.';
+          : 'No room on day ' + activeDay + ' yet. You can book the same place as another day.';
+        var donorDay = 0;
+        lines.forEach(function (line) {
+          var d = lineDay(line);
+          if (d > 0 && d !== activeDay) donorDay = d;
+        });
+        if (noun === 'room' || noun === 'vehicle') {
+          var rideNoun = noun === 'vehicle';
+          var skippedDay = rideNoun ? rideDaySkipped(activeDay) : stayDaySkipped(activeDay);
+          if (skippedDay) {
+            empty.textContent = rideNoun
+              ? 'No transportation on day ' + activeDay + '.'
+              : 'No accommodation on day ' + activeDay + '.';
+            var undo = document.createElement('button');
+            undo.type = 'button';
+            undo.className = 'btn btn-outline-light btn-sm mt-2';
+            undo.textContent = rideNoun ? 'Add a vehicle for this day' : 'Add a room for this day';
+            undo.addEventListener('click', function () {
+              if (rideNoun) unskipRideDay(activeDay);
+              else unskipStayDay(activeDay);
+            });
+            box.appendChild(empty);
+            box.appendChild(undo);
+            return;
+          }
+          var actions = document.createElement('div');
+          actions.className = 'stay-day-actions';
+          if (donorDay > 0) {
+            var same = document.createElement('button');
+            same.type = 'button';
+            same.className = 'btn btn-outline-light btn-sm';
+            same.textContent = rideNoun
+              ? 'Use the same transportation as day ' + donorDay
+              : 'Use the same accommodation as day ' + donorDay;
+            same.addEventListener('click', function () {
+              if (rideNoun) copyRideDay(donorDay, activeDay);
+              else copyStayDay(donorDay, activeDay);
+            });
+            actions.appendChild(same);
+          }
+          var skip = document.createElement('button');
+          skip.type = 'button';
+          skip.className = 'btn btn-outline-light btn-sm';
+          skip.textContent = rideNoun
+            ? "I don't need transportation on this day"
+            : "I don't need accommodation on this day";
+          skip.addEventListener('click', function () {
+            if (rideNoun) skipRideDay(activeDay);
+            else skipStayDay(activeDay);
+          });
+          actions.appendChild(skip);
+          box.appendChild(empty);
+          box.appendChild(actions);
+          return;
+        }
       } else {
         empty.textContent = noun === 'vehicle'
           ? 'Add a vehicle. It takes the guests who still need a seat, up to its seats.'
@@ -9170,12 +10977,8 @@ window.itinVisitHm = {
     var tripLabel = window.itinStayQuote ? window.itinStayQuote.amount_label : formatPeso(0);
     var tripCount = window.itinStayQuote ? window.itinStayQuote.label : 'Nothing added yet';
     if (totalEl) totalEl.textContent = declined ? formatPeso(0) : tripLabel;
-    var viewTotal = document.querySelector('[data-stay-view-total]');
-    var viewCount = document.querySelector('[data-stay-view-count]');
-    if (viewTotal) viewTotal.textContent = declined ? formatPeso(0) : tripLabel;
-    if (viewCount) viewCount.textContent = declined ? 'Not needed' : tripCount;
     if (holdEl) {
-      if (declined) {
+      if (declined || stayDaySkipped(stayActiveDay)) {
         holdEl.hidden = true;
       } else if (window.itinStayQuote && !window.itinStayQuote.holdsKnown) {
         holdEl.hidden = false;
@@ -9202,6 +11005,11 @@ window.itinVisitHm = {
     }
     paintDayChips('stay');
     paintDayStock('stay');
+    var anotherStay = document.querySelector('[data-stay-another]');
+    if (anotherStay) {
+      var hasStay = !!(window.itinStayLines || []).length;
+      anotherStay.textContent = hasStay ? 'Add another place' : 'Add place';
+    }
     document.querySelectorAll('[data-stay-count]').forEach(function (badge) {
       var id = String(badge.getAttribute('data-stay-count') || '');
       var count = 0;
@@ -9236,8 +11044,19 @@ window.itinVisitHm = {
       }
     });
     syncStayRideFields();
+    commitStayBar();
     if (typeof window.itinRenderBill === 'function') window.itinRenderBill();
     scheduleStayDraft();
+  }
+  function commitStayBar() {
+    var declined = !!document.querySelector('input[name="stayRideAcc"][value="0"]:checked');
+    var quote = window.itinStayQuote;
+    var viewTotal = document.querySelector('[data-stay-view-total]');
+    var viewCount = document.querySelector('[data-stay-view-count]');
+    var label = quote ? quote.amount_label : formatPeso(0);
+    var count = quote ? quote.label : 'Nothing added yet';
+    if (viewTotal) viewTotal.textContent = declined ? formatPeso(0) : label;
+    if (viewCount) viewCount.textContent = declined ? 'Not needed' : count;
   }
   function roomIncludedGuests(room) {
     var cap = room && Number(room.capacity) > 0 ? Number(room.capacity) : 1;
@@ -9278,10 +11097,43 @@ window.itinVisitHm = {
       if (!cut) break;
     }
   }
+  function stayDaySkipped(day) {
+    return (window.itinStaySkipDays || []).indexOf(day) !== -1;
+  }
+  function skipStayDay(day) {
+    window.itinStaySkipDays = window.itinStaySkipDays || [];
+    if (window.itinStaySkipDays.indexOf(day) === -1) window.itinStaySkipDays.push(day);
+    window.itinStayLines = (window.itinStayLines || []).filter(function (line) { return lineDay(line) !== day; });
+    renderStayTray();
+  }
+  function unskipStayDay(day) {
+    window.itinStaySkipDays = (window.itinStaySkipDays || []).filter(function (item) { return item !== day; });
+    renderStayTray();
+  }
+  function copyStayDay(fromDay, toDay) {
+    window.itinStaySkipDays = (window.itinStaySkipDays || []).filter(function (item) { return item !== toDay; });
+    var lines = (window.itinStayLines || []).map(copyStayLine);
+    lines = lines.filter(function (line) { return lineDay(line) !== toDay; });
+    (window.itinStayLines || []).forEach(function (line) {
+      if (lineDay(line) !== fromDay) return;
+      var room = stayCatalogMap()[String(line.service_id)];
+      var max = lineMaxUnits(room, toDay);
+      if (!room || max < 1) return;
+      var copy = copyStayLine(line);
+      copy.day = toDay;
+      var units = Math.min(copy.guests.length || copy.units || 1, max);
+      copy.guests = (copy.guests || [1]).slice(0, units);
+      copy.units = copy.guests.length;
+      lines.push(copy);
+    });
+    window.itinStayLines = lines;
+    renderStayTray();
+  }
   function addStayRoom(id) {
     var room = stayCatalogMap()[String(id)];
     if (!room) return;
     var day = stayIsMulti() ? stayActiveDay : 0;
+    window.itinStaySkipDays = (window.itinStaySkipDays || []).filter(function (item) { return item !== day; });
     var max = lineMaxUnits(room, day);
     if (max < 1) return;
     var lines = window.itinStayLines || [];
@@ -9437,7 +11289,7 @@ window.itinVisitHm = {
     if (viewTotal) viewTotal.textContent = declined ? formatPeso(0) : tripLabel;
     if (viewCount) viewCount.textContent = declined ? 'Not needed' : tripCount;
     if (holdEl) {
-      if (declined) {
+      if (declined || rideDaySkipped(rideActiveDay)) {
         holdEl.hidden = true;
       } else {
         var left = window.itinRideQuote && typeof window.itinRideQuote.left === 'number'
@@ -9497,10 +11349,43 @@ window.itinVisitHm = {
     if (left < 1) return 1;
     return Math.max(1, Math.min(seats, left));
   }
+  function rideDaySkipped(day) {
+    return (window.itinRideSkipDays || []).indexOf(day) !== -1;
+  }
+  function skipRideDay(day) {
+    window.itinRideSkipDays = window.itinRideSkipDays || [];
+    if (window.itinRideSkipDays.indexOf(day) === -1) window.itinRideSkipDays.push(day);
+    window.itinRideLines = (window.itinRideLines || []).filter(function (line) { return lineDay(line) !== day; });
+    renderRideTray();
+  }
+  function unskipRideDay(day) {
+    window.itinRideSkipDays = (window.itinRideSkipDays || []).filter(function (item) { return item !== day; });
+    renderRideTray();
+  }
+  function copyRideDay(fromDay, toDay) {
+    window.itinRideSkipDays = (window.itinRideSkipDays || []).filter(function (item) { return item !== toDay; });
+    var lines = (window.itinRideLines || []).map(copyStayLine);
+    lines = lines.filter(function (line) { return lineDay(line) !== toDay; });
+    (window.itinRideLines || []).forEach(function (line) {
+      if (lineDay(line) !== fromDay) return;
+      var car = rideCatalogMap()[String(line.service_id)];
+      var max = lineMaxUnits(car, toDay);
+      if (!car || max < 1) return;
+      var copy = copyStayLine(line);
+      copy.day = toDay;
+      var units = Math.min(copy.guests.length || copy.units || 1, max);
+      copy.guests = (copy.guests || [1]).slice(0, units);
+      copy.units = copy.guests.length;
+      lines.push(copy);
+    });
+    window.itinRideLines = lines;
+    renderRideTray();
+  }
   function addRideVehicle(id) {
     var car = rideCatalogMap()[String(id)];
     if (!car) return;
     var day = stayIsMulti() ? rideActiveDay : 0;
+    window.itinRideSkipDays = (window.itinRideSkipDays || []).filter(function (item) { return item !== day; });
     var max = lineMaxUnits(car, day);
     if (max < 1) return;
     var lines = window.itinRideLines || [];
@@ -9661,7 +11546,30 @@ window.itinVisitHm = {
       window.itinRenderBill();
     }
   });
+  function savePackageLimits() {
+    if (!partyEl || !itinId) return;
+    var minEl = document.getElementById('packageMinPax');
+    var priceEl = document.getElementById('packagePriceField');
+    var body = new FormData();
+    body.append('csrf_token', (window.CulTour && CulTour.csrf) || '');
+    body.append('action', 'save_package_limits');
+    body.append('itinerary_id', String(itinId));
+    body.append('package_min_pax', minEl ? String(minEl.value || '').trim() : '');
+    body.append('package_max_pax', String(partyEl.value || '').trim());
+    body.append('package_price', priceEl ? String(priceEl.value || '').trim() : '');
+    if (!body.get('package_min_pax') && !body.get('package_max_pax') && !body.get('package_price')) return;
+    fetch(window.location.pathname + window.location.search, {
+      method: 'POST',
+      headers: { 'X-Requested-With': 'XMLHttpRequest', Accept: 'application/json' },
+      body: body,
+      credentials: 'same-origin'
+    }).catch(function () {});
+  }
   function savePartySize() {
+    if (document.body.classList.contains('package-maker')) {
+      savePackageLimits();
+      return;
+    }
     if (!partyEl || partyEl.readOnly || !itinId) return;
     var n = parseInt(String(partyEl.value || '').trim(), 10);
     if (!n || n < 1 || n > 20) return;
@@ -9706,15 +11614,22 @@ window.itinVisitHm = {
       savePartySize();
     });
   }
+  if (document.body.classList.contains('package-maker')) {
+    ['packageMinPax', 'packagePriceField'].forEach(function (id) {
+      var field = document.getElementById(id);
+      if (!field) return;
+      field.addEventListener('input', function () {
+        clearTimeout(partySaveTimer);
+        partySaveTimer = setTimeout(savePackageLimits, 400);
+      });
+      field.addEventListener('change', savePackageLimits);
+    });
+  }
   var meetupInputEl = document.querySelector('#itinEditScheduleForm [name="meetup_time"]');
   var meetupClockEl = document.querySelector('[data-itin-day-meetup="1"] [data-itin-day-meetup-clock]');
-  var meetupAmPmEl = document.querySelector('[data-itin-day-meetup="1"] [data-itin-day-meetup-ampm]');
   if (meetupClockEl) {
     meetupClockEl.addEventListener('input', syncBookingDetailsPreview);
     meetupClockEl.addEventListener('change', syncBookingDetailsPreview);
-  }
-  if (meetupAmPmEl) {
-    meetupAmPmEl.addEventListener('change', syncBookingDetailsPreview);
   }
   document.addEventListener('input', function (e) {
     if (e.target && e.target.closest && e.target.closest('[data-itin-day-meetup-clock]')) {
@@ -9723,7 +11638,7 @@ window.itinVisitHm = {
   });
   document.addEventListener('change', function (e) {
     if (!e.target || !e.target.closest) return;
-    if (e.target.closest('[data-itin-day-meetup-clock]') || e.target.closest('[data-itin-day-meetup-ampm]')) {
+    if (e.target.closest('[data-itin-day-meetup-clock]')) {
       if (window.itinSyncMeetupTimeFeedback) window.itinSyncMeetupTimeFeedback();
     }
     var dayDate = e.target.closest('[data-itin-day-date-input]');
@@ -9798,6 +11713,18 @@ window.itinVisitHm = {
     return firstEmpty;
   }
   function applyDayDateFeedback(forceShowEmpty) {
+    if (packageTouristPicksDate()) {
+      document.querySelectorAll('[data-itin-day-section]').forEach(function (sec) {
+        var input = sec.querySelector('[data-itin-day-date-input]');
+        var fb = sec.querySelector('[data-itin-day-date-feedback]');
+        if (input) input.classList.remove('is-invalid');
+        if (fb && /set a date/i.test(fb.textContent || '')) {
+          fb.hidden = true;
+          fb.textContent = '';
+        }
+      });
+      return null;
+    }
     var firstEmpty = null;
     document.querySelectorAll('[data-itin-day-section]').forEach(function (sec) {
       var input = sec.querySelector('[data-itin-day-date-input]');
@@ -9818,6 +11745,13 @@ window.itinVisitHm = {
     });
     return firstEmpty;
   }
+  var packageDateBox = document.getElementById('packageDateTourist');
+  if (packageDateBox) {
+    packageDateBox.addEventListener('change', function () {
+      if (packageTouristPicksDate()) applyDayDateFeedback(false);
+    });
+    if (packageTouristPicksDate()) applyDayDateFeedback(false);
+  }
   function needDateOrGuests(btn, opts) {
     opts = opts || {};
     var requireGuests = opts.requireGuests !== false;
@@ -9825,8 +11759,8 @@ window.itinVisitHm = {
     var requireTitle = opts.requireTitle !== false;
     var requireGuide = opts.requireGuide === true;
     var requireStops = opts.requireStops === true;
-    var hasDate = !!(dateEl && String(dateEl.value || '').trim());
-    var blocked = dateErrorVisible();
+    var hasDate = !!(dateEl && String(dateEl.value || '').trim()) || packageTouristPicksDate();
+    var blocked = dateErrorVisible() && !packageTouristPicksDate();
     if (blocked && !requireMeetup) {
       var fbMeetup = document.querySelector('[data-itin-date-feedback]');
       var msg = fbMeetup ? String(fbMeetup.textContent || '') : '';
@@ -9866,7 +11800,7 @@ window.itinVisitHm = {
       var gfb = document.querySelector('[data-itin-guest-feedback]');
       if (partyEl && !syncPartySize()) {
         if (partyEl) partyEl.classList.add('is-invalid');
-        setFb(gfb, true, 'Enter the number of guests.');
+        setFb(gfb, true, document.body.classList.contains('package-maker') ? 'Enter the participants.' : 'Enter the number of guests.');
         miss(partyEl, 'need-guests');
       } else if (partyEl) {
         partyEl.classList.remove('is-invalid');
@@ -9963,6 +11897,106 @@ window.itinVisitHm = {
   window.itinSyncMeetupPlaceFeedback = function () {
     applyMeetupPlaceFeedback(false);
   };
+  function packageGuestMessage(which) {
+    var minEl = document.getElementById('packageMinPax');
+    var maxEl = document.getElementById('itinPartySize');
+    var minN = minEl ? parseInt(String(minEl.value || '').trim(), 10) : 0;
+    var maxN = maxEl ? parseInt(String(maxEl.value || '').trim(), 10) : 0;
+    var checkMin = which !== 'max';
+    var checkMax = which !== 'min';
+    var minBad = checkMin && (!minN || minN < 1);
+    var maxBad = checkMax && (!maxN || maxN < 1);
+    var orderBad = minN >= 1 && maxN >= 1 && minN > maxN && (checkMin || checkMax);
+    var guestMsg = '';
+    if (minBad) guestMsg = 'Enter the minimum participants.';
+    else if (maxBad) guestMsg = 'Enter the maximum participants.';
+    else if (orderBad) guestMsg = 'Minimum participants cannot be more than the maximum.';
+    if (minEl) minEl.classList.toggle('is-invalid', minBad || (orderBad && checkMin));
+    if (maxEl) maxEl.classList.toggle('is-invalid', maxBad || (orderBad && checkMax));
+    setFb(document.querySelector('[data-itin-guest-feedback]'), !!guestMsg, guestMsg);
+    if (minBad) return minEl;
+    if (maxBad) return maxEl;
+    if (orderBad) return minEl || maxEl;
+    return null;
+  }
+  function packagePriceMessage() {
+    var priceEl = document.getElementById('packagePriceField');
+    var price = priceEl ? parseFloat(String(priceEl.value || '').trim()) : 0;
+    var priceMsg = (!isFinite(price) || price <= 0) ? 'Enter the price per person.' : '';
+    if (priceEl) priceEl.classList.toggle('is-invalid', !!priceMsg);
+    setFb(document.querySelector('[data-package-price-feedback]'), !!priceMsg, priceMsg);
+    return priceMsg ? priceEl : null;
+  }
+  function packageCloseMessage() {
+    var closeEl = document.getElementById('packageCloseDate');
+    if (!closeEl || packageTouristPicksDate()) return null;
+    var closeVal = String(closeEl.value || '').trim();
+    var tourEl = document.getElementById('itinStartDate');
+    var latestClose = '';
+    if (tourEl && tourEl.value) {
+      var parts = String(tourEl.value).split('-');
+      if (parts.length === 3) {
+        var dt = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+        dt.setDate(dt.getDate() - 2);
+        latestClose = dt.getFullYear() + '-' + String(dt.getMonth() + 1).padStart(2, '0') + '-' + String(dt.getDate()).padStart(2, '0');
+      }
+    }
+    var closeMsg = !closeVal ? 'Set the package cut off.' : (latestClose && closeVal > latestClose ? 'The package cut off must be at least 2 days before the tour date.' : '');
+    closeEl.classList.toggle('is-invalid', !!closeMsg);
+    setFb(document.querySelector('[data-package-close-feedback]'), !!closeMsg, closeMsg);
+    return closeMsg ? closeEl : null;
+  }
+  function packageSummaryMessage() {
+    var coverEl = document.getElementById('packageCoverInput');
+    var preview = document.getElementById('packageCoverPreview');
+    var hasCover = !!(coverEl && coverEl.files && coverEl.files.length)
+      || !!(preview && !preview.hidden && String(preview.getAttribute('src') || '').trim());
+    if (coverEl) coverEl.classList.toggle('is-invalid', !hasCover);
+    setFb(document.querySelector('[data-package-cover-feedback]'), !hasCover, 'Add a cover photo.');
+    var descEl = document.getElementById('packageDescriptionField');
+    var descEmpty = !descEl || !String(descEl.value || '').trim();
+    if (descEl) descEl.classList.toggle('is-invalid', descEmpty);
+    setFb(document.querySelector('[data-package-description-feedback]'), descEmpty, 'Enter the package description.');
+    var hidden = document.getElementById('packageInclusionsField');
+    var entry = document.getElementById('packageInclusionEntry');
+    var chips = document.querySelectorAll('#packageInclusionTags .tag-input__chip');
+    var hasInclusion = !!((hidden && String(hidden.value || '').trim()) || (entry && String(entry.value || '').trim()) || chips.length);
+    var tagBox = document.getElementById('packageInclusionTags');
+    if (tagBox) tagBox.classList.toggle('is-invalid', !hasInclusion);
+    setFb(document.querySelector('[data-package-inclusion-feedback]'), !hasInclusion, 'Add at least one inclusion.');
+    return (!hasCover && coverEl) || (descEmpty && descEl) || (!hasInclusion && (entry || tagBox)) || null;
+  }
+  function packageFieldsReady(focus) {
+    if (!document.body.classList.contains('package-maker')) return true;
+    var first = packageGuestMessage() || packagePriceMessage() || packageCloseMessage();
+    if (focus !== false && first && first.focus) {
+      first.focus({ preventScroll: false });
+      if (first.scrollIntoView) first.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    return !first;
+  }
+  ['packageMinPax', 'itinPartySize', 'packagePriceField', 'packageCloseDate'].forEach(function (id) {
+    var field = document.getElementById(id);
+    if (!field) return;
+    field.addEventListener('input', function () {
+      if (id === 'packageMinPax') packageGuestMessage('min');
+      else if (id === 'itinPartySize') packageGuestMessage('max');
+      else if (id === 'packagePriceField') packagePriceMessage();
+      else packageCloseMessage();
+    });
+  });
+  ['packageCoverInput', 'packageDescriptionField', 'packageInclusionEntry'].forEach(function (id) {
+    var field = document.getElementById(id);
+    if (!field) return;
+    field.addEventListener('input', function () {
+      var note = document.querySelector(id === 'packageCoverInput' ? '[data-package-cover-feedback]' : (id === 'packageDescriptionField' ? '[data-package-description-feedback]' : '[data-package-inclusion-feedback]'));
+      if (note && !note.hidden) packageSummaryMessage();
+    });
+    field.addEventListener('change', function () {
+      var note = document.querySelector('[data-package-cover-feedback], [data-package-description-feedback], [data-package-inclusion-feedback]');
+      if (note && !note.hidden) packageSummaryMessage();
+    });
+  });
   function openGuideBookModal() {
     var guideEl = document.getElementById('guideBookModal');
     if (guideEl && window.bootstrap) {
@@ -9974,10 +12008,21 @@ window.itinVisitHm = {
     bookBtn.addEventListener('click', function (e) {
       e.preventDefault();
       e.stopPropagation();
+      if (document.body.classList.contains('package-maker')) {
+        if (needDateOrGuests(bookBtn, { requireGuests: true, requireTitle: true, requireGuide: false, requireStops: true })) return;
+        if (!packageFieldsReady()) return;
+        if (!packageTouristPicksDate()) {
+          openStayRideModal();
+          return;
+        }
+        syncBookingDetailsPreview();
+        var reviewEl = document.getElementById('itinBookReviewModal');
+        if (reviewEl && window.bootstrap) bootstrap.Modal.getOrCreateInstance(reviewEl).show();
+        return;
+      }
       if (needDateOrGuests(bookBtn, { requireGuests: true, requireTitle: true, requireGuide: false, requireStops: true })) return;
       var ensure = window.itinEnsureScheduleForBooking;
       function openFreshStay() {
-        resetStaySelection();
         openStayRideModal();
       }
       if (typeof ensure === 'function') {
@@ -10041,8 +12086,101 @@ window.itinVisitHm = {
     if (el) el.addEventListener('change', syncPwdFields);
   });
   syncPwdFields();
+  function submitPackageSave(mode) {
+    var pkgForm = document.getElementById('guideBookForm');
+    var inclusionEntry = document.getElementById('packageInclusionEntry');
+    var inclusionHidden = document.getElementById('packageInclusionsField');
+    var saveMode = document.getElementById('itinSaveMode');
+    if (inclusionEntry && inclusionHidden && String(inclusionEntry.value || '').trim()) {
+      inclusionHidden.value = [inclusionHidden.value, inclusionEntry.value].filter(Boolean).join(', ');
+    }
+    if (saveMode) saveMode.value = mode === 'new' ? 'new' : 'existing';
+    var touristDate = document.getElementById('packageDateTourist');
+    var systemGuide = !(touristDate && touristDate.checked)
+      && itinPickedGuide && itinPickedGuide.id && !itinPickedGuide.name_only;
+    if (systemGuide && !submitPackageSave.paid) {
+      var amountEl = document.querySelector('[data-package-pay-amount]');
+      var nameEl = document.querySelector('[data-package-pay-guide]');
+      if (amountEl) amountEl.textContent = String(itinPickedGuide.rate || '');
+      if (nameEl) nameEl.textContent = String(itinPickedGuide.name || 'Tour guide');
+      var qrImg = document.querySelector('[data-package-pay-qr]');
+      if (qrImg) {
+        qrImg.removeAttribute('src');
+        var qrBody = new FormData();
+        qrBody.append('csrf_token', (window.CulTour && CulTour.csrf) || '');
+        qrBody.append('action', 'package_guide_qr');
+        qrBody.append('amount', String(itinPickedGuide.rate_amount || 0));
+        qrBody.append('guide_name', String(itinPickedGuide.name || ''));
+        fetch(window.location.pathname + window.location.search, {
+          method: 'POST',
+          headers: { 'X-Requested-With': 'XMLHttpRequest', Accept: 'application/json' },
+          body: qrBody,
+          credentials: 'same-origin'
+        }).then(function (res) { return res.json(); }).then(function (data) {
+          if (data && data.qr) qrImg.src = data.qr;
+        }).catch(function () {});
+      }
+      submitPackageSave.mode = mode;
+      var reviewEl = document.getElementById('itinBookReviewModal');
+      var choiceEl = document.getElementById('itinSaveChoiceModal');
+      if (reviewEl && window.bootstrap) bootstrap.Modal.getOrCreateInstance(reviewEl).hide();
+      if (choiceEl && window.bootstrap) bootstrap.Modal.getOrCreateInstance(choiceEl).hide();
+      var payEl = document.getElementById('packageGuidePayModal');
+      if (payEl && window.bootstrap) bootstrap.Modal.getOrCreateInstance(payEl).show();
+      return;
+    }
+    submitPackageSave.paid = false;
+    if (pkgForm) pkgForm.submit();
+  }
+  var packagePayBtn = document.getElementById('packageGuidePayConfirm');
+  if (packagePayBtn) {
+    packagePayBtn.addEventListener('click', function () {
+      submitPackageSave.paid = true;
+      submitPackageSave(submitPackageSave.mode || 'existing');
+    });
+  }
+  var saveExistingBtn = document.getElementById('itinSaveExisting');
+  var saveNewBtn = document.getElementById('itinSaveNew');
+  if (saveExistingBtn) saveExistingBtn.addEventListener('click', function () { submitPackageSave('existing'); });
+  if (saveNewBtn) saveNewBtn.addEventListener('click', function () { submitPackageSave('new'); });
   if (proceedBtn) {
     proceedBtn.addEventListener('click', function () {
+      if (document.body.classList.contains('package-maker')) {
+        if (needDateOrGuests(null, { requireGuests: true, requireTitle: true, requireMeetup: true, requireStops: true }) || !packageFieldsReady()) {
+          var reviewBlock = document.getElementById('itinBookReviewModal');
+          if (reviewBlock && window.bootstrap) bootstrap.Modal.getOrCreateInstance(reviewBlock).hide();
+          return;
+        }
+        var summaryMiss = packageSummaryMessage();
+        if (summaryMiss) {
+          if (summaryMiss.focus) summaryMiss.focus();
+          return;
+        }
+        var choiceEl = document.getElementById('itinSaveChoiceModal');
+        var baselineEl = document.getElementById('itinBaseline');
+        var itinField = document.querySelector('#guideBookForm [name="itinerary_id"]');
+        var body = new FormData();
+        body.append('csrf_token', (window.CulTour && CulTour.csrf) || '');
+        body.append('action', 'itinerary_changed');
+        body.append('itinerary_id', itinField ? String(itinField.value || '') : '');
+        body.append('baseline', baselineEl ? String(baselineEl.value || '') : '');
+        fetch(window.location.pathname + window.location.search, {
+          method: 'POST',
+          headers: { 'X-Requested-With': 'XMLHttpRequest', Accept: 'application/json' },
+          body: body,
+          credentials: 'same-origin'
+        }).then(function (res) { return res.json(); }).then(function (data) {
+          var published = document.getElementById('packageAlreadyMade');
+          if (data && data.changed && published && published.value === '1' && choiceEl && window.bootstrap) {
+            bootstrap.Modal.getOrCreateInstance(choiceEl).show();
+            return;
+          }
+          submitPackageSave('existing');
+        }).catch(function () {
+          submitPackageSave('existing');
+        });
+        return;
+      }
       if (needDateOrGuests(null, { requireGuests: true, requireTitle: true, requireMeetup: true, requireStops: true })) {
         var reviewElBlock = document.getElementById('itinBookReviewModal');
         if (reviewElBlock && window.bootstrap) bootstrap.Modal.getOrCreateInstance(reviewElBlock).hide();
@@ -10091,13 +12229,14 @@ window.itinVisitHm = {
   syncBookBtnForDate();
 
   var allGuides = <?= json_encode($bookGuides, JSON_UNESCAPED_UNICODE) ?>;
+  var systemGuideList = <?= json_encode($packageSystemGuides ?? [], JSON_UNESCAPED_UNICODE) ?>;
   var guides = [];
   var showFilter = 'available';
   var root = document.getElementById('guideFocusCarousel');
   var modalEl = document.getElementById('guideBookModal');
   var filterEl = document.getElementById('guideShowFilter');
   var emptyEl = document.querySelector('[data-guide-empty]');
-  if (!root || !allGuides || !allGuides.length) {
+  if (!root) {
     return;
   }
 
@@ -10148,16 +12287,8 @@ window.itinVisitHm = {
     return 'available';
   }
 
-  function sortGuides(list) {
-    return (list || []).slice().sort(function (a, b) {
-      var fd = ((b && b.full_day_ok) ? 1 : 0) - ((a && a.full_day_ok) ? 1 : 0);
-      if (fd) return fd;
-      return ((b && b.ok) ? 1 : 0) - ((a && a.ok) ? 1 : 0);
-    });
-  }
-
   function visibleGuides() {
-    return sortGuides(allGuides).filter(function (g) { return !!(g && g.ok); });
+    return (allGuides || []).filter(function (g) { return !!(g && g.ok); });
   }
 
   function wrap(i) {
@@ -10185,6 +12316,26 @@ window.itinVisitHm = {
     var notesForm = document.getElementById('guideBookForm');
     if (notesForm) notesForm.classList.toggle('d-none', guides.length === 0);
     render();
+  }
+
+  var requestGuideBtn = document.getElementById('packageNoGuideRequest');
+  if (requestGuideBtn) {
+    requestGuideBtn.addEventListener('click', function () {
+      allGuides = systemGuideList || [];
+      var guideTitle = document.getElementById('guideBookModalLabel');
+      if (guideTitle) guideTitle.textContent = 'Tour guide';
+      applyShowFilter();
+      var notice = document.getElementById('packageNoGuideModal');
+      if (notice && window.bootstrap) {
+        notice.addEventListener('hidden.bs.modal', function onHidden() {
+          notice.removeEventListener('hidden.bs.modal', onHidden);
+          openGuideBookModal();
+        });
+        bootstrap.Modal.getOrCreateInstance(notice).hide();
+      } else {
+        openGuideBookModal();
+      }
+    });
   }
 
   function initials(name) {
@@ -10263,7 +12414,6 @@ window.itinVisitHm = {
             '<li><span>Phone</span><strong>' + escapeHtml(g.phone) + '</strong></li>' +
             '<li><span>Languages</span><strong>' + escapeHtml(g.languages) + '</strong></li>' +
             '<li><span>Daily rate</span><strong>' + escapeHtml(g.rate) + '</strong></li>' +
-            '<li><span>License no.</span><strong>' + escapeHtml(g.license) + '</strong></li>' +
           '</ul>' +
           (g.hint ? '<div class="guide-focus__avail-hint' + (hintOk ? ' is-ok' : '') + '">' + escapeHtml(g.hint) + '</div>' : '') +
         '</div>' +
@@ -10305,9 +12455,12 @@ window.itinVisitHm = {
       var bookModal = bootstrap.Modal.getOrCreateInstance(modalEl);
       modalEl.addEventListener('hidden.bs.modal', function onGuideHidden() {
         modalEl.removeEventListener('hidden.bs.modal', onGuideHidden);
-        if (typeof openBookReviewModal === 'function') openBookReviewModal();
+        if (!document.body.classList.contains('package-maker') && typeof openGuideGuestModal === 'function') openGuideGuestModal();
+        else if (typeof openBookReviewModal === 'function') openBookReviewModal();
       });
       bookModal.hide();
+    } else if (!document.body.classList.contains('package-maker') && typeof openGuideGuestModal === 'function') {
+      openGuideGuestModal();
     } else if (typeof openBookReviewModal === 'function') {
       openBookReviewModal();
     }
@@ -10488,41 +12641,101 @@ window.itinVisitHm = {
     });
   }
 
+  function guideCard(g) {
+    var photo = g.avatar
+      ? '<span class="pick-spot__photo" style="background-image:url(' + escapeHtml(g.avatar) + ')"><span class="pick-spot__kicker">' + (g.name_only ? 'In-house guide' : 'Tour guide') + '</span></span>'
+      : '<span class="pick-spot__photo is-empty"><span class="pick-spot__kicker">' + (g.name_only ? 'In-house guide' : 'Tour guide') + '</span></span>';
+    var selected = Number(g.id) === Number(selectedGuideId);
+    if (g.name_only) {
+      return '<article class="pick-spot pick-spot--guide pick-spot--house' + (selected ? ' is-selected' : '') + '" data-guide-select="' + g.id + '">' +
+        photo +
+        '<span class="pick-spot__copy"><span class="pick-spot__name">' + escapeHtml(g.name) + '</span></span>' +
+      '</article>';
+    }
+    return '<article class="pick-spot pick-spot--guide' + (g.ok ? '' : ' is-unavailable') + (selected ? ' is-selected' : '') + '" data-guide-select="' + g.id + '">' +
+      photo +
+      '<span class="pick-spot__copy">' +
+        '<span class="pick-spot__name">' + escapeHtml(g.name) + '</span>' +
+        '<span class="pick-spot__rating">' + ratingStarsHtml(g, 'sm') + '</span>' +
+        '<ul class="pick-spot__facts">' +
+          '<li><span>Phone</span><strong>' + escapeHtml(g.phone) + '</strong></li>' +
+          '<li><span>Daily rate</span><strong>' + escapeHtml(g.rate) + '</strong></li>' +
+          '<li class="is-languages" title="' + escapeHtml(g.languages) + '"><span>Languages</span><strong>' + escapeHtml(g.languages) + '</strong></li>' +
+        '</ul>' +
+        (g.hint ? '<div class="guide-focus__avail-hint' + (g.ok ? ' is-ok' : '') + '">' + escapeHtml(g.hint) + '</div>' : '') +
+        '<span class="pick-spot__actions">' +
+          '<a class="btn btn-outline-light btn-sm" href="' + chatBase + g.user_id + '">Chat</a>' +
+        '</span>' +
+      '</span>' +
+    '</article>';
+  }
+
   function render() {
-    var n = guides.length;
-    if (!n) {
-      fillSide(leftEl, null);
-      fillCenter(centerEl, null);
-      fillSide(rightEl, null);
-      if (leftEl) leftEl.classList.add('is-empty');
-      if (rightEl) rightEl.classList.add('is-empty');
+    var grid = document.getElementById('guidePickGrid');
+    if (!grid) return;
+    var q = '';
+    var search = document.getElementById('guidePickSearch');
+    if (search) q = String(search.value || '').trim().toLowerCase();
+    var list = guides.filter(function (g) {
+      if (!q) return true;
+      return (String(g.name || '') + ' ' + String(g.languages || '') + ' ' + String(g.phone || '')).toLowerCase().indexOf(q) !== -1;
+    });
+    if (!list.length) {
+      grid.innerHTML = '';
+      if (emptyEl) {
+        emptyEl.textContent = q ? 'No guides match that search.' : emptyGuideMessage();
+        emptyEl.classList.remove('d-none');
+      }
       syncForm(null);
       return;
     }
-    var center = guides[wrap(idx)];
-    var left = n === 1 ? null : guides[wrap(idx - 1)];
-    var right = n === 1 ? null : guides[wrap(idx + 1)];
-    if (n === 2) {
-      left = guides[wrap(idx - 1)];
-      right = left;
-    }
-    fillSide(leftEl, left);
-    fillCenter(centerEl, center);
-    fillSide(rightEl, right);
-    if (leftEl) leftEl.classList.toggle('is-empty', !left);
-    if (rightEl) rightEl.classList.toggle('is-empty', !right);
-    syncForm(center);
+    if (emptyEl) emptyEl.classList.add('d-none');
+    grid.innerHTML = list.map(guideCard).join('');
+    syncForm(guides[wrap(idx)] || list[0]);
+    if (window.itinPlaceGuidePick) window.itinPlaceGuidePick();
   }
 
   if (prevBtn) prevBtn.addEventListener('click', function () { idx = wrap(idx - 1); render(); });
   if (nextBtn) nextBtn.addEventListener('click', function () { idx = wrap(idx + 1); render(); });
-  if (centerEl) {
-    centerEl.addEventListener('click', function (e) {
-      var btn = e.target.closest('[data-guide-book]');
-      if (!btn || btn.disabled) return;
+  var selectedGuideId = 0;
+  var guidePickConfirm = document.getElementById('guidePickConfirm');
+  function markGuideSelection(id) {
+    selectedGuideId = Number(id) || 0;
+    var chosen = null;
+    for (var si = 0; si < guides.length; si++) {
+      if (Number(guides[si].id) === selectedGuideId) {
+        idx = si;
+        chosen = guides[si];
+        break;
+      }
+    }
+    if (guidePickConfirm) guidePickConfirm.disabled = !chosen || !chosen.ok;
+    var nameEl = document.querySelector('[data-guide-view-name]');
+    var rateEl = document.querySelector('[data-guide-view-rate]');
+    if (nameEl) {
+      nameEl.textContent = !chosen ? '' : (chosen.name_only ? String(chosen.name || 'Guide') : String(chosen.rate || ''));
+    }
+    if (rateEl) {
+      rateEl.textContent = !chosen ? 'Select a guide' : (chosen.name_only ? '' : String(chosen.name || 'Guide'));
+    }
+    render();
+  }
+  if (root) {
+    root.addEventListener('click', function (e) {
+      if (e.target.closest('a')) return;
+      var card = e.target.closest('[data-guide-select]');
+      if (!card) return;
+      markGuideSelection(card.getAttribute('data-guide-select'));
+    });
+  }
+  if (guidePickConfirm) {
+    guidePickConfirm.addEventListener('click', function () {
+      if (!selectedGuideId) return;
       pickCurrentGuide();
     });
   }
+  var guideSearch = document.getElementById('guidePickSearch');
+  if (guideSearch) guideSearch.addEventListener('input', function () { render(); });
   var bookForm = document.getElementById('guideBookForm');
   if (bookForm) {
     bookForm.addEventListener('submit', function (e) {

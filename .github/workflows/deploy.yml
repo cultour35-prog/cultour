@@ -1,64 +1,25 @@
-# Deploy CulTour to the web server when code is pushed.
-#
-# Add these repository secrets before the first run
-# (GitHub → Settings → Secrets and variables → Actions):
-#
-#   FTP_SERVER       hostname, for example ftp.example.com
-#   FTP_USERNAME     FTP account
-#   FTP_PASSWORD     FTP password
-#   FTP_SERVER_DIR   remote folder, for example /public_html/cultour/
-#
-# config/secrets.php, uploads, sessions, backups, and SQL dumps are not uploaded.
-# Keep the live secrets.php and user uploads on the server.
 
-name: Deploy CulTour
+name: Deploy CulTour to InfinityFree
 
 on:
   push:
     branches:
       - main
-      - master
-  workflow_dispatch:
-
-concurrency:
-  group: cultour-production
-  cancel-in-progress: false
 
 jobs:
   deploy:
-    name: Deploy to production
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Upload site over FTP
+      - name: Deploy to InfinityFree
         uses: SamKirkland/FTP-Deploy-Action@v4.3.5
         with:
           server: ${{ secrets.FTP_SERVER }}
           username: ${{ secrets.FTP_USERNAME }}
           password: ${{ secrets.FTP_PASSWORD }}
+          server-dir: /htdocs/cultour/
           protocol: ftp
           port: 21
-          local-dir: ./
-          server-dir: ${{ secrets.FTP_SERVER_DIR }}
-          dangerous-clean-slate: false
-          log-level: standard
-          exclude: |
-            **/.git*
-            **/.git*/**
-            **/.github/**
-            **/.vscode/**
-            **/node_modules/**
-            **/vendor/**
-            **/storage/sessions/**
-            **/storage/backups/**
-            **/uploads/**
-            **/config/secrets.php
-            **/*.sql
-            **/*.sql.gz
-            **/*.sqlite
-            **/*.db
-            **/*.log
-            **/cultour mobile/**
-            **/mobile_app/**

@@ -11,7 +11,10 @@ if (!$rows): ?>
               $payOpen = in_array($status, ['pending', 'approved'], true) && ($r['payment_status'] ?? '') !== 'paid';
               $alreadyRated = (int) ($r['rated'] ?? 0) > 0;
             ?>
-            <div class="col-12">
+            <div class="col-12" data-booking-id="<?= (int) $r['id'] ?>"
+              data-sort-date="<?= e(trim((string) ($r['booking_date'] ?? '') . ' ' . (string) ($r['start_time'] ?? ''))) ?>"
+              data-sort-status="<?= e($status) ?>"
+              data-sort-name="<?= e(strtolower((string) ($r['guide_name'] ?? ''))) ?>">
               <div class="glass p-3">
                 <div class="d-flex flex-wrap justify-content-between gap-2 mb-2">
                   <div>
@@ -30,9 +33,6 @@ if (!$rows): ?>
                     <?php if (booking_needs_replacement($r)): ?>
                       <div class="mt-1"><span class="badge bg-warning text-dark">Needs replacement</span></div>
                     <?php endif; ?>
-                    <?php if ($status === 'pending'): ?>
-                      <div class="small text-muted mt-1">Waiting for guide</div>
-                    <?php endif; ?>
                   </div>
                 </div>
 
@@ -42,9 +42,6 @@ if (!$rows): ?>
                     <div>
                       <?php if (!empty($r['itinerary_id']) && !empty($r['itinerary_title'])): ?>
                         <?= e($r['itinerary_title']) ?>
-                        <div class="mt-1">
-                          <a class="btn btn-sm btn-outline-primary" href="<?= APP_URL ?>/itinerary-share.php?id=<?= (int) $r['itinerary_id'] ?>" target="_blank" rel="noopener">View itinerary</a>
-                        </div>
                       <?php else: ?>
                         —
                       <?php endif; ?>
@@ -74,10 +71,8 @@ if (!$rows): ?>
                   </div>
                 <?php endif; ?>
 
-                <div class="d-flex flex-wrap gap-2 align-items-start">
-                  <?php if (!empty($r['itinerary_id']) || in_array($status, ['approved', 'completed'], true)): ?>
-                    <?= booking_history_details_html($r) ?>
-                  <?php endif; ?>
+                <div class="d-flex flex-wrap gap-2 align-items-center tourist-booking-actions">
+                  <button type="button" class="btn btn-sm btn-outline-primary booking-pair-btn" data-tourist-summary="<?= (int) $r['id'] ?>">View details</button>
                   <?php if ($ticketReady): ?>
                     <a class="btn btn-sm btn-ct booking-pair-btn" href="<?= APP_URL ?>/booking-ticket.php?id=<?= (int) $r['id'] ?>" target="_blank">
                       <i class="bi bi-qr-code"></i> Ticket / QR

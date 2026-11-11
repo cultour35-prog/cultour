@@ -98,14 +98,14 @@ require __DIR__ . '/../includes/guide_shell_start.php';
                         <input type="time" class="form-control form-control-sm" id="availStart<?= $i ?>"
                                name="day_start[<?= $i ?>]"
                                value="<?= e(time_picker_value((string) $availByDay[$i]['start'], '8:00 AM')) ?>"
-                               step="60"<?= $dayOn ? ' required' : ' disabled' ?>>
+                               step="900"<?= $dayOn ? ' required' : ' disabled' ?>>
                       </div>
                       <div>
                         <label class="form-label small mb-0" for="availEnd<?= $i ?>">End</label>
                         <input type="time" class="form-control form-control-sm" id="availEnd<?= $i ?>"
                                name="day_end[<?= $i ?>]"
                                value="<?= e(time_picker_value((string) $availByDay[$i]['end'], '5:00 PM')) ?>"
-                               step="60" data-avail-end<?= $dayOn ? ' required' : ' disabled' ?>>
+                               step="900" data-avail-end<?= $dayOn ? ' required' : ' disabled' ?>>
                       </div>
                       <p class="guide-profile-avail__cutoff mb-0" data-avail-cutoff>
                         Same-day booking cutoff: <?= e(guide_booking_cutoff_display($availByDay[$i]['end']) ?: '—') ?>
@@ -210,5 +210,6 @@ require __DIR__ . '/../includes/guide_shell_start.php';
   });
 })();
 </script>
+<script src="<?= APP_URL ?>/assets/js/avail-time.js?v=<?= @filemtime(ROOT_PATH . '/assets/js/avail-time.js') ?: time() ?>"></script>
 <?php require __DIR__ . '/../includes/guide_shell_end.php'; ?>
 <?php require __DIR__ . '/../includes/footer.php'; ?>

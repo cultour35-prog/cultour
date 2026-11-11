@@ -333,6 +333,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
         }
         $visitLimit = $visitParsed['limit'];
         $visit = $visitLimit ?? 60;
+        $featuredFlag = isset($_POST['is_featured']) ? 1 : 0;
         $extraChanged = [];
         if (files_field_has_upload($_FILES['business_photos'] ?? null)) {
             $extraChanged[] = 'business photos';
@@ -345,7 +346,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
             'UPDATE businesses SET business_type_id=?, name=?, owner_name=?, representative_name=?, representative_sex=?, slug=?, description=?, address=?,
              address_region=?, address_city=?, address_barangay=?, address_street=?,
              phone=?, email=?, permit_number=?, tax_id=?, website=?, facebook_url=?, instagram_url=?, cover_image=?, logo=?, latitude=?, longitude=?, status=?,
-             opening_hours=?, default_visit_minutes=?, visit_duration_minutes=?
+             opening_hours=?, default_visit_minutes=?, visit_duration_minutes=?, is_featured=?
              WHERE id=?'
         )->execute([
             $typeId,
@@ -375,6 +376,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && verify_csrf()) {
             $hoursJson,
             $visit,
             $visitLimit,
+            $featuredFlag,
             $id,
         ]);
         db()->prepare('UPDATE users SET first_name=?, last_name=?, middle_name=?, sex=? WHERE id=?')->execute([
@@ -629,6 +631,12 @@ map_leaflet_head();
             <input type="hidden" name="longitude" id="editBizLng" value="<?= e((string) ($edit['longitude'] ?? '')) ?>">
             <fieldset class="admin-locked-form<?= $formLocked ? ' is-locked' : '' ?>">
             <div class="row g-3">
+              <div class="col-12">
+                <div class="form-check mb-0">
+                  <input class="form-check-input" type="checkbox" name="is_featured" id="bizFeatured" value="1"<?= !empty($edit['is_featured']) ? ' checked' : '' ?><?= $formLocked ? ' disabled' : '' ?>>
+                  <label class="form-check-label" for="bizFeatured">Featured business</label>
+                </div>
+              </div>
               <?php
                 $listing = $edit;
                 $repParts = split_person_name((string) ($edit['representative_name'] ?? ''));

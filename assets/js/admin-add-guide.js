@@ -4,24 +4,49 @@
 
   var sameWrapEl = document.getElementById('sameAsAddressWrap');
   var GUIDE_LOCK_PROV = sameWrapEl
-    ? (sameWrapEl.getAttribute('data-same-lock-province') || 'Leyte')
+    ? (sameWrapEl.getAttribute('data-same-lock-province') || '')
     : 'Leyte';
   var GUIDE_LOCK_CITY = sameWrapEl
-    ? (sameWrapEl.getAttribute('data-same-lock-city') || 'Ormoc City')
+    ? (sameWrapEl.getAttribute('data-same-lock-city') || '')
     : 'Ormoc City';
 
   function capFirst(el) {
-    if (!el) return;
+    if (!el || (el.name && /suffix/i.test(el.name))) return;
     var v = el.value;
     if (!v) return;
-    el.value = v.charAt(0).toUpperCase() + v.slice(1);
+    var next = v.replace(/[A-Za-zÀ-ÖØ-öø-ÿÑñ]+/g, function (word) {
+      return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+    });
+    if (next === v) return;
+    var start = el.selectionStart;
+    var end = el.selectionEnd;
+    el.value = next;
+    if (typeof start === 'number' && el.setSelectionRange) {
+      try { el.setSelectionRange(start, end); } catch (err) {}
+    }
   }
   document.querySelectorAll('#adminAddGuideForm .name-cap').forEach(function (el) {
     el.addEventListener('blur', function () { capFirst(el); });
-    el.addEventListener('input', function () {
-      if (el.value.length === 1) capFirst(el);
-    });
+    el.addEventListener('input', function () { capFirst(el); });
   });
+  var nationalityInput = form.querySelector('[name="nationality"]');
+  if (nationalityInput) {
+    function capNationality() {
+      var v = nationalityInput.value || '';
+      if (!v) return;
+      var lower = v.toLocaleLowerCase();
+      var next = lower.charAt(0).toLocaleUpperCase() + lower.slice(1);
+      if (next === v) return;
+      var start = nationalityInput.selectionStart;
+      nationalityInput.value = next;
+      if (typeof start === 'number' && nationalityInput.setSelectionRange) {
+        try { nationalityInput.setSelectionRange(start, start); } catch (err) {}
+      }
+    }
+    nationalityInput.addEventListener('input', capNationality);
+    nationalityInput.addEventListener('blur', capNationality);
+    capNationality();
+  }
 
   function nameLettersLabel(input) {
     var n = (input && input.name) || '';
@@ -125,7 +150,14 @@
     emailInput._showEmailWarn = showEmail;
   }
 
-  function phoneMessage(d, onBlur) {
+  function phoneDigits(raw) {
+    var d = String(raw || '').replace(/\D+/g, '');
+    if (d.indexOf('63') === 0 && d.length > 10) d = d.slice(2);
+    if (d.charAt(0) === '0') d = d.replace(/^0+/, '');
+    return d.slice(0, 10);
+  }
+  function phoneMessage(raw, onBlur) {
+    var d = phoneDigits(raw);
     if (!d) return '';
     if (d.charAt(0) !== '9') return 'Enter a valid mobile number.';
     if (onBlur && d.length !== 10) return 'Phone number must be exactly 10 digits.';
@@ -146,8 +178,7 @@
       }
     }
     input.addEventListener('input', function () {
-      input.value = String(input.value || '').replace(/\D+/g, '').slice(0, 10);
-      show(phoneMessage(input.value, false));
+      show(phoneMessage(input.value, phoneDigits(input.value).length >= 10));
       if (window.syncTouristEmergencyDupWarn) window.syncTouristEmergencyDupWarn();
     });
     input.addEventListener('blur', function () { show(phoneMessage(input.value, true)); });
@@ -254,6 +285,7 @@
     return addrCity ? String(addrCity.value || '').trim() : '';
   }
   function guideSameAsNeedsLeyte() {
+    if (!GUIDE_LOCK_PROV && !GUIDE_LOCK_CITY) return false;
     if (!sameYes || !sameYes.checked) return false;
     var prov = permanentProvince();
     var city = permanentCity();

@@ -40,7 +40,6 @@ $guideNav = [
     ['checkin', 'Check-in', '/tourguide/checkin.php', 'bi-camera'],
     ['bookings', 'Bookings', '/tourguide/bookings.php', 'bi-calendar-check'],
     ['availability', 'Availability', '/tourguide/availability.php', 'bi-calendar3'],
-    ['itineraries', 'Tours', '/tourguide/itineraries.php', 'bi-signpost-2'],
     ['ratings', 'Ratings', '/tourguide/ratings.php', 'bi-star'],
 ];
 
@@ -144,12 +143,17 @@ $bodyClass = trim(($bodyClass ?? '') . ' guide-app');
 
   <main class="tourist-main">
     <?php if (empty($guideHidePagehead) && (!empty($pageHeading) || !empty($pageSub))): ?>
-      <div class="tourist-pagehead">
-        <?php if (!empty($pageHeading)): ?>
-          <h1 class="tourist-pagehead__title"><?= e($pageHeading) ?></h1>
-        <?php endif; ?>
-        <?php if (!empty($pageSub)): ?>
-          <p class="tourist-pagehead__sub"><?= e($pageSub) ?></p>
+      <div class="tourist-pagehead<?= !empty($pageHeadingTools) ? ' tourist-pagehead--tools' : '' ?>">
+        <div>
+          <?php if (!empty($pageHeading)): ?>
+            <h1 class="tourist-pagehead__title"><?= e($pageHeading) ?></h1>
+          <?php endif; ?>
+          <?php if (!empty($pageSub)): ?>
+            <p class="tourist-pagehead__sub"><?= e($pageSub) ?></p>
+          <?php endif; ?>
+        </div>
+        <?php if (!empty($pageHeadingTools)): ?>
+          <?= $pageHeadingTools ?>
         <?php endif; ?>
       </div>
     <?php endif; ?>

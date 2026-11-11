@@ -63,7 +63,6 @@ $menus = [
     ['checkin', 'bi-camera', 'Check-in', '/tourguide/checkin.php'],
     ['bookings', 'bi-calendar-check', 'Bookings', '/tourguide/bookings.php'],
     ['availability', 'bi-calendar3', 'Availability', '/tourguide/availability.php'],
-    ['itineraries', 'bi-signpost-2', 'Suggested Tours', '/tourguide/itineraries.php'],
     ['ratings', 'bi-star', 'Ratings', '/tourguide/ratings.php'],
   ],
   ROLE_BUSINESS => [

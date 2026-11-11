@@ -153,7 +153,7 @@ foreach ($stopsByDay as $g) {
         }
         $pdf->SetFont('Helvetica', '', 9);
         $pdf->SetTextColor(20, 36, 42);
-        $pdf->Cell(0, 5, pdf_text('Estimated time of arrival ' . $arrive . ' · Leave ' . $leave . ' · Stay ' . $visit . ' min'), 0, 1);
+        $pdf->Cell(0, 5, pdf_text('ETA ' . $arrive . ' · Leave ' . $leave . ' · Stay ' . $visit . ' min'), 0, 1);
         $pdf->SetDrawColor(230, 236, 238);
         $pdf->Line(16, $pdf->GetY() + 1, 194, $pdf->GetY() + 1);
         $pdf->Ln(4);

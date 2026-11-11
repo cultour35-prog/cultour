@@ -176,15 +176,22 @@ function admin_guides_fetch_rows(): array
 {
     ensure_guide_documents_schema();
     ensure_user_identity_schema();
+    if (is_file(__DIR__ . '/inhouse_guides.php')) {
+        require_once __DIR__ . '/inhouse_guides.php';
+        inhouse_guides_ensure_schema();
+    }
     return db()->query(
         "SELECT g.*, u.first_name, u.last_name, u.middle_name, u.name_suffix, u.sex, u.date_of_birth, u.nationality,
+                biz.name AS affiliation_name,
                 u.address AS user_address, u.address_region, u.address_city, u.address_barangay, u.address_street,
                 u.current_same_as_permanent, u.current_address, u.current_address_region, u.current_address_city,
                 u.current_address_barangay, u.current_address_street,
                 u.emergency_contact_name, u.emergency_contact_relationship, u.emergency_contact_phone,
                 u.email, u.phone, u.avatar, u.status AS user_status,
                 (SELECT COUNT(*) FROM guide_ratings gr WHERE gr.guide_id = g.id) AS review_count
-         FROM tour_guide_profiles g JOIN users u ON u.id=g.user_id
+         FROM tour_guide_profiles g
+         JOIN users u ON u.id=g.user_id
+         LEFT JOIN businesses biz ON biz.id = g.affiliated_business_id
          ORDER BY g.created_at DESC"
     )->fetchAll() ?: [];
 }
@@ -210,7 +217,7 @@ function admin_guides_version(array $rows): string
 {
     $parts = [];
     foreach ($rows as $r) {
-        $parts[] = (int) $r['id'] . ':' . ($r['approval_status'] ?? '') . ':' . ($r['user_status'] ?? '') . ':' . ($r['updated_at'] ?? $r['created_at'] ?? '');
+        $parts[] = (int) $r['id'] . ':' . ($r['approval_status'] ?? '') . ':' . ($r['user_status'] ?? '') . ':' . ($r['guide_type'] ?? '') . ':' . ($r['affiliation_name'] ?? '') . ':' . ($r['updated_at'] ?? $r['created_at'] ?? '');
     }
     return md5(implode('|', $parts) . '|g|' . count($rows));
 }
@@ -219,7 +226,7 @@ function admin_businesses_version(array $rows): string
 {
     $parts = [];
     foreach ($rows as $r) {
-        $parts[] = (int) $r['id'] . ':' . ($r['approval_status'] ?? '') . ':' . ($r['status'] ?? '') . ':' . ($r['user_status'] ?? '') . ':' . ($r['updated_at'] ?? $r['created_at'] ?? '');
+        $parts[] = (int) $r['id'] . ':' . ($r['approval_status'] ?? '') . ':' . ($r['status'] ?? '') . ':' . ($r['user_status'] ?? '') . ':' . (!empty($r['is_featured']) ? '1' : '0') . ':' . ($r['updated_at'] ?? $r['created_at'] ?? '');
     }
     return md5(implode('|', $parts) . '|b|' . count($rows));
 }
@@ -256,7 +263,7 @@ function admin_try_suspend_role_user(int $userId, int $adminId, int $expectedRol
     return suspend_user($userId, $adminId, $reason);
 }
 
-function admin_render_guide_rows(array $list, array $docsByGuide, bool $showApprove): string
+function admin_render_guide_rows(array $list, array $docsByGuide, bool $showApprove, bool $showAffiliation = false): string
 {
     if (!$list) {
         return '';
@@ -319,6 +326,9 @@ function admin_render_guide_rows(array $list, array $docsByGuide, bool $showAppr
             </div>
           </td>
           <td class="guide-col-lang"><?= e($r['languages'] ?? '—') ?></td>
+          <?php if ($showAffiliation): ?>
+          <td><?= e(trim((string) ($r['affiliation_name'] ?? '')) !== '' ? (string) $r['affiliation_name'] : '—') ?></td>
+          <?php endif; ?>
           <td class="guide-col-status">
             <?php
             $guideStatus = $r;
@@ -431,6 +441,7 @@ function admin_render_business_rows(array $list, array $docsByBiz, bool $showApp
             <?php endif; ?>
           </td>
           <td class="biz-col-status">
+            <span class="biz-status-row">
             <?php
             if (($r['approval_status'] ?? '') === 'approved') {
                 if (($r['user_status'] ?? '') === 'suspended') {
@@ -440,10 +451,14 @@ function admin_render_business_rows(array $list, array $docsByBiz, bool $showApp
                 } else {
                     echo status_badge('approved');
                 }
+                if (!empty($r['is_featured'])) {
+                    echo '<span class="badge text-bg-primary">Featured</span>';
+                }
             } else {
                 echo admin_approval_badge((string) ($r['approval_status'] ?? ''));
             }
             ?>
+            </span>
           </td>
           <td class="biz-col-actions text-nowrap">
             <?php if (($r['approval_status'] ?? '') !== 'pending'): ?>
@@ -884,7 +899,17 @@ function admin_registrations_live_payload(string $kind): array
 
     if ($kind === 'guides') {
         $rows = admin_guides_fetch_rows();
-        $split = admin_guides_split($rows);
+        $systemRows = [];
+        $inhouseRows = [];
+        foreach ($rows as $guideRow) {
+            if ((string) ($guideRow['guide_type'] ?? 'olga') === 'in_house') {
+                $inhouseRows[] = $guideRow;
+            } else {
+                $systemRows[] = $guideRow;
+            }
+        }
+        $split = admin_guides_split($systemRows);
+        $inhouseSplit = admin_guides_split($inhouseRows);
         $panels = [
             'registered' => [
                 'html' => admin_render_guide_rows($split['registered'], [], false),
@@ -901,6 +926,22 @@ function admin_registrations_live_payload(string $kind): array
             'suspended' => [
                 'html' => admin_render_guide_rows($split['suspended'], [], false),
                 'empty' => 'No suspended tour guides.',
+            ],
+            'ih_registered' => [
+                'html' => admin_render_guide_rows($inhouseSplit['registered'], [], false, true),
+                'empty' => 'No active in-house guides.',
+            ],
+            'ih_pending' => [
+                'html' => admin_render_guide_rows($inhouseSplit['pending'], [], true, true),
+                'empty' => 'No pending in-house guides.',
+            ],
+            'ih_rejected' => [
+                'html' => admin_render_guide_rows($inhouseSplit['rejected'], [], false, true),
+                'empty' => 'No rejected in-house guides.',
+            ],
+            'ih_suspended' => [
+                'html' => admin_render_guide_rows($inhouseSplit['suspended'], [], false, true),
+                'empty' => 'No suspended in-house guides.',
             ],
         ];
         $version = admin_guides_version($rows);
@@ -935,6 +976,12 @@ function admin_registrations_live_payload(string $kind): array
         'suspended' => count($split['suspended'] ?? []),
         'inactive' => count($split['inactive'] ?? []),
     ];
+    if ($kind === 'guides' && isset($inhouseSplit)) {
+        $counts['ih_registered'] = count($inhouseSplit['registered']);
+        $counts['ih_pending'] = count($inhouseSplit['pending']);
+        $counts['ih_rejected'] = count($inhouseSplit['rejected']);
+        $counts['ih_suspended'] = count($inhouseSplit['suspended']);
+    }
 
     return [
         'ok' => true,

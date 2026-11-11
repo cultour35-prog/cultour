@@ -1,6 +1,13 @@
 <?php
 $gpUser = $profileUser ?? $user;
 $dayLabels = $dayLabels ?? ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+if (!empty($inhouseGuideAddressFree)) {
+    $guideLockProv = '';
+    $guideLockCity = '';
+    $curRegion = trim((string) ($gpUser['current_address_region'] ?? ''));
+} else {
+    $guideLockCity = ph_guide_locked_city();
+}
 $guideProfileShowStatus = $guideProfileShowStatus ?? true;
 $guideProfileRequirePhoto = $guideProfileRequirePhoto ?? true;
 $guideProfileAvailNote = $guideProfileAvailNote ?? ('Same-day bookings close 2 hours before end. Block dates on <a href="' . APP_URL . '/tourguide/availability.php">Availability</a>.');
@@ -93,7 +100,7 @@ $markGuideIncomplete = ($guideProfileShowStatus ?? true)
               </div>
             </div>
 
-            <div data-same-as-permanent data-same-lock-province="<?= e($guideLockProv) ?>" data-same-lock-city="<?= e(ph_guide_locked_city()) ?>">
+            <div data-same-as-permanent<?= $guideLockProv !== '' ? ' data-same-lock-province="' . e($guideLockProv) . '" data-same-lock-city="' . e($guideLockCity) . '"' : '' ?>>
             <div class="guide-profile-section">
               <?php if (!$hasStructured && $legacyAddress !== ''): ?>
                 <div class="alert alert-secondary small mb-3">Previously saved: <?= e($legacyAddress) ?>. Choose province, city, and barangay below to update.</div>
@@ -132,14 +139,18 @@ $markGuideIncomplete = ($guideProfileShowStatus ?? true)
               </div>
             </div>
 
-            <div class="guide-profile-section" data-ph-address data-same-current data-ph-lock-province="<?= e($guideLockProv) ?>" data-ph-lock-city="<?= e(ph_guide_locked_city()) ?>">
+            <div class="guide-profile-section" data-ph-address data-same-current<?= $guideLockProv !== '' ? ' data-ph-lock-province="' . e($guideLockProv) . '" data-ph-lock-city="' . e($guideLockCity) . '"' : '' ?>>
               <?= current_address_same_radios_html(!empty($sameAsPermanent), 'guideAddrSame') ?>
               <div class="guide-profile-fields guide-profile-fields--2">
                 <div>
                   <label class="form-label">Province</label>
                   <select class="form-select" name="current_address_region" id="curAddrRegion" data-ph-region required
                           data-initial="<?= e($curRegion) ?>">
-                    <option value="<?= e($guideLockProv) ?>" selected><?= e($guideLockProv) ?></option>
+                    <?php if ($guideLockProv !== ''): ?>
+                      <option value="<?= e($guideLockProv) ?>" selected><?= e($guideLockProv) ?></option>
+                    <?php else: ?>
+                      <option value="" selected disabled>Select province</option>
+                    <?php endif; ?>
                   </select>
                 </div>
                 <div>
@@ -341,14 +352,14 @@ $markGuideIncomplete = ($guideProfileShowStatus ?? true)
                       <input type="time" class="form-control form-control-sm" id="dayStart<?= $i ?>"
                              name="day_start[<?= $i ?>]"
                              value="<?= e(time_picker_value((string) $availByDay[$i]['start'], '8:00 AM')) ?>"
-                             step="60"<?= $dayOn ? ' required' : ' disabled' ?>>
+                             step="900"<?= $dayOn ? ' required' : ' disabled' ?>>
                     </div>
                     <div>
                       <label class="form-label small mb-0" for="dayEnd<?= $i ?>">End</label>
                          <input type="time" class="form-control form-control-sm" id="dayEnd<?= $i ?>"
                              name="day_end[<?= $i ?>]"
                              value="<?= e(time_picker_value((string) $availByDay[$i]['end'], '5:00 PM')) ?>"
-                             step="60" data-avail-end<?= $dayOn ? ' required' : ' disabled' ?>>
+                             step="900" data-avail-end<?= $dayOn ? ' required' : ' disabled' ?>>
                     </div>
                     <p class="guide-profile-avail__cutoff mb-0" data-avail-cutoff data-cutoff-prefix="Cutoff: ">
                       Cutoff: <?= e(guide_booking_cutoff_display($availByDay[$i]['end']) ?: '—') ?>
@@ -422,8 +433,10 @@ $markGuideIncomplete = ($guideProfileShowStatus ?? true)
         </form>
       </div>
 <?php
-$guideLeyteSameBody = 'Only tour guides who currently live in Ormoc City can register on CulTour. Uncheck “Same as permanent address” and enter an Ormoc City current address.';
-require __DIR__ . '/guide_leyte_same_modal.php';
+if (empty($inhouseGuideAddressFree)) {
+    $guideLeyteSameBody = 'Only tour guides who currently live in Ormoc City can register on CulTour. Uncheck “Same as permanent address” and enter an Ormoc City current address.';
+    require __DIR__ . '/guide_leyte_same_modal.php';
+}
 ?>
 <script>
 (function () {
@@ -488,6 +501,7 @@ require __DIR__ . '/guide_leyte_same_modal.php';
   });
 })();
 </script>
+<script src="<?= APP_URL ?>/assets/js/avail-time.js?v=<?= @filemtime(ROOT_PATH . '/assets/js/avail-time.js') ?: time() ?>"></script>
 <script src="<?= APP_URL ?>/assets/js/ph-address.js?v=<?= @filemtime(ROOT_PATH . '/assets/js/ph-address.js') ?: time() ?>"></script>
 <script>
   if (window.CulTourPhAddress) {

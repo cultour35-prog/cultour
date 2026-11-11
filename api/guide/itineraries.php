@@ -303,6 +303,10 @@ if ($action === 'add_stop') {
     if ($limitMsg !== null) {
         json_response(['ok' => false, 'message' => $limitMsg], 400);
     }
+    $minMsg = itinerary_visit_min_message((string) ($place['name'] ?? ''), $place['min_visit_minutes'] ?? null, $visitMins);
+    if ($minMsg !== null) {
+        json_response(['ok' => false, 'message' => $minMsg], 400);
+    }
     $newMins = itin_time_to_minutes(trim((string) ($in['start_time'] ?? '')));
     if ($newMins === null) {
         $newMins = !empty($prev['skip_travel'])

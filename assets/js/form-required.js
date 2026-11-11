@@ -49,7 +49,9 @@
       return (label || 'This field') + ' is required.';
     }
     if (el.closest('.phone-input')) {
-      if (!/^9\d{9}$/.test(v)) return 'Enter the 10-digit mobile number after +63, starting with 9 (for example 9171234567).';
+      var phoneDigits = v.replace(/\D/g, '');
+      if (phoneDigits.charAt(0) !== '9') return 'Enter a valid mobile number.';
+      if (phoneDigits.length !== 10) return 'Phone number must be exactly 10 digits.';
     }
     if (el.type === 'email' && el.validity && el.validity.typeMismatch) return 'Enter a complete email address, for example name@gmail.com.';
     if (el.minLength > 0 && v.length < el.minLength) {
@@ -79,16 +81,42 @@
     const target = searchInputFor(el) || el;
     try { target.focus({ preventScroll: true }); } catch (err) {}
   }
+  function normalizePhone(el) {
+    let digits = String(el.value || '').replace(/\D+/g, '');
+    if (digits.indexOf('63') === 0 && digits.length > 10) digits = digits.slice(2);
+    while (digits.charAt(0) === '0') digits = digits.slice(1);
+    var formatted = window.formatPhLocal ? window.formatPhLocal(digits) : digits.slice(0, 10);
+    if (el.value !== formatted) el.value = formatted;
+    return formatted.replace(/\D/g, '');
+  }
   function bind(form) {
     if (form._reqBound) return;
     form._reqBound = true;
     form.noValidate = true;
-    ['input', 'change'].forEach(function (evt) {
-      form.addEventListener(evt, function (e) {
-        const el = e.target;
-        if (!el || !el.matches || !el.matches(FIELD_SEL) || !el.classList.contains('is-invalid')) return;
-        if (!messageFor(el)) clear(el);
-      });
+    form.addEventListener('input', function (e) {
+      const el = e.target;
+      if (!el || !el.matches || !el.matches(FIELD_SEL) || !isActive(el)) return;
+      if (el.closest('.phone-input')) {
+        const digits = normalizePhone(el);
+        if (digits && digits.charAt(0) !== '9') mark(el, 'Enter a valid mobile number.');
+        else clear(el);
+        return;
+      }
+      if (!el.classList.contains('is-invalid')) return;
+      if (!messageFor(el)) clear(el);
+    });
+    form.addEventListener('change', function (e) {
+      const el = e.target;
+      if (!el || !el.matches || !el.matches(FIELD_SEL) || !el.classList.contains('is-invalid')) return;
+      if (!messageFor(el)) clear(el);
+    });
+    form.addEventListener('focusout', function (e) {
+      const el = e.target;
+      if (!el || !el.matches || !el.matches(FIELD_SEL) || !el.closest('.phone-input') || !isActive(el)) return;
+      normalizePhone(el);
+      const msg = String(el.value || '').trim() ? messageFor(el) : '';
+      if (msg) mark(el, msg);
+      else clear(el);
     });
     form.addEventListener('submit', function (e) {
       const first = validate(form);

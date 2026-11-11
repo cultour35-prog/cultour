@@ -36,6 +36,7 @@ $payload = [
     'credential_files' => $_FILES['resume_files'] ?? [],
     'languages' => $in['languages'] ?? '',
     'years_experience' => $in['years_experience'] ?? '',
+    'license_number' => $in['license_number'] ?? '',
     'representative_first_name' => $in['representative_first_name'] ?? '',
     'representative_middle_name' => $in['representative_middle_name'] ?? '',
     'representative_last_name' => $in['representative_last_name'] ?? '',

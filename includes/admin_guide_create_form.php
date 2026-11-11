@@ -7,8 +7,8 @@ $natVal = (string) ($_POST['nationality'] ?? '');
 $phonePosted = ph_phone_local_digits((string) ($_POST['phone_local'] ?? ''));
 $emergPhonePosted = ph_phone_local_digits((string) ($_POST['emergency_phone_local'] ?? ''));
 $guideYearsPosted = preg_replace('/\D+/', '', (string) ($_POST['years_experience'] ?? '')) ?? '';
-$guideLockProv = ph_guide_locked_province();
-$guideLockCity = ph_guide_locked_city();
+$guideLockProv = !empty($inhouseGuideAddressFree) ? '' : ph_guide_locked_province();
+$guideLockCity = !empty($inhouseGuideAddressFree) ? '' : ph_guide_locked_city();
 $sameAsPermanent = false;
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $sameRaw = $_POST['current_same_as_permanent'] ?? '0';

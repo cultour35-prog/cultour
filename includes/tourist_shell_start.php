@@ -37,7 +37,7 @@ $touristNav = [
 
 $bodyClass = trim(($bodyClass ?? '') . ' tourist-app');
 ?>
-<div class="tourist-shell" data-app-tutorial="tourist" data-app-tutorial-user="<?= (int) ($user['id'] ?? 0) ?>"<?= $activeNav === 'dashboard' ? ' data-app-tutorial-auto="1"' : '' ?>>
+<div class="tourist-shell" data-app-tutorial="tourist" data-app-tutorial-user="<?= (int) ($user['id'] ?? 0) ?>" data-view-itinerary="<?= (int) ($GLOBALS['CULTOUR_VIEW_ITINERARY_ID'] ?? 0) ?>"<?= $activeNav === 'dashboard' ? ' data-app-tutorial-auto="1"' : '' ?>>
   <header class="tourist-topnav">
     <a class="tourist-topnav__brand" href="<?= APP_URL ?>/tourist/dashboard.php"><?= e(APP_NAME) ?></a>
 
@@ -136,17 +136,22 @@ $bodyClass = trim(($bodyClass ?? '') . ' tourist-app');
 
   <main class="tourist-main">
     <?php if (empty($touristHidePagehead) && (!empty($pageHeading) || !empty($pageSub) || !empty($pageHeadBackHref))): ?>
-      <div class="tourist-pagehead">
-        <?php if (!empty($pageHeadBackHref)): ?>
-          <a class="tourist-pagehead__back" href="<?= e($pageHeadBackHref) ?>">
-            <i class="bi bi-arrow-left"></i> <?= e($pageHeadBackLabel ?? 'Back') ?>
-          </a>
-        <?php endif; ?>
-        <?php if (!empty($pageHeading)): ?>
-          <h1 class="tourist-pagehead__title"><?= e($pageHeading) ?></h1>
-        <?php endif; ?>
-        <?php if (!empty($pageSub)): ?>
-          <p class="tourist-pagehead__sub"><?= e($pageSub) ?></p>
+      <div class="tourist-pagehead<?= !empty($pageHeadingTools) ? ' tourist-pagehead--tools' : '' ?>">
+        <div>
+          <?php if (!empty($pageHeadBackHref)): ?>
+            <a class="tourist-pagehead__back" href="<?= e($pageHeadBackHref) ?>">
+              <i class="bi bi-arrow-left"></i> <?= e($pageHeadBackLabel ?? 'Back') ?>
+            </a>
+          <?php endif; ?>
+          <?php if (!empty($pageHeading)): ?>
+            <h1 class="tourist-pagehead__title"><?= e($pageHeading) ?></h1>
+          <?php endif; ?>
+          <?php if (!empty($pageSub)): ?>
+            <p class="tourist-pagehead__sub"><?= e($pageSub) ?></p>
+          <?php endif; ?>
+        </div>
+        <?php if (!empty($pageHeadingTools)): ?>
+          <?= $pageHeadingTools ?>
         <?php endif; ?>
       </div>
     <?php endif; ?>
